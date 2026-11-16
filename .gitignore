@@ -1,0 +1,87 @@
+# Local design/reverse-engineering workspaces
+.superpowers/
+.impeccable/
+
+# Dependencies and build outputs
+node_modules/
+desktop/node_modules/
+dist/
+desktop/dist/
+desktop/src-tauri/target/
+desktop/src-tauri/gen/
+target/
+coverage/
+*.tsbuildinfo
+
+# Portable capsule and model/runtime artifacts
+/model/
+/models/
+/model-packs/*/
+!model-packs/README.md
+!model-packs/example-manifest.json
+/runtime/
+/runtimes/
+*.gguf
+*.onnx
+*.safetensors
+*.bin
+UCode.exe
+*.msi
+*.msix
+*.zip
+*.7z
+
+# User state, evidence, logs, and temporary projects
+/data/
+/workspaces/
+/logs/
+/evidence/
+/artifacts/
+desktop/artifacts/
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.log
+*.bak
+*.tmp
+.ucode-*
+
+# Secrets and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+id_rsa*
+id_ed25519*
+credentials*
+secrets*
+
+# Editor and OS state
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+*.user
+*.suo
+*.pdb
+
+# Upstream source is fetched/distributed under its own license
+vendor/
+
+# Keep the public design record focused on the current release
+desktop/docs/
+desktop/scripts/real_desktop_*.py
+desktop/scripts/ui_smoke.py
+docs/superpowers/*
+!docs/superpowers/specs/
+!docs/superpowers/plans/
+docs/superpowers/specs/*
+docs/superpowers/plans/*
+!docs/superpowers/specs/2026-11-16-ucode-trusted-mvp-and-public-release-design.md
+!docs/superpowers/plans/2026-11-16-ucode-trusted-mvp-and-public-release-plan.md
+

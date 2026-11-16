@@ -1,0 +1,51 @@
+{
+  "version": "ucode.executor.v1",
+  "requestId": "request-fixture",
+  "turnId": "turn-fixture",
+  "threadKey": "desktop:conversation-fixture",
+  "mode": "action",
+  "assignment": {
+    "ticketId": "ticket-fixture",
+    "assignmentId": "assignment-fixture"
+  },
+  "mandate": {
+    "strength": "explicit",
+    "policyVersion": "policy-1",
+    "projectId": "project-fixture",
+    "projectFingerprint": "fingerprint-fixture",
+    "capabilities": ["read", "search", "propose_write"],
+    "triggerId": "trigger-fixture",
+    "threadKey": "desktop:conversation-fixture"
+  },
+  "inputs": [
+    {
+      "id": "input-fixture",
+      "kind": "trigger",
+      "triggerId": "trigger-fixture",
+      "text": "读取 README.md 并说明项目用途",
+      "human": true
+    }
+  ],
+  "history": [
+    {
+      "role": "user",
+      "content": "这是一个本地项目"
+    }
+  ],
+  "workspace": {
+    "canonicalRoot": "C:/fixture/project",
+    "fingerprint": "fingerprint-fixture",
+    "files": [
+      {
+        "path": "README.md",
+        "sizeBytes": 128,
+        "contentDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    ]
+  },
+  "attachmentToken": null,
+  "attachments": [],
+  "metadata": {
+    "locale": "zh-CN"
+  }
+}

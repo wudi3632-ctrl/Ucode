@@ -1,0 +1,8 @@
+export const TOOL_DEFINITIONS = Object.freeze([
+  { type: "function", function: { name: "read_file", description: "Read a UTF-8 file relative to the selected project", parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } } },
+  { type: "function", function: { name: "search", description: "Search text inside the selected project", parameters: { type: "object", properties: { query: { type: "string" }, path: { type: "string" } }, required: ["query"] } } },
+  { type: "function", function: { name: "write_file", description: "Propose replacing a project-relative file; user approval is required", parameters: { type: "object", properties: { path: { type: "string" }, content: { type: "string" } }, required: ["path", "content"] } } },
+  { type: "function", function: { name: "write_files", description: "Propose one approval batch containing 1-20 project-relative file creates, modifications, or deletions", parameters: { type: "object", properties: { changes: { type: "array", minItems: 1, maxItems: 20, items: { type: "object", properties: { path: { type: "string" }, operation: { type: "string", enum: ["create", "modify", "delete"] }, content: { type: "string" } }, required: ["path", "operation"] } } }, required: ["changes"] } } },
+  { type: "function", function: { name: "diff", description: "Preview replacement content as a diff", parameters: { type: "object", properties: { path: { type: "string" }, content: { type: "string" } }, required: ["path", "content"] } } },
+  { type: "function", function: { name: "pytest", description: "Run pytest on optional project-relative test paths", parameters: { type: "object", properties: { paths: { type: "array", items: { type: "string" } } } } } },
+]);

@@ -1,0 +1,11 @@
+{
+  "host": "127.0.0.1",
+  "port": 3082,
+  "modelHost": "127.0.0.1",
+  "modelPort": 3083,
+  "maxOutputBytes": 1048576,
+  "commandTimeoutMs": 120000,
+  "modelDir": "model",
+  "dataDir": "data",
+  "workspacesDir": "workspaces"
+}

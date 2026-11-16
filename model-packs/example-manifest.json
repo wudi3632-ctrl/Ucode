@@ -1,0 +1,16 @@
+{
+  "format": 1,
+  "id": "replace-with-stable-pack-id",
+  "name": "Replace with exact model name",
+  "runtime": "llama.cpp",
+  "ggufRelativePath": "model-packs/replace-with-stable-pack-id/model.gguf",
+  "bytes": 1,
+  "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "parameterClass": "1.5B",
+  "contextSize": 4096,
+  "minimumRamBytes": 4294967296,
+  "recommendedRamBytes": 6442450944,
+  "taskSuitability": ["chat", "named-file edits"],
+  "releaseEligible": false
+}
+

@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>PocketMind</title><link rel="stylesheet" href="/styles.css"></head>
+<body>
+  <main>
+    <header><div><p class="eyebrow">LOCAL · PRIVATE · AUDITABLE</p><h1>PocketMind</h1></div><span id="health" class="badge">正在检查</span></header>
+    <section class="card"><h2>项目</h2><form id="project-form"><input id="project" placeholder="Windows 项目绝对路径" required><button>选择项目</button></form><p id="current-project" class="muted">尚未选择</p></section>
+    <section class="card"><h2>新任务</h2><form id="ticket-form"><textarea id="request" placeholder="描述要完成的 Python 编码任务" required></textarea><button>创建 Ticket</button></form></section>
+    <section class="layout"><section class="card"><h2>Tickets</h2><div id="tickets" class="list"><p class="muted">暂无任务</p></div></section><section class="card"><h2>详情与审批</h2><pre id="detail">选择一个 Ticket</pre><div id="actions"></div></section></section>
+    <div id="message" role="status"></div>
+  </main>
+  <script type="module" src="/app.js"></script>
+</body></html>

@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  node:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm install
+      - run: npm run check
+
+  desktop:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - run: npm ci
+        working-directory: desktop
+      - run: npm test -- --run
+        working-directory: desktop
+      - run: npm run build
+        working-directory: desktop
+      - run: cargo test --manifest-path desktop/src-tauri/Cargo.toml
+
+  hygiene:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Reject oversized tracked files and forbidden artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          bad=$(find . -type f -not -path './.git/*' -size +25M -print)
+          test -z "$bad" || { echo "$bad"; exit 1; }
+          test -z "$(git ls-files '*.gguf' '*.onnx' '*.safetensors' '*.db' '*.sqlite' '.env' '.env.*')"
