@@ -1,10 +1,14 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { bootstrap } from "../bridge/desktop";
+import * as desktopBridge from "../bridge/desktop";
 import { Inspector } from "../components/Inspector";
 import { App, detectStartingProviderStatus, effectFrom, friendlyError, mergeRuntimeEvents, modelPerformanceFrom, providerStatusFromRuntime, resolveTheme, runtimeCoreReady, shouldPollProviderStatus } from "./App";
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
 
 function openInspector() {
   const toggle = screen.queryByRole("button", { name: "展开任务面板" });
@@ -172,6 +176,41 @@ describe("UCode desktop", () => {
     expect(screen.getByRole("region", { name: "knapsack.py 差异审查" })).toHaveTextContent("# reviewed");
     fireEvent.click(screen.getByRole("tab", { name: /README\.md/ }));
     expect(screen.getByRole("region", { name: "README.md 差异审查" })).toHaveTextContent("# Review");
+  });
+
+  it("refreshes the Files view after an applied project mutation", async () => {
+    const initial = [
+      { path: "calculator.py", name: "calculator.py", isDirectory: false, depth: 0, size: 38 },
+      { path: "test_calculator.py", name: "test_calculator.py", isDirectory: false, depth: 0, size: 74 },
+    ];
+    const created = [
+      ...initial,
+      { path: "fibonacci.py", name: "fibonacci.py", isDirectory: false, depth: 0, size: 96 },
+      { path: "test_fibonacci.py", name: "test_fibonacci.py", isDirectory: false, depth: 0, size: 112 },
+    ];
+    const listFiles = vi.spyOn(desktopBridge, "listProjectFiles")
+      .mockResolvedValueOnce(initial)
+      .mockResolvedValueOnce(created);
+    const ticket = { id: "ticket-files", projectId: "project-files", title: "创建文件", request: "创建斐波那契模块", state: "running" } as never;
+    const project = { id: "project-files", name: "files-project", path: "E:\\files-project", trusted: true } as never;
+    const props = { ticket, project, effect: null, onExpandedChange: () => undefined, onOpenProject: async () => undefined, onClose: () => undefined };
+    const view = render(<Inspector {...props} events={[]} />);
+
+    fireEvent.click(screen.getByRole("tab", { name: "文件" }));
+    expect(await screen.findByRole("tree", { name: "项目文件" })).toHaveTextContent("calculator.py");
+    expect(screen.getByRole("tree", { name: "项目文件" })).not.toHaveTextContent("fibonacci.py");
+
+    view.rerender(<Inspector {...props} events={[{
+      sequence: 12,
+      ticketId: "ticket-files",
+      eventType: "effect.applied",
+      payload: { effectId: "effect-files" },
+      createdAt: "2026-11-17T10:00:00.000Z",
+    }]} />);
+
+    await waitFor(() => expect(screen.getByRole("tree", { name: "项目文件" })).toHaveTextContent("fibonacci.py"));
+    expect(screen.getByRole("tree", { name: "项目文件" })).toHaveTextContent("test_fibonacci.py");
+    expect(listFiles).toHaveBeenCalledTimes(2);
   });
 
   it("uses structured one-turn attachments without putting disk paths in the message", async () => {

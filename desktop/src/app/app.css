@@ -204,17 +204,16 @@ html[data-theme="light"] .rich-text th { color:#29322b; background:#e9ede9; } ht
 .assistant-message:hover .message-actions,.assistant-message:focus-within .message-actions { opacity: 1;visibility:visible;transform:none;transition-delay:0s; }
 .user-message:hover .message-actions,.user-message:focus-within .message-actions { opacity: 1;visibility:visible;transform:none;transition-delay:0s; }
 .message-actions button { width: 28px; height: 26px; border: 0; border-radius: 6px; color: var(--muted); background: transparent; cursor: pointer; }
-.message-actions button:hover { color: var(--ink); background: #232523; }
+.message-actions button:hover { color: var(--ink); background: var(--surface-hover); }
 .user-actions { position:absolute;z-index:3;right:2px;top:calc(100% + 3px);justify-content:flex-end;margin:0;padding:1px;background:transparent; }
 .user-actions button { width:26px;height:24px;padding:4px;border-radius:6px; }
-.user-actions button:hover { background:#252825; }
+.user-actions button:hover { background:var(--surface-hover); }
 .user-actions svg { display:block;width:15px;height:15px; }
 @media (hover:none) { .user-actions { position:static;margin:5px -5px -3px;border:0;box-shadow:none;background:transparent;opacity:1;visibility:visible;transform:none } }
 
 .thought-block { align-self: stretch; padding-left: 1px; color: var(--muted); }
 .thought-heading { display: flex; align-items: center; gap: 9px; padding: 5px 7px 5px 2px; border: 0; border-radius: 7px; color: #a7aca9; background: transparent; cursor: pointer; font-size: calc(12px * var(--ui-font-scale)); transition: color .18s, background .18s; }
-.thought-heading:hover { color: #d0d3d0; }
-.thought-heading:hover { background: rgba(255,255,255,.025); }
+.thought-heading:hover { color: var(--ink); background: var(--surface-hover); }
 .thought-mark { width: 18px; height: 18px; display: grid; place-items: center; color: var(--accent); font-size: calc(11px * var(--ui-font-scale)); }
 .thinking-dots { display: flex; align-items: center; gap: 2px; }
 .thinking-dots i { width: 3px; height: 3px; border-radius: 50%; background: var(--accent); animation: pulse 1.1s ease-in-out infinite; }
@@ -927,6 +926,13 @@ html[data-theme="light"] .composer { border-color:#c8cec8; background:var(--comp
 html[data-theme="light"] .composer::before { background:linear-gradient(180deg,transparent,var(--composer-fade) 58%); }
 html[data-theme="light"] .composer:focus-within { border-color:#8b9a8d; box-shadow:0 14px 36px var(--shadow-color),0 0 0 3px rgba(75,120,74,.08); }
 html[data-theme="light"] .user-message { border-color:#d2d8d2; color:var(--user-message-ink); background:var(--user-message-bg); }
+html[data-theme="light"] .message-actions button:hover,
+html[data-theme="light"] .user-actions button:hover,
+html[data-theme="light"] .thought-heading:hover { color:var(--ink); background:var(--surface-hover); }
+html[data-theme="light"] .thought-steps { border-left-color:var(--line); }
+html[data-theme="light"] .thought-steps li::before { background:var(--muted-2); box-shadow:0 0 0 3px var(--workspace); }
+html[data-theme="light"] .thought-steps li.current { color:var(--ink); }
+html[data-theme="light"] .thought-steps li.current::before { background:var(--accent); box-shadow:0 0 0 3px var(--workspace),0 0 10px rgba(91,145,82,.22); }
 html[data-theme="light"] .section-label,html[data-theme="light"] .nav-row,html[data-theme="light"] .conversation-row,html[data-theme="light"] .portable-state,html[data-theme="light"] .conversation-title-text,html[data-theme="light"] .branch-icon,html[data-theme="light"] .tool-button,html[data-theme="light"] .model-button { color:var(--muted); }
 html[data-theme="light"] .nav-row:hover,html[data-theme="light"] .conversation-row:hover,html[data-theme="light"] .conversation-item:hover,html[data-theme="light"] .conversation-menu-trigger:hover,html[data-theme="light"] .panel-toggle:hover,html[data-theme="light"] .more-button:hover,html[data-theme="light"] .tool-button:hover,html[data-theme="light"] .model-button:hover,html[data-theme="light"] .inspector-tabs button:hover { color:var(--ink); background:var(--surface-hover); }
 html[data-theme="light"] .nav-row.active,html[data-theme="light"] .conversation-row.selected,html[data-theme="light"] .conversation-item.selected,html[data-theme="light"] .panel-toggle.is-open { color:var(--ink); background:var(--surface-selected); }
@@ -953,9 +959,17 @@ html[data-theme="light"] .quiet { border-color:var(--line-strong); color:#4b554d
 html[data-theme="light"] .quiet:hover { color:var(--ink); background:var(--surface-hover); }
 html[data-theme="light"] .approval-card,html[data-theme="light"] .task-rescue,html[data-theme="light"] .receipt-banner,html[data-theme="light"] .evidence-receipt,html[data-theme="light"] .error-card,html[data-theme="light"] .recovery-required-card { border-color:var(--line); color:var(--ink); background:#fff; box-shadow:0 8px 22px rgba(38,52,42,.06); }
 html[data-theme="light"] .task-rescue-copy code { color:#4c5d50; }
+html[data-theme="light"] .recovery-required-paths code { border-color:#e1c7c3; color:#754f4b; background:#fff5f3; }
+html[data-theme="light"] .recovery-required-card summary { color:#7d5652; }
+html[data-theme="light"] .recovery-required-card details p { color:#766764; }
 html[data-theme="light"] .inspector-tabs { background:#f5f7f4; }
+html[data-theme="light"] .inspector-tabs .inspector-close { color:var(--muted); }
 html[data-theme="light"] .inspector-body,html[data-theme="light"] .file-browser,html[data-theme="light"] .git-panel,html[data-theme="light"] .agent-panel { color:var(--ink); background:var(--panel); }
 html[data-theme="light"] .file-row:hover,html[data-theme="light"] .git-row:hover,html[data-theme="light"] .agent-row:hover { background:var(--surface-hover); }
+html[data-theme="light"] .context-placeholder { color:var(--muted); }
+html[data-theme="light"] .todo-check { border-color:var(--line-strong); }
+html[data-theme="light"] .panel-loading span { border-color:var(--line); border-top-color:var(--accent); }
+html[data-theme="light"] .panel-error { border:1px solid #ebcfcb; color:#9a544d; background:#fff4f2; }
 html[data-theme="light"] .onboarding-progress { background:#dfe5df; }
 html[data-theme="light"] .onboarding-checklist li.active { border-color:#b8c4ba; background:#eef3ee; }
 html[data-theme="light"] .onboarding-step-actions button { background:#fff; }
@@ -992,6 +1006,8 @@ html[data-theme="light"] .model-pack-row.selected .model-pack-radio { border-col
 html[data-theme="light"] .model-pack-empty { border-color:var(--line-strong); }
 html[data-theme="light"] .model-pack-empty b { color:var(--ink); }
 html[data-theme="light"] .conversation-search { border-color:var(--line); background:#fff; }
+html[data-theme="light"] .git-branch { color:var(--ink); background:var(--surface-raised); }
+html[data-theme="light"] .git-branch button:hover { color:var(--ink); background:var(--surface-hover); }
 html[data-theme="light"] .git-changes>button,
 html[data-theme="light"] .git-branches>button,
 html[data-theme="light"] .git-change-row,
@@ -1001,11 +1017,34 @@ html[data-theme="light"] .worktree-create,
 html[data-theme="light"] .subagent-heading,
 html[data-theme="light"] .subagent-card,
 html[data-theme="light"] .subagent-create { border-color:var(--line); color:var(--ink); background:#f7f9f6; }
+html[data-theme="light"] .git-change-row button,
+html[data-theme="light"] .git-commit-card button,
+html[data-theme="light"] .worktree-card button,
+html[data-theme="light"] .worktree-create button,
+html[data-theme="light"] .subagent-running>button,
+html[data-theme="light"] .subagent-create-actions>button,
+html[data-theme="light"] .subagent-draft>div>button,
+html[data-theme="light"] .inline-approval button:not(.approve) { border-color:var(--line); color:var(--ink); background:#fff; }
+html[data-theme="light"] .git-change-row button:hover,
+html[data-theme="light"] .git-commit-card button:hover,
+html[data-theme="light"] .worktree-card button:hover,
+html[data-theme="light"] .worktree-create button:hover,
+html[data-theme="light"] .subagent-running>button:hover,
+html[data-theme="light"] .subagent-create-actions>button:hover,
+html[data-theme="light"] .subagent-draft>div>button:hover,
+html[data-theme="light"] .inline-approval button:not(.approve):hover { background:var(--surface-hover); }
 html[data-theme="light"] .git-review-files button.selected { color:var(--ink); background:var(--surface-selected); }
 html[data-theme="light"] .subagent-result { color:#3b443e; background:#edf1ed; }
 html[data-theme="light"] .subagent-draft { background:#eef2ed; }
 html[data-theme="light"] .subagent-capability { background:#fff; }
 html[data-theme="light"] .subagent-capability button.selected { color:var(--ink); background:#dfe7df; box-shadow:none; }
+html[data-theme="light"] .subagent-state { border-color:var(--line-strong); }
+html[data-theme="light"] .app-toast { border-color:var(--line); color:var(--ink); background:rgba(255,255,255,.97); box-shadow:0 12px 40px var(--shadow-color); }
+html[data-theme="light"] .onboarding-orbit>span { border-color:var(--line-strong); color:var(--ink); background:var(--surface-raised); box-shadow:0 8px 24px var(--shadow-color); }
+html[data-theme="light"] .onboarding-kicker,
+html[data-theme="light"] .onboarding-promises span { color:var(--muted)!important; }
+html[data-theme="light"] .onboarding-promises span { background:var(--surface-raised); }
+html[data-theme="light"] .onboarding-step-mark { border-color:var(--line-strong); color:var(--muted); }
 html[data-theme="light"] .terminal-emulator input,
 html[data-theme="light"] .terminal-input input,
 html[data-theme="light"] .git-diff-review input { color:#e8e9e7; background:transparent; }

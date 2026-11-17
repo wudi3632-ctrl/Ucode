@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
@@ -41,7 +41,11 @@ export function Inspector({ ticket, project, effect, events, codeFontSize = 14, 
   const [git, setGit] = useState<GitDetails | null>(null);
   const [loading, setLoading] = useState(false);
   const [panelError, setPanelError] = useState<string | null>(null);
+  const filesRequestRef = useRef(0);
   const ticketEvents = useMemo(() => events.filter((event) => event.ticketId === ticket?.id), [events, ticket?.id]);
+  const fileMutationRevision = useMemo(() => ticketEvents
+    .filter((event) => ["effect.applied", "effect.rolled_back", "subagent.change_merged"].includes(event.eventType))
+    .at(-1)?.sequence ?? 0, [ticketEvents]);
   const steps = useMemo(() => currentTurnSteps(ticket, ticketEvents), [ticket, ticketEvents]);
   const showGuide = openOnboarding || onboarding.welcomeState !== "completed";
   const availableTabs = showGuide ? tabOrder : tabOrder.filter((item) => item !== "guide");
@@ -60,6 +64,8 @@ export function Inspector({ ticket, project, effect, events, codeFontSize = 14, 
   }, [showGuide, tab]);
 
   useEffect(() => {
+    filesRequestRef.current += 1;
+    setFiles([]);
     setPreview(null);
     setGit(null);
     onExpandedChange(false);
@@ -74,11 +80,25 @@ export function Inspector({ ticket, project, effect, events, codeFontSize = 14, 
     onExpandedChange(false);
   }, [effect?.id]);
 
+  const refreshFiles = useCallback(async () => {
+    if (!project) return;
+    const request = ++filesRequestRef.current;
+    setLoading(true);
+    setPanelError(null);
+    try {
+      const nextFiles = await listProjectFiles(project.id);
+      if (request === filesRequestRef.current) setFiles(nextFiles);
+    } catch (error) {
+      if (request === filesRequestRef.current) setPanelError(String(error));
+    } finally {
+      if (request === filesRequestRef.current) setLoading(false);
+    }
+  }, [project?.id]);
+
   useEffect(() => {
-    if (tab !== "files" || !project || files.length) return;
-    setLoading(true); setPanelError(null);
-    listProjectFiles(project.id).then(setFiles).catch((error) => setPanelError(String(error))).finally(() => setLoading(false));
-  }, [tab, project, files.length]);
+    if (tab !== "files" || !project) return;
+    void refreshFiles();
+  }, [tab, project?.id, fileMutationRevision, refreshFiles]);
 
   useEffect(() => {
     if (tab !== "git" || !project || git) return;
