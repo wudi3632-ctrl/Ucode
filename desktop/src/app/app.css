@@ -53,6 +53,15 @@ button, textarea { font: inherit; }
 button { color: inherit; }
 button:focus-visible, input:focus-visible { outline: 2px solid rgba(168,233,134,.7); outline-offset: 2px; }
 
+.desktop-context-menu { position:fixed; z-index:200; width:180px; padding:5px; border:1px solid var(--line-strong); border-radius:10px; color:var(--ink); background:color-mix(in srgb,var(--surface-floating) 96%,transparent); box-shadow:0 16px 42px rgba(0,0,0,.32); backdrop-filter:blur(18px); transform-origin:top left; animation:context-menu-in .15s var(--ease) both; }
+.desktop-context-menu button { width:100%; height:31px; display:flex; align-items:center; justify-content:space-between; gap:12px; padding:0 9px; border:0; border-radius:7px; color:var(--ink); background:transparent; cursor:pointer; font-size:calc(11px * var(--ui-font-scale)); text-align:left; transition:background .12s cubic-bezier(.2,0,0,1),transform .12s cubic-bezier(.2,0,0,1); }
+.desktop-context-menu button:hover:not(:disabled),.desktop-context-menu button:focus-visible { background:var(--surface-hover); }
+.desktop-context-menu button:active:not(:disabled) { transform:scale(.985); }
+.desktop-context-menu button:disabled { color:var(--muted-2); cursor:default; }
+.desktop-context-menu kbd { color:var(--muted); font:calc(9px * var(--ui-font-scale)) var(--font-mono,Consolas,monospace); }
+.desktop-context-menu i { display:block; height:1px; margin:4px 6px; background:var(--line); }
+@keyframes context-menu-in { from { opacity:0; transform:translateY(-3px) scale(.98); } to { opacity:1; transform:none; } }
+
 .boot-screen { height: 100%; display: grid; place-content: center; justify-items: center; gap: 14px; background: #111312; }
 .boot-mark { width: 46px; height: 46px; display: grid; place-items: center; border-radius: 14px; color: var(--accent-ink); background: var(--accent); font-weight: 900; font-size: calc(22px * var(--ui-font-scale)); animation: settle .5s var(--ease) both; }
 .capsule-recovery { width:100%; height:100%; padding:clamp(28px,6vw,76px); display:grid; align-content:center; justify-items:start; gap:13px; background:radial-gradient(circle at 18% 18%,rgba(231,134,127,.08),transparent 34%),#111312; }
