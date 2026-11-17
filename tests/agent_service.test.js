@@ -470,8 +470,10 @@ test("runs requested pytest after approval before declaring an explicit edit com
     tool: { name: "write_file", arguments: { path: "calculator.py", content: `${original}\n\ndef multiply(a, b):\n    return a * b\n` } },
   });
   let pytestCalls = 0;
-  value.service.tools.pytest = async () => {
+  let pytestPaths = null;
+  value.service.tools.pytest = async (_root, argumentsValue) => {
     pytestCalls += 1;
+    pytestPaths = argumentsValue.paths;
     return { exitCode: 0, signal: null, stdout: "3 passed", stderr: "" };
   };
   const ticket = value.service.createTicket("修改 calculator.py：新增 multiply(a, b)，然后运行 pytest");
@@ -480,10 +482,79 @@ test("runs requested pytest after approval before declaring an explicit edit com
   const completed = await value.service.plan(ticket.id);
 
   assert.equal(pytestCalls, 1);
+  assert.deepEqual(pytestPaths, []);
   assert.equal(completed.type, "final");
   assert.equal(completed.route, "verified_edit");
   assert.match(completed.content, /pytest 已通过/);
   assert.equal(completed.evidence.at(-1).toolName, "pytest");
+});
+
+test("new explicit pytest files must contain collectible assertions and are run directly", async (t) => {
+  const value = fixture();
+  t.after(() => fs.rmSync(value.root, { recursive: true, force: true }));
+  let testAttempts = 0;
+  let retryPayload = null;
+  value.coder.generate = async (payload) => {
+    const pathname = payload.requested_tool.arguments.path;
+    if (pathname === "fibonacci.py") {
+      return { type: "tool_request", content: "", tool: { name: "write_file", arguments: { path: pathname, content: "def fib(n):\n    a, b = 0, 1\n    for _ in range(n):\n        a, b = b, a + b\n    return a\n" } } };
+    }
+    testAttempts += 1;
+    if (testAttempts === 2) retryPayload = payload;
+    const content = testAttempts === 1
+      ? "def fib(n):\n    return n\n"
+      : "from fibonacci import fib\n\ndef test_fib_values():\n    assert fib(0) == 0\n    assert fib(1) == 1\n    assert fib(10) == 55\n";
+    return { type: "tool_request", content: "", tool: { name: "write_file", arguments: { path: pathname, content } } };
+  };
+  let pytestPaths = null;
+  value.service.tools.pytest = async (_root, argumentsValue) => {
+    pytestPaths = argumentsValue.paths;
+    return { exitCode: 0, signal: null, stdout: "1 passed", stderr: "" };
+  };
+
+  const ticket = value.service.createTicket(
+    "创建 fibonacci.py，实现 fib(n)；再创建 test_fibonacci.py，包含 fib(0)、fib(1)、fib(10) 的 pytest 测试；批准后运行 pytest。",
+  );
+  const proposal = await value.service.plan(ticket.id);
+
+  assert.equal(testAttempts, 2, "an implementation-shaped test file must be rejected and retried");
+  const testChange = proposal.effect.changes.find((change) => change.path === "test_fibonacci.py");
+  assert.match(testChange.content, /def test_fib_values/);
+  assert.match(testChange.content, /assert fib\(10\) == 55/);
+  assert.match(testChange.content, /from fibonacci import fib/);
+  assert.doesNotMatch(testChange.content, /^def fib\(/m);
+  assert.match(retryPayload.messages.at(-1).content, /上一个候选被安全校验拒绝/);
+  assert.match(retryPayload.messages.at(-1).content, /test_ 函数和断言/);
+  assert.equal(retryPayload.workspace.files.some((file) => file.path === "fibonacci.py" && /def fib/.test(file.content || "")), true);
+  value.service.approve(ticket.id, proposal.effect.id, true);
+  const completed = await value.service.plan(ticket.id);
+
+  assert.equal(completed.type, "final");
+  assert.deepEqual(pytestPaths, ["test_fibonacci.py"]);
+});
+
+test("completes an unambiguous missing import in a real pytest candidate", async (t) => {
+  const value = fixture();
+  t.after(() => fs.rmSync(value.root, { recursive: true, force: true }));
+  let testAttempts = 0;
+  value.coder.generate = async (payload) => {
+    const pathname = payload.requested_tool.arguments.path;
+    if (pathname === "fibonacci.py") {
+      return { type: "tool_request", content: "", tool: { name: "write_file", arguments: { path: pathname, content: "def fib(n):\n    return n if n < 2 else fib(n - 1) + fib(n - 2)\n" } } };
+    }
+    testAttempts += 1;
+    return { type: "tool_request", content: "", tool: { name: "write_file", arguments: { path: pathname, content: "def test_fib_values():\n    assert fib(0) == 0\n    assert fib(1) == 1\n    assert fib(10) == 55\n" } } };
+  };
+
+  const ticket = value.service.createTicket(
+    "创建 fibonacci.py，实现 fib(n)；再创建 test_fibonacci.py，包含 fib(0)、fib(1)、fib(10) 的 pytest 测试。",
+  );
+  const proposal = await value.service.plan(ticket.id);
+  const testChange = proposal.effect.changes.find((change) => change.path === "test_fibonacci.py");
+
+  assert.equal(testAttempts, 1);
+  assert.match(testChange.content, /^from fibonacci import fib/m);
+  assert.match(testChange.content, /def test_fib_values/);
 });
 
 test("shows a bounded sanitized pytest failure summary after an approved edit", async (t) => {

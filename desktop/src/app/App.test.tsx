@@ -2,7 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { bootstrap } from "../bridge/desktop";
 import { Inspector } from "../components/Inspector";
-import { App, detectStartingProviderStatus, effectFrom, friendlyError, mergeRuntimeEvents, modelPerformanceFrom, providerStatusFromRuntime, resolveTheme, runtimeCoreReady } from "./App";
+import { App, detectStartingProviderStatus, effectFrom, friendlyError, mergeRuntimeEvents, modelPerformanceFrom, providerStatusFromRuntime, resolveTheme, runtimeCoreReady, shouldPollProviderStatus } from "./App";
 
 afterEach(cleanup);
 
@@ -36,6 +36,13 @@ describe("UCode desktop", () => {
     ] };
     expect(runtimeCoreReady(progressive)).toBe(true);
     expect(providerStatusFromRuntime(progressive)).toBe("ready");
+  });
+
+  it("keeps polling both starting and initially unavailable runtimes until they converge", () => {
+    expect(shouldPollProviderStatus("offline", false)).toBe(true);
+    expect(shouldPollProviderStatus("unavailable", false)).toBe(true);
+    expect(shouldPollProviderStatus("ready", false)).toBe(false);
+    expect(shouldPollProviderStatus("unavailable", true)).toBe(false);
   });
 
   it("confirms a cold-starting runtime with the authoritative Agent bootstrap", async () => {

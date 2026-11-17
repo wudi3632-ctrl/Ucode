@@ -306,28 +306,37 @@ function formatLatency(milliseconds: number) {
 }
 
 function EvidenceReceiptCard({ receipt, onExport }: { receipt: EvidenceReceipt; onExport: (receipt: EvidenceReceipt, format: "json" | "md") => Promise<void> }) {
-  const total = receipt.sources.length + receipt.commands.length + receipt.tests.length + receipt.effects.length + receipt.decisions.length;
-  const outcome = ({ completed: "已完成", failed: "失败", cancelled: "已停止", rolled_back: "已回滚", waiting_input: "等待输入", waiting_approval: "等待审批", in_progress: "进行中" } as Record<string, string>)[receipt.outcome] ?? receipt.outcome;
-  const changed = receipt.effects.length ? `${receipt.effects.length} 个已记录变更` : "没有写入文件";
-  const verified = receipt.tests.length
-    ? `${receipt.tests.length} 项测试已有记录`
-    : receipt.sources.length
-      ? `${receipt.sources.length} 项项目来源已核验`
-      : receipt.effects.length
+  const legacyTests = receipt.sources.filter(isTestEvidence);
+  const visibleSources = receipt.sources.filter((item) => !isTestEvidence(item));
+  const visibleTests = [...receipt.tests, ...legacyTests];
+  const total = visibleSources.length + receipt.commands.length + visibleTests.length + receipt.effects.length + receipt.decisions.length;
+  const appliedEffects = receipt.effects.filter((effect) => effect.event === "effect.applied");
+  const rejected = appliedEffects.length === 0 && receipt.decisions.some((decision) => decision.event === "effect.rejected");
+  const outcome = rejected ? "已取消" : ({ completed: "已完成", failed: "失败", cancelled: "已停止", rolled_back: "已回滚", waiting_input: "等待输入", waiting_approval: "等待审批", in_progress: "进行中" } as Record<string, string>)[receipt.outcome] ?? receipt.outcome;
+  const changed = appliedEffects.length ? `${appliedEffects.length} 个已应用批次` : "没有写入文件";
+  const verified = rejected
+    ? "未执行测试（修改已拒绝）"
+    : visibleTests.length
+    ? summarizeTestEvidence(visibleTests)
+    : visibleSources.length
+      ? `${visibleSources.length} 项项目来源已核验`
+      : appliedEffects.length
         ? "尚未记录测试结果"
         : "本轮不需要运行测试";
-  const risk = receipt.outcome === "completed"
-    ? receipt.effects.length
+  const risk = rejected
+    ? "修改已拒绝，项目文件未改变"
+    : receipt.outcome === "completed"
+    ? appliedEffects.length
       ? "文件已变更，仍应审查 Diff 和测试结果"
-      : receipt.sources.length
+      : visibleSources.length
         ? "回答范围仅限于本轮实际读取的项目内容"
         : "本轮未修改项目文件"
     : receipt.outcome === "failed"
       ? "任务失败，不能视为完成"
       : "任务尚未完成或仍需人工确认";
-  const undo = receipt.effects.length ? "可使用本任务下方的回滚入口撤销已应用批次" : "没有需要撤销的文件批次";
+  const undo = appliedEffects.length ? "可使用本任务下方的回滚入口撤销已应用批次" : "没有需要撤销的文件批次";
   return <article className="evidence-receipt" aria-label="结果证据">
-    <header><span className="receipt-seal">{receipt.outcome === "completed" ? "✓" : "·"}</span><span><b>任务收据</b><small>{outcome}</small></span></header>
+    <header><span className="receipt-seal">{rejected ? "×" : receipt.outcome === "completed" ? "✓" : "·"}</span><span><b>任务收据</b><small>{outcome}</small></span></header>
     <dl className="receipt-summary">
       <div><dt>改了什么</dt><dd>{changed}</dd></div>
       <div><dt>为什么</dt><dd>{receipt.request}</dd></div>
@@ -335,9 +344,30 @@ function EvidenceReceiptCard({ receipt, onExport }: { receipt: EvidenceReceipt; 
       <div><dt>剩余风险</dt><dd>{risk}</dd></div>
       <div><dt>如何撤销</dt><dd>{undo}</dd></div>
     </dl>
-    <details className="receipt-technical"><summary>技术详情 · {total} 条事实</summary><div className="receipt-body"><div className="receipt-counts"><span>来源 <b>{receipt.sources.length}</b></span><span>命令 <b>{receipt.commands.length}</b></span><span>测试 <b>{receipt.tests.length}</b></span><span>变更 <b>{receipt.effects.length}</b></span><span>决策 <b>{receipt.decisions.length}</b></span></div><p>路由 <code>{receipt.route ?? "未记录"}</code> · SHA-256 <code>{receipt.contentDigest}</code></p></div></details>
+    <details className="receipt-technical"><summary>技术详情 · {total} 条事实</summary><div className="receipt-body"><div className="receipt-counts"><span>来源 <b>{visibleSources.length}</b></span><span>命令 <b>{receipt.commands.length}</b></span><span>测试 <b>{visibleTests.length}</b></span><span>变更 <b>{receipt.effects.length}</b></span><span>决策 <b>{receipt.decisions.length}</b></span></div><p>路由 <code>{receipt.route ?? "未记录"}</code> · SHA-256 <code>{receipt.contentDigest}</code></p></div></details>
     <div className="receipt-actions"><button type="button" onClick={() => void onExport(receipt, "md")}>导出 Markdown</button><button type="button" onClick={() => void onExport(receipt, "json")}>导出 JSON</button></div>
   </article>;
+}
+
+function isTestEvidence(item: Record<string, unknown>) {
+  const nested = item.evidence && typeof item.evidence === "object" ? item.evidence as Record<string, unknown> : item;
+  const tool = String(nested.toolName ?? nested.tool ?? "");
+  return tool === "pytest" || tool.includes("test");
+}
+
+function summarizeTestEvidence(tests: Record<string, unknown>[]) {
+  const latest = tests.at(-1) ?? {};
+  const nested = latest.evidence && typeof latest.evidence === "object" ? latest.evidence as Record<string, unknown> : latest;
+  const preview = typeof nested.preview === "string" ? nested.preview : "";
+  const paths = Array.isArray(nested.sourcePaths) ? nested.sourcePaths.filter((value): value is string => typeof value === "string") : [];
+  const passed = preview.match(/\b(\d+)\s+passed\b/i)?.[1];
+  const failed = preview.match(/\b(\d+)\s+failed\b/i)?.[1];
+  const exitCode = typeof nested.exitCode === "number" ? nested.exitCode : null;
+  const scope = paths.length ? ` · ${paths.join("、")}` : "";
+  if (passed && exitCode === 0) return `pytest：${passed} passed${scope}`;
+  if (failed || (exitCode !== null && exitCode !== 0)) return `pytest：${failed ? `${failed} failed` : `退出码 ${exitCode}`}${scope}`;
+  if (exitCode === 0 || nested.status === "succeeded") return `pytest 已通过 · ${tests.length} 项真实测试记录${scope}`;
+  return `${tests.length} 项测试已有记录`;
 }
 
 interface VisibleTaskContext {

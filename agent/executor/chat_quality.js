@@ -34,6 +34,25 @@ export function exactReplyRetryMessages(target) {
   ];
 }
 
+export function oneSentenceConstraint(request) {
+  return /(?:请|用|以)?(?:只)?(?:用)?一句话(?:回答|解释|说明|概括|总结|介绍)?|(?:in|with)\s+(?:exactly\s+)?one\s+sentence/iu.test(String(request || ""));
+}
+
+export function enforceOneSentence(content) {
+  const value = String(content || "").trim();
+  if (!value) return value;
+  const compact = value
+    .split(/\r?\n/u)
+    .map((line) => line.trim().replace(/^[-*•]\s+/u, ""))
+    .filter(Boolean)
+    .join("，")
+    .replace(/[。！？!?]+(?=\s*\S)/gu, "，")
+    .replace(/，{2,}/gu, "，")
+    .replace(/\s+/gu, " ")
+    .trim();
+  return /[。！？!?]$/u.test(compact) ? compact : `${compact}。`;
+}
+
 function stripBalancedQuotes(value) {
   const pairs = new Map([["`", "`"], ["'", "'"], ['"', '"'], ["“", "”"], ["‘", "’"]]);
   const closing = pairs.get(value[0]);

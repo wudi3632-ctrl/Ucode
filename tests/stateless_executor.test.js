@@ -183,6 +183,35 @@ test("direct file-content questions return a fenced code block with real newline
   assert.equal(value.calls.length, 0);
 });
 
+test("a content-grounded README purpose question is answered instead of dumping the file", async (t) => {
+  const value = fixture("project_read", "README.md 是做什么的？请只根据文件内容回答。");
+  t.after(() => fs.rmSync(value.root, { recursive: true, force: true }));
+
+  const content = await value.executor.execute(value.request, { onEvent: (event) => value.events.push(event) });
+
+  assert.match(content, /项目说明文档/);
+  assert.match(content, /Portable desktop agent/);
+  assert.match(content, /来源/);
+  assert.doesNotMatch(content, /```/);
+  assert.equal(value.calls.length, 0);
+});
+
+test("one-sentence chat output is normalized before it is streamed", async (t) => {
+  const value = fixture("chat", "用一句话解释什么是动态规划，不要写代码。");
+  const coder = value.executor.coder();
+  coder.generate = async (payload) => {
+    value.calls.push(payload);
+    return { type: "final", content: "动态规划将问题拆成重叠子问题。它保存结果以避免重复计算。" };
+  };
+  t.after(() => fs.rmSync(value.root, { recursive: true, force: true }));
+
+  const content = await value.executor.execute(value.request, { onEvent: (event) => value.events.push(event) });
+
+  assert.equal(content, "动态规划将问题拆成重叠子问题，它保存结果以避免重复计算。");
+  assert.deepEqual(value.events, [{ type: "text_delta", delta: content }]);
+  assert.equal(value.calls.length, 1);
+});
+
 test("what-file questions receive an evidence-based local description", async (t) => {
   const value = fixture("project_read", "calculator.py是什么文件");
   fs.writeFileSync(path.join(value.root, "calculator.py"), "def add(a, b):\n    return a + b\n");

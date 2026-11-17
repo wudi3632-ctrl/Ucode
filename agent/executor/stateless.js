@@ -5,9 +5,9 @@ import { looksLikeRawToolOutput, validateToolRequest } from "./router.js";
 import { validateExecutorRequest } from "./protocol.js";
 import { resolveProjectRoot } from "../local_source/workspace.js";
 import { TOOL_DEFINITIONS } from "../tools/definitions.js";
-import { exactReplyConstraint } from "./chat_quality.js";
+import { enforceOneSentence, exactReplyConstraint, oneSentenceConstraint } from "./chat_quality.js";
 
-const CHAT_PROMPT = "你是 UCode 桌面应用中的本地编码助手。禁止读写项目文件只是本轮权限约束，不是取消回答。直接针对用户当前问题自然、简洁地使用中文回答，不套用固定开头，不复述权限说明，不输出工具调用或 JSON。只有用户明确要求代码时才给完整可运行代码；只有用户询问复杂度或复杂度确实有助于理解时才说明。";
+const CHAT_PROMPT = "你是 UCode 桌面应用中的本地编码助手。禁止读写项目文件只是本轮权限约束，不是取消回答。直接针对用户当前问题自然、简洁地使用中文回答，不套用固定开头，不复述权限说明，不输出工具调用或 JSON。只有用户明确要求代码时才给完整可运行代码；只有用户询问复杂度或复杂度确实有助于理解时才说明。用户要求一句话时，只输出一个句号结尾的完整句子。";
 const PROJECT_PROMPT = "你是 UCode 的项目问答助手。文件已经由桌面宿主读取完毕，你只做文本信息提取和解释，不再执行读取。只依据本轮真实文件内容，用完整、简洁的中文句子回答；先说明文件用途，再列出能够确认的关键内容。展示代码时必须使用带语言名的 Markdown 围栏，禁止把换行写成字面量 \\n。不猜测，不声称修改，不输出列表字面量、JSON、XML、函数调用、工具名称或任何虚构文件路径。来源路径由桌面宿主统一追加，你不需要重复。";
 const PROJECT_RETRY_PROMPT = "上一次输出错误地生成了工具调用。本次文件内容已经在用户消息中，只能直接回答问题；禁止再次读取，禁止输出 JSON、代码形式的参数或任何工具调用。";
 const READABLE = new Set([".md", ".txt", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".py", ".rs", ".go", ".java", ".kt", ".c", ".h", ".cpp", ".hpp", ".cs", ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".xml", ".html", ".css", ".sql", ".sh", ".ps1", ".bat", ".cmd", ".log", ".csv"]);
@@ -43,13 +43,20 @@ export class StatelessExecutor {
     const coder = this.coder();
     if (!coder) throw new AppError("chat_provider_unavailable", "对话模型尚未启动。", 503);
     const messages = modelMessages(request, CHAT_PROMPT);
-    const result = await generate(coder, {
+    const payload = {
       task_id: request.turnId,
       messages,
       workspace: { root: request.workspace.canonicalRoot, files: attachmentFiles(request) },
       tools: [],
       mode: "chat",
-    }, options);
+    };
+    if (oneSentenceConstraint(query)) {
+      const result = await coder.generate(payload, { signal: options.signal });
+      const content = safeIdentityAnswer(request, enforceOneSentence(usableContent(result, "本地对话模型没有生成可用的文本回答。")));
+      options.onEvent?.({ type: "text_delta", delta: content });
+      return content;
+    }
+    const result = await generate(coder, payload, options);
     return safeIdentityAnswer(request, usableContent(result, "本地对话模型没有生成可用的文本回答。"));
   }
 
@@ -486,7 +493,9 @@ function answerFromConversationHistory(query, history) {
 }
 
 function asksForFileContent(query) {
-  return /(?:文件|源码|代码)?(?:的)?(?:完整)?内容|(?:显示|给我|贴出|输出).{0,8}(?:源码|代码|内容)|what(?:'s| is)\s+in/i.test(String(query || ""));
+  const value = String(query || "");
+  if (/(?:根据|依据|基于).{0,10}(?:文件|源码|代码)(?:的)?内容.{0,10}(?:回答|解释|说明|概括|总结)/i.test(value)) return false;
+  return /(?:[\w./\\-]+\.[a-z0-9]+|这个文件|该文件|文件|源码|代码)(?:的)?(?:完整)?内容(?:是什么|呢|[？?]|\s*$)|(?:显示|给我|贴出|输出|查看).{0,10}(?:文件|源码|代码|内容)|what(?:'s| is)\s+in/i.test(value);
 }
 
 function asksWhatFileIs(query) {
@@ -508,10 +517,21 @@ function describeFile(file) {
     .map((match) => match[1] || match[2])
     .filter(Boolean)
     .slice(0, 6);
-  const detail = symbols.length
+  const readmePurpose = extension === ".md" && /(?:^|\/)readme\.md$/i.test(file.path)
+    ? describeReadmePurpose(file.content)
+    : "";
+  const detail = readmePurpose || (symbols.length
     ? `其中定义了 ${symbols.map((name) => `\`${name}\``).join("、")}。`
-    : "当前内容中没有识别到可列出的函数或类定义。";
+    : "当前内容中没有识别到可列出的函数或类定义。");
   return `\`${file.path}\` 是一个${type}。${detail}\n\n来源\n- \`${file.path}\``;
+}
+
+function describeReadmePurpose(content) {
+  const lines = String(content || "").split(/\r?\n/u).map((line) => line.trim()).filter(Boolean);
+  const title = lines.find((line) => /^#{1,6}\s+/u.test(line))?.replace(/^#{1,6}\s+/u, "").trim();
+  const summary = lines.find((line) => !/^#{1,6}\s+/u.test(line) && !/^[-*`]\s*/u.test(line));
+  const subject = title ? `介绍 ${title}` : "介绍当前项目";
+  return summary ? `作为项目说明文档，它用于${subject}；文件说明：${summary}` : `作为项目说明文档，它用于${subject}。`;
 }
 
 function repairWriteToolPath(tool, request) {

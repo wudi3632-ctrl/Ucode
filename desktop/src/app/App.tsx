@@ -80,9 +80,12 @@ export function App() {
   }, [snapshot?.settings.uiFontSize, snapshot?.settings.codeFontSize]);
 
   useEffect(() => {
-    if (!snapshot || busy || snapshot.providerStatus !== "offline") return;
+    if (!snapshot || !shouldPollProviderStatus(snapshot.providerStatus, busy)) return;
     let disposed = false;
+    let attempts = 0;
+    let timer: number | undefined;
     const inspect = async () => {
+      attempts += 1;
       try {
         const providerStatus = await detectStartingProviderStatus(getRuntimeDiagnostics, bootstrap);
         if (disposed) return;
@@ -91,10 +94,14 @@ export function App() {
         // One failed diagnostic call must not turn a healthy UI red. The next
         // bounded poll will retry without changing user data or task state.
       }
+      if (attempts >= 30 && timer !== undefined) window.clearInterval(timer);
     };
     void inspect();
-    const timer = window.setInterval(inspect, 4_000);
-    return () => { disposed = true; window.clearInterval(timer); };
+    timer = window.setInterval(inspect, 4_000);
+    return () => {
+      disposed = true;
+      if (timer !== undefined) window.clearInterval(timer);
+    };
   }, [snapshot?.portableRoot, snapshot?.providerStatus, busy]);
 
   useEffect(() => {
@@ -587,6 +594,10 @@ export function providerStatusFromRuntime(diagnostics: RuntimeDiagnosticSnapshot
   if (diagnostics.overall === "ready" || runtimeCoreReady(diagnostics)) return "ready";
   if (diagnostics.overall === "starting") return "offline";
   return "unavailable";
+}
+
+export function shouldPollProviderStatus(status: BootstrapSnapshot["providerStatus"], busy: boolean): boolean {
+  return !busy && status !== "ready";
 }
 
 export function runtimeCoreReady(diagnostics: Pick<RuntimeDiagnosticSnapshot, "services">): boolean {

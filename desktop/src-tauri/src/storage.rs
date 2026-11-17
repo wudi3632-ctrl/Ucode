@@ -1412,7 +1412,23 @@ fn refresh_evidence_receipt(connection: &Connection, ticket_id: &str) -> Result<
                     .into_iter()
                     .flatten()
                 {
-                    push_unique(&mut sources, evidence.clone());
+                    let tool = evidence
+                        .get("toolName")
+                        .or_else(|| evidence.get("tool"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    if matches!(
+                        tool,
+                        "read_file" | "list_files" | "search" | "attachment_read"
+                    ) {
+                        push_unique(&mut sources, evidence.clone());
+                    } else if tool.contains("test") || tool == "pytest" {
+                        push_unique(&mut tests, evidence.clone());
+                    } else if tool.is_empty() {
+                        push_unique(&mut sources, evidence.clone());
+                    } else {
+                        push_unique(&mut commands, evidence.clone());
+                    }
                 }
             }
             "effect.proposed" => {
@@ -2358,6 +2374,42 @@ mod tests {
         assert_eq!(receipt.outcome, "completed");
         assert_eq!(receipt.sources.len(), 1);
         assert_eq!(receipt.content_digest.len(), 64);
+    }
+
+    #[test]
+    fn evidence_receipt_classifies_delivery_pytest_evidence_as_a_test() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("ucode.db");
+        let mut storage = Storage::open(&database).unwrap();
+        let locator = ProjectLocator {
+            absolute_path: directory.path().display().to_string(),
+            relative_path: None,
+            fingerprint: "delivery-pytest-receipt".into(),
+        };
+        let project = storage.upsert_project(&locator, true).unwrap();
+        let ticket = storage.create_ticket(&project.id, "Run focused tests").unwrap();
+        storage
+            .append_event(
+                Some(&ticket.id),
+                "delivery.ready",
+                json!({
+                    "content": "tests passed",
+                    "route": "verified_edit",
+                    "evidence": [{
+                        "toolName": "pytest",
+                        "status": "succeeded",
+                        "exitCode": 0,
+                        "sourcePaths": ["test_fibonacci.py"],
+                        "preview": "3 passed in 0.02s"
+                    }]
+                }),
+            )
+            .unwrap();
+
+        let receipt = storage.evidence_receipts().unwrap().pop().unwrap();
+        assert!(receipt.sources.is_empty());
+        assert_eq!(receipt.tests.len(), 1);
+        assert_eq!(receipt.tests[0]["toolName"], "pytest");
     }
 
     #[test]

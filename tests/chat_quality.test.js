@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { exactReplyConstraint, exactReplyMatches } from "../agent/executor/chat_quality.js";
+import { enforceOneSentence, exactReplyConstraint, exactReplyMatches, oneSentenceConstraint } from "../agent/executor/chat_quality.js";
 
 test("extracts bounded Chinese and English exact-reply constraints", () => {
   assert.deepEqual(
@@ -21,4 +21,14 @@ test("exact-reply comparison accepts only the complete requested string", () => 
 
 test("Chinese punctuation after an exact-reply instruction is not part of the target", () => {
   assert.deepEqual(exactReplyConstraint("只回答：你好"), { target: "你好" });
+});
+
+test("one-sentence requests are detected and multi-sentence output is normalized", () => {
+  assert.equal(oneSentenceConstraint("用一句话解释什么是动态规划，不要写代码。"), true);
+  assert.equal(oneSentenceConstraint("Explain dynamic programming in one sentence."), true);
+  assert.equal(oneSentenceConstraint("解释动态规划"), false);
+  assert.equal(
+    enforceOneSentence("动态规划将问题拆成重叠子问题。它保存子问题结果以避免重复计算。"),
+    "动态规划将问题拆成重叠子问题，它保存子问题结果以避免重复计算。",
+  );
 });

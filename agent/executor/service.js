@@ -7,9 +7,9 @@ import { buildEscalationPayload } from "../escalation/escalation.js";
 import { AppError } from "../shared/errors.js";
 import { TOOL_DEFINITIONS } from "../tools/definitions.js";
 import { Intent, classifyIntent, conversationMessages, looksLikeRawToolOutput, validateToolRequest } from "./router.js";
-import { exactReplyConstraint } from "./chat_quality.js";
+import { enforceOneSentence, exactReplyConstraint, oneSentenceConstraint } from "./chat_quality.js";
 
-const CHAT_PROMPT = "你是 UCode 桌面应用中的本地编码助手，不是 Python 脚本，也不是用户项目中的代码。请直接、自然、简洁地使用中文回答。当前是普通聊天模式：不要输出工具调用、JSON 或虚构文件操作。保留并延续对话上下文。";
+const CHAT_PROMPT = "你是 UCode 桌面应用中的本地编码助手，不是 Python 脚本，也不是用户项目中的代码。请直接、自然、简洁地使用中文回答。当前是普通聊天模式：不要输出工具调用、JSON 或虚构文件操作。保留并延续对话上下文。用户要求一句话时，只输出一个句号结尾的完整句子。";
 const PROJECT_PROMPT = "你是 UCode 的项目问答助手。只能依据提供的项目文件索引和文件内容回答；信息不足时明确说明需要哪个文件，不得猜测路径，不得输出工具调用或 JSON，不得声称已经修改文件。展示代码时必须使用带语言名的 Markdown 围栏，禁止把换行写成字面量 \\n。来源路径由桌面宿主统一展示，不要在回答中重复来源。使用简洁中文。";
 const PLAIN_TEXT_RETRY_PROMPT = "上一次输出没有遵守纯文本回答协议。本次只能输出面向用户的自然语言答案；禁止输出 JSON、XML、工具名称、函数调用或代码形式的工具参数。";
 const TEXT_EXTENSIONS = new Set([".md", ".txt", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".py", ".rs", ".go", ".java", ".kt", ".c", ".h", ".cpp", ".hpp", ".cs", ".json", ".jsonl", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".xml", ".html", ".css", ".scss", ".sql", ".sh", ".ps1", ".bat", ".cmd", ".log", ".csv"]);
@@ -207,7 +207,7 @@ export class AgentService {
         ? ticket.effects.find((effect) => effect.id === ticket.execution.directEditEffectId && effect.status === "applied")
         : null;
       if (!ticket.execution.testsPassed && requestsPytest(taskRequest) && appliedDirectEffect) {
-        const tool = { name: "pytest", arguments: { paths: [] } };
+        const tool = { name: "pytest", arguments: { paths: pytestPathsForEffect(appliedDirectEffect) } };
         messages.push({ role: "assistant", content: "", tool_calls: [tool] });
         const toolResult = await this.callTool(id, tool.name, tool.arguments);
         options.onEvent?.({ type: "tool_completed", tool: tool.name, evidence: toolResult.evidence });
@@ -492,12 +492,14 @@ export class AgentService {
     const currentRequest = [...messages].reverse().find((message) => message.role === "user")?.content || "";
     const exact = exactReplyConstraint(currentRequest);
     if (exact) return this.generateExactReply(ticket, { exact, workspace, mode, options });
-    const result = options.onEvent
+    const singleSentence = oneSentenceConstraint(currentRequest);
+    const result = options.onEvent && !singleSentence
       ? await this.activeCoder().generateStream({ task_id: ticket.id, messages, workspace, tools: [], mode }, { signal: options.signal, onEvent: options.onEvent })
       : await this.activeCoder().generate({ task_id: ticket.id, messages, workspace, tools: [], mode }, { signal: options.signal });
     this.audit.append("coder.response", ticket.id, { intent: mode, ...responseAuditMetadata(result) });
-    const content = String(result.content || "").trim();
+    const content = singleSentence ? enforceOneSentence(result.content) : String(result.content || "").trim();
     if (!content || looksLikeRawToolOutput(content)) throw new AppError("chat_protocol_error", "本地对话模型没有生成可用的文本回答，请重试或切换模型。", 422);
+    if (singleSentence) options.onEvent?.({ type: "text_delta", delta: content });
     return content;
   }
 
@@ -861,6 +863,10 @@ export class AgentService {
       const language = path.extname(target.path).toLowerCase() || "原文件";
       const action = target.operation === "create" ? "创建" : "修改";
       const scopedRequest = scopedRequestForTarget(request, target);
+      const relatedImplementations = relatedImplementationPaths(request, target.path);
+      const testRequirement = relatedImplementations.length
+        ? `这是 pytest 测试文件：必须从 ${relatedImplementations.join("、")} 导入并测试真实实现；至少包含一个 def test_*() 函数和 assert；必须覆盖用户点名的每个函数调用；禁止在测试文件中复制被测函数实现。`
+        : "";
       const deterministic = target.operation === "modify"
         ? deterministicReplacement(target.path, target.content, scopedRequest)
         : null;
@@ -874,24 +880,51 @@ export class AgentService {
         });
         continue;
       }
-      const systemPrompt = skillPrompt(`你是 UCode 的代码修改模型。当前只${action} ${target.path}。依据下面这一条文件专属要求${target.operation === "create" ? "生成新文件" : "和已提供的真实文件内容完成修改"}，只输出该文件的完整内容。目标文件类型是 ${language}${target.operation === "modify" ? "，必须保持原语言、既有导出和全部无关接口" : ""}。不要解释，不要输出 JSON 或 Markdown 代码围栏。其他文件会单独处理，写入仍需用户批准。`, ticket.execution.skillContext);
-      const messages = [{ role: "system", content: systemPrompt }, { role: "user", content: scopedRequest }];
+      const systemPrompt = skillPrompt(`你是 UCode 的代码修改模型。当前只${action} ${target.path}。依据下面这一条文件专属要求${target.operation === "create" ? "生成新文件" : "和已提供的真实文件内容完成修改"}，只输出该文件的完整内容。目标文件类型是 ${language}${target.operation === "modify" ? "，必须保持原语言、既有导出和全部无关接口" : ""}。${testRequirement}不要解释，不要输出 JSON 或 Markdown 代码围栏。其他文件会单独处理，写入仍需用户批准。`, ticket.execution.skillContext);
+      const messages = [{ role: "system", content: systemPrompt }, { role: "user", content: `${scopedRequest}${testRequirement ? `\n${testRequirement}` : ""}` }];
       const requestedTool = { name: "write_file", arguments: { path: target.path } };
-      const targetWorkspace = { root: ticket.projectRoot, files: target.operation === "create" ? [{ path: target.path }] : [target] };
+      const dependencyCandidates = changes
+        .filter((change) => change.operation !== "delete" && typeof change.content === "string")
+        .map((change) => ({ path: change.path, content: change.content, readOnly: true, candidate: true }));
+      const targetWorkspace = {
+        root: ticket.projectRoot,
+        files: [...(target.operation === "create" ? [{ path: target.path }] : [target]), ...dependencyCandidates],
+      };
       let coderResult = null;
+      let lastCandidateError = null;
       for (let attempt = 1; attempt <= 2; attempt += 1) {
-        const attemptMessages = attempt === 1 ? messages : [...messages, { role: "user", content: `上一个候选未满足这条文件专属要求：${scopedRequest}。只返回 ${target.path} 的完整文件内容；保持原语言以及全部既有接口，并确保明确要求的函数名、字符串和返回值都正确。` }];
+        const rejectionDetail = lastCandidateError?.message || "候选内容不完整";
+        const retryInstruction = testRequirement
+          ? `上一个候选被安全校验拒绝：${rejectionDetail}。重新生成完整的 ${target.path}。${testRequirement} 直接导入本轮候选实现，不要定义同名实现函数。只输出文件内容。`
+          : `上一个候选被安全校验拒绝：${rejectionDetail}。只返回 ${target.path} 的完整文件内容；保持原语言以及全部既有接口，并确保明确要求的函数名、字符串和返回值都正确。`;
+        const attemptMessages = attempt === 1 ? messages : [...messages, { role: "user", content: retryInstruction }];
         const generated = await this.activeCoder().generate({ task_id: ticket.id, messages: attemptMessages, workspace: targetWorkspace, tools: [], mode: "write_content", requested_tool: requestedTool });
         this.audit.append("coder.response", ticket.id, { route: "explicit_batch_edit", batchPath: target.path, attempt, ...responseAuditMetadata(generated) });
         if (generated.type !== "tool_request" || generated.tool?.name !== "write_file" || typeof generated.tool.arguments?.content !== "string") continue;
         generated.tool.arguments.path = target.path;
         generated.tool.arguments.content = normalizeCoderFileContent(generated.tool.arguments.content);
+        const completedTestCandidate = completePythonTestImports(
+          target.path,
+          generated.tool.arguments.content,
+          scopedRequest,
+          relatedImplementations,
+        );
+        if (completedTestCandidate !== generated.tool.arguments.content) {
+          generated.tool.arguments.content = completedTestCandidate;
+          this.audit.append("coder.candidate_completed", ticket.id, {
+            route: "explicit_batch_edit",
+            path: target.path,
+            attempt,
+            strategy: "add_explicit_test_import",
+          });
+        }
         try {
           this.tools.validateReplacement(target.path, target.operation === "create" ? null : target.content, generated.tool.arguments.content);
-          validateExplicitCandidateRequirements(target.path, generated.tool.arguments.content, scopedRequest);
+          validateExplicitCandidateRequirements(target.path, generated.tool.arguments.content, scopedRequest, request);
           coderResult = generated;
           break;
         } catch (error) {
+          lastCandidateError = error;
           this.audit.append("coder.candidate_rejected", ticket.id, { route: "explicit_batch_edit", path: target.path, attempt, code: error.code || "candidate_invalid", message: error.message });
         }
       }
@@ -1539,7 +1572,7 @@ function scopedRequestForTarget(request, target) {
       for (let next = index + 1; next < segments.length; next += 1) {
         const continuation = segments[next];
         if (extractRequestedPaths(continuation).length) break;
-        if (!/^(?:返回|并|同时|其|值|内容|要求|其中|return\b)/i.test(continuation)) break;
+        if (!/^(?:返回|并|同时|其|值|内容|要求|其中|包含|覆盖|测试|验证|断言|检查|return\b|assert\b)/i.test(continuation)) break;
         selectedIndexes.add(next);
       }
     }
@@ -1550,13 +1583,68 @@ function scopedRequestForTarget(request, target) {
   return selected.length ? selected.join("；") : requestClauseForPath(value, target.path);
 }
 
-function validateExplicitCandidateRequirements(pathname, content, requestClause) {
+function validateExplicitCandidateRequirements(pathname, content, requestClause, fullRequest = requestClause) {
   const tokens = new Set();
   for (const match of String(requestClause || "").matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*\)/g)) tokens.add(match[1]);
   for (const match of String(requestClause || "").matchAll(/[`"']([^`"'\r\n]{2,80})[`"']/g)) tokens.add(match[1]);
   for (const match of String(requestClause || "").matchAll(/返回(?:值)?(?:改成|为)?\s*([A-Za-z0-9_.-]{2,80})/gi)) tokens.add(match[1]);
   const missing = [...tokens].filter((token) => !content.includes(token));
   if (missing.length) throw new AppError("candidate_requirement_missing", `代码模型生成的 ${pathname} 缺少明确要求：${missing.join("、")}`);
+  if (/(?:^|\/)test_[^/]+\.py$/i.test(pathname) || /(?:^|\/)tests?\/[^/]+\.py$/i.test(pathname)) {
+    if (!/^\s*(?:async\s+)?def\s+test_[A-Za-z0-9_]+\s*\(/m.test(content) || !/\bassert\b/.test(content)) {
+      throw new AppError("candidate_test_missing", `代码模型生成的 ${pathname} 不包含可由 pytest 收集的 test_ 函数和断言`);
+    }
+    const requiredCalls = [...String(requestClause || "").matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*([^)]{1,60})\s*\)/g)]
+      .map((match) => `${match[1]}(${match[2].replace(/\s+/g, "")})`)
+      .filter((call) => !/^pytest\(/i.test(call));
+    const compact = content.replace(/\s+/g, "");
+    const missingCalls = [...new Set(requiredCalls)].filter((call) => !compact.includes(call));
+    if (missingCalls.length) throw new AppError("candidate_test_cases_missing", `代码模型生成的 ${pathname} 缺少测试用例：${missingCalls.join("、")}`);
+    const related = relatedImplementationPaths(fullRequest, pathname);
+    for (const implementationPath of related) {
+      const moduleName = path.basename(implementationPath, ".py");
+      const imported = new RegExp(`(?:^|\\n)\\s*(?:from\\s+${escapeRegExp(moduleName)}\\s+import\\s+|import\\s+${escapeRegExp(moduleName)}(?:\\s|$))`, "m").test(content);
+      if (!imported) throw new AppError("candidate_test_import_missing", `代码模型生成的 ${pathname} 没有导入被测模块 ${implementationPath}`);
+    }
+    const invokedNames = [...String(requestClause || "").matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\s*\(/g)]
+      .map((match) => match[1])
+      .filter((name) => name !== "pytest" && !name.startsWith("test_"));
+    const duplicated = [...new Set(invokedNames)].filter((name) => new RegExp(`^\\s*(?:async\\s+)?def\\s+${escapeRegExp(name)}\\s*\\(`, "m").test(content));
+    if (related.length && duplicated.length) throw new AppError("candidate_test_duplicates_implementation", `代码模型生成的 ${pathname} 复制了被测实现：${duplicated.join("、")}`);
+  }
+}
+
+function completePythonTestImports(pathname, content, requestClause, relatedImplementations) {
+  if (!/(?:^|\/)test_[^/]+\.py$/i.test(pathname) && !/(?:^|\/)tests?\/[^/]+\.py$/i.test(pathname)) return content;
+  if (relatedImplementations.length !== 1) return content;
+  if (!/^\s*(?:async\s+)?def\s+test_[A-Za-z0-9_]+\s*\(/m.test(content) || !/\bassert\b/.test(content)) return content;
+  const implementationPath = relatedImplementations[0];
+  const moduleName = path.basename(implementationPath, ".py");
+  const alreadyImported = new RegExp(`(?:^|\\n)\\s*(?:from\\s+${escapeRegExp(moduleName)}\\s+import\\s+|import\\s+${escapeRegExp(moduleName)}(?:\\s|$))`, "m").test(content);
+  if (alreadyImported) return content;
+  const invokedNames = [...String(requestClause || "").matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\s*\(/g)]
+    .map((match) => match[1])
+    .filter((name) => name !== "pytest" && !name.startsWith("test_") && new RegExp(`\\b${escapeRegExp(name)}\\s*\\(`).test(content));
+  const importedNames = [...new Set(invokedNames)].filter((name) => !new RegExp(`^\\s*(?:async\\s+)?def\\s+${escapeRegExp(name)}\\s*\\(`, "m").test(content));
+  if (!importedNames.length) return content;
+  return `from ${moduleName} import ${importedNames.join(", ")}\n\n${String(content).replace(/^\s+/, "")}`;
+}
+
+function relatedImplementationPaths(request, testPath) {
+  if (!/(?:^|\/)test_[^/]+\.py$/i.test(testPath) && !/(?:^|\/)tests?\/[^/]+\.py$/i.test(testPath)) return [];
+  return [...new Set(extractRequestedPaths(String(request || ""))
+    .map((pathname) => pathname.replaceAll("\\", "/"))
+    .filter((pathname) => pathname.toLowerCase().endsWith(".py") && pathname.toLowerCase() !== testPath.toLowerCase() && !/(?:^|\/)test_[^/]+\.py$/i.test(pathname)))];
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function pytestPathsForEffect(effect) {
+  return (effect?.changes || [])
+    .map((change) => change?.path)
+    .filter((pathname) => typeof pathname === "string" && (/(?:^|\/)test_[^/]+\.py$/i.test(pathname) || /(?:^|\/)tests?\/[^/]+\.py$/i.test(pathname)));
 }
 
 function isReadFollowUp(request) {
@@ -1595,7 +1683,9 @@ function withSources(content, paths) {
 }
 
 function asksForFileContent(request) {
-  return /(?:文件|源码|代码)?(?:的)?(?:完整)?内容|(?:显示|给我|贴出|输出).{0,8}(?:源码|代码|内容)|what(?:'s| is)\s+in/i.test(String(request || ""));
+  const value = String(request || "");
+  if (/(?:根据|依据|基于).{0,10}(?:文件|源码|代码)(?:的)?内容.{0,10}(?:回答|解释|说明|概括|总结)/i.test(value)) return false;
+  return /(?:[\w./\\-]+\.[a-z0-9]+|这个文件|该文件|文件|源码|代码)(?:的)?(?:完整)?内容(?:是什么|呢|[？?]|\s*$)|(?:显示|给我|贴出|输出|查看).{0,10}(?:文件|源码|代码|内容)|what(?:'s| is)\s+in/i.test(value);
 }
 
 function asksWhatFileIs(request) {
@@ -1623,10 +1713,21 @@ function describeProjectFile(pathname, content) {
     .map((match) => match[1] || match[2])
     .filter(Boolean)
     .slice(0, 6);
-  const detail = symbols.length
+  const readmePurpose = extension === ".md" && /(?:^|\/)readme\.md$/i.test(pathname)
+    ? describeReadmePurpose(content)
+    : "";
+  const detail = readmePurpose || (symbols.length
     ? `其中定义了 ${symbols.map((name) => `\`${name}\``).join("、")}。`
-    : "当前内容中没有识别到可列出的函数或类定义。";
+    : "当前内容中没有识别到可列出的函数或类定义。");
   return `\`${pathname}\` 是一个${type}。${detail}`;
+}
+
+function describeReadmePurpose(content) {
+  const lines = String(content || "").split(/\r?\n/u).map((line) => line.trim()).filter(Boolean);
+  const title = lines.find((line) => /^#{1,6}\s+/u.test(line))?.replace(/^#{1,6}\s+/u, "").trim();
+  const summary = lines.find((line) => !/^#{1,6}\s+/u.test(line) && !/^[-*`]\s*/u.test(line));
+  const subject = title ? `介绍 ${title}` : "介绍当前项目";
+  return summary ? `作为项目说明文档，它用于${subject}；文件说明：${summary}` : `作为项目说明文档，它用于${subject}。`;
 }
 
 function repairWriteToolPath(tool, request) {

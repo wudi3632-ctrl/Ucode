@@ -61,6 +61,76 @@ describe("conversation timeline projection", () => {
     expect(evidence).not.toHaveTextContent("审查 Diff");
   });
 
+  it("describes a rejected proposal as no write instead of a completed change", () => {
+    const receipt: EvidenceReceipt = {
+      ticketId: ticket.id,
+      request: "创建 test_fibonacci.py",
+      route: "explicit_batch_edit",
+      outcome: "completed",
+      sources: [], commands: [], tests: [],
+      effects: [{ event: "effect.proposed", detail: { effectId: "effect-1" } }],
+      decisions: [{ event: "effect.rejected", detail: { effectId: "effect-1" } }],
+      finalState: {}, contentDigest: "digest", updatedAt: "2026-11-10T00:00:01Z",
+    };
+    render(<Conversation
+      projectId="project-1" ticket={ticket} events={[]} effect={null} receipt={receipt} appliedEffect={null} busy={false}
+      onSubmit={vi.fn()} onCancel={vi.fn()} onRetry={vi.fn()} onExport={vi.fn()} onBranch={vi.fn()}
+      onApprove={vi.fn()} onReject={vi.fn()} onRollback={vi.fn()} onExportReceipt={vi.fn()} hasProject onOpenProject={vi.fn()} error={null}
+      sidebarOpen inspectorOpen={false} onToggleSidebar={vi.fn()} onToggleInspector={vi.fn()}
+      providerStatus="ready" modelProvider="bundled" providerModel="" modelPerformance={null}
+    />);
+
+    const evidence = screen.getByRole("article", { name: "结果证据" });
+    expect(evidence).toHaveTextContent("已取消");
+    expect(evidence).toHaveTextContent("没有写入文件");
+    expect(evidence).toHaveTextContent("修改已拒绝，项目文件未改变");
+    expect(evidence).toHaveTextContent("没有需要撤销的文件批次");
+    expect(evidence).not.toHaveTextContent("文件已变更");
+  });
+
+  it("shows the observed pytest result instead of counting it as a generic source", () => {
+    const receipt: EvidenceReceipt = {
+      ticketId: ticket.id,
+      request: "创建并验证 fibonacci.py",
+      route: "verified_edit",
+      outcome: "completed",
+      sources: [], commands: [],
+      tests: [{ toolName: "pytest", status: "succeeded", exitCode: 0, sourcePaths: ["test_fibonacci.py"], preview: "3 passed in 0.02s" }],
+      effects: [{ event: "effect.applied", detail: { effectId: "effect-1" } }],
+      decisions: [], finalState: {}, contentDigest: "digest", updatedAt: "2026-11-10T00:00:01Z",
+    };
+    render(<Conversation
+      projectId="project-1" ticket={ticket} events={[]} effect={null} receipt={receipt} appliedEffect={null} busy={false}
+      onSubmit={vi.fn()} onCancel={vi.fn()} onRetry={vi.fn()} onExport={vi.fn()} onBranch={vi.fn()}
+      onApprove={vi.fn()} onReject={vi.fn()} onRollback={vi.fn()} onExportReceipt={vi.fn()} hasProject onOpenProject={vi.fn()} error={null}
+      sidebarOpen inspectorOpen={false} onToggleSidebar={vi.fn()} onToggleInspector={vi.fn()}
+      providerStatus="ready" modelProvider="bundled" providerModel="" modelPerformance={null}
+    />);
+
+    const evidence = screen.getByRole("article", { name: "结果证据" });
+    expect(evidence).toHaveTextContent("pytest：3 passed · test_fibonacci.py");
+    expect(evidence).not.toHaveTextContent("项目来源已核验");
+  });
+
+  it("repairs legacy receipts that stored delivery pytest evidence under sources", () => {
+    const receipt: EvidenceReceipt = {
+      ticketId: ticket.id, request: "验证 fibonacci.py", route: "verified_edit", outcome: "completed",
+      sources: [{ toolName: "pytest", status: "succeeded", exitCode: 0, sourcePaths: ["test_fibonacci.py"], preview: "3 passed in 0.02s" }],
+      commands: [], tests: [], effects: [{ event: "effect.applied" }], decisions: [], finalState: {}, contentDigest: "digest", updatedAt: "2026-11-10T00:00:01Z",
+    };
+    render(<Conversation
+      projectId="project-1" ticket={ticket} events={[]} effect={null} receipt={receipt} appliedEffect={null} busy={false}
+      onSubmit={vi.fn()} onCancel={vi.fn()} onRetry={vi.fn()} onExport={vi.fn()} onBranch={vi.fn()}
+      onApprove={vi.fn()} onReject={vi.fn()} onRollback={vi.fn()} onExportReceipt={vi.fn()} hasProject onOpenProject={vi.fn()} error={null}
+      sidebarOpen inspectorOpen={false} onToggleSidebar={vi.fn()} onToggleInspector={vi.fn()}
+      providerStatus="ready" modelProvider="bundled" providerModel="" modelPerformance={null}
+    />);
+    const evidence = screen.getByRole("article", { name: "结果证据" });
+    expect(evidence).toHaveTextContent("pytest：3 passed · test_fibonacci.py");
+    expect(evidence).toHaveTextContent("来源 0");
+    expect(evidence).toHaveTextContent("测试 1");
+  });
+
   it("reveals observed response performance only inside the model menu", () => {
     render(<Conversation
       projectId="project-1" ticket={ticket} events={[]} effect={null} receipt={null} appliedEffect={null} busy={false}
