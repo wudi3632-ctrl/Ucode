@@ -119,6 +119,90 @@ impl AttachmentStore {
         }
     }
 
+    pub fn append(
+        &mut self,
+        selection_id: &str,
+        project_id: &str,
+        project_root: &Path,
+        paths: Vec<PathBuf>,
+    ) -> Result<ContextAttachmentSelection, String> {
+        let now = SystemTime::now();
+        self.remove_expired(now);
+        let selection = self
+            .selections
+            .get(selection_id)
+            .ok_or_else(|| "附件选择已失效，请重新添加文件".to_string())?;
+        if selection.project_id != project_id {
+            return Err("附件选择不属于当前项目".into());
+        }
+
+        let project_root =
+            fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+        let existing_paths = selection
+            .attachments
+            .iter()
+            .map(|item| item.canonical_path.clone())
+            .collect::<Vec<_>>();
+        let mut known_paths = existing_paths;
+        let mut remaining = MAX_CONTEXT_BYTES.saturating_sub(
+            selection
+                .attachments
+                .iter()
+                .map(|item| item.summary.included_bytes)
+                .sum::<usize>(),
+        );
+        let mut available_slots = MAX_ATTACHMENTS.saturating_sub(selection.attachments.len());
+        let mut prepared = Vec::new();
+        let mut errors = Vec::new();
+
+        for path in paths {
+            let canonical_path = fs::canonicalize(&path).ok();
+            if canonical_path
+                .as_ref()
+                .is_some_and(|candidate| known_paths.iter().any(|known| known == candidate))
+            {
+                continue;
+            }
+            if available_slots == 0 {
+                errors.push(ContextAttachmentError {
+                    display_name: path
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or("未命名文件")
+                        .to_string(),
+                    code: "attachment_limit".into(),
+                    message: "本轮最多添加 8 个附件".into(),
+                });
+                continue;
+            }
+            match prepare_file(&project_root, &path, remaining) {
+                Ok(item) => {
+                    remaining = remaining.saturating_sub(item.summary.included_bytes);
+                    available_slots -= 1;
+                    known_paths.push(item.canonical_path.clone());
+                    prepared.push(item);
+                }
+                Err(error) => errors.push(error),
+            }
+        }
+
+        let selection = self
+            .selections
+            .get_mut(selection_id)
+            .ok_or_else(|| "附件选择已失效，请重新添加文件".to_string())?;
+        selection.created_at = now;
+        selection.attachments.extend(prepared);
+        Ok(ContextAttachmentSelection {
+            selection_id: selection_id.to_string(),
+            attachments: selection
+                .attachments
+                .iter()
+                .map(|item| item.summary.clone())
+                .collect(),
+            errors,
+        })
+    }
+
     pub fn resolve(
         &mut self,
         selection_id: Option<&str>,
@@ -354,6 +438,41 @@ mod tests {
     }
 
     #[test]
+    fn appends_to_an_existing_selection_and_ignores_duplicate_paths() {
+        let root = tempdir().unwrap();
+        let project = root.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let first = project.join("first.txt");
+        let second = root.path().join("second.txt");
+        fs::write(&first, "first").unwrap();
+        fs::write(&second, "second").unwrap();
+        let mut store = AttachmentStore::default();
+        let initial = store.prepare("project-1", &project, vec![first.clone()]);
+
+        let appended = store
+            .append(
+                &initial.selection_id,
+                "project-1",
+                &project,
+                vec![first, second],
+            )
+            .unwrap();
+
+        assert_eq!(appended.selection_id, initial.selection_id);
+        assert_eq!(appended.attachments.len(), 2);
+        assert_eq!(appended.attachments[0].source, "project");
+        assert_eq!(appended.attachments[1].source, "external_readonly");
+        assert!(appended.errors.is_empty());
+        assert_eq!(
+            store
+                .resolve(Some(&appended.selection_id), "project-1")
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
     fn rejects_binary_oversize_project_mismatch_and_changed_files() {
         let root = tempdir().unwrap();
         let project = root.path().join("project");
@@ -419,6 +538,41 @@ mod tests {
             .unwrap();
         assert_eq!(payload.len(), 1);
         store.complete(Some(&selection.selection_id));
+        assert!(store
+            .resolve(Some(&selection.selection_id), "project-1")
+            .is_err());
+    }
+
+    #[test]
+    fn accepts_text_by_content_caps_eight_files_and_expires_the_selection() {
+        let root = tempdir().unwrap();
+        let project = root.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let mut paths = Vec::new();
+        for index in 0..10 {
+            let file = project.join(format!("context-{index}.ucode"));
+            fs::write(&file, format!("plain UTF-8 context {index}")).unwrap();
+            paths.push(file);
+        }
+        let invalid = project.join("invalid.txt");
+        fs::write(&invalid, [0xff_u8, 0xfe, 0xfd]).unwrap();
+        let mut store = AttachmentStore::default();
+        let selection = store.prepare("project-1", &project, paths);
+        assert_eq!(selection.attachments.len(), MAX_ATTACHMENTS);
+        assert!(selection.errors.is_empty());
+        assert!(selection
+            .attachments
+            .iter()
+            .all(|item| item.display_name.ends_with(".ucode")));
+
+        let rejected = store.prepare("project-1", &project, vec![invalid]);
+        assert_eq!(rejected.errors[0].code, "attachment_encoding");
+
+        store
+            .selections
+            .get_mut(&selection.selection_id)
+            .unwrap()
+            .created_at = SystemTime::UNIX_EPOCH;
         assert!(store
             .resolve(Some(&selection.selection_id), "project-1")
             .is_err());

@@ -277,7 +277,7 @@ export async function exportEvidenceReceipt(suggestedName: string, content: stri
   return path;
 }
 
-export async function chooseContextAttachments(projectId: string): Promise<ContextAttachmentSelection | null> {
+export async function chooseContextAttachments(projectId: string, selectionId?: string): Promise<ContextAttachmentSelection | null> {
   if (!inTauri()) {
     return {
       selectionId: "selection-demo",
@@ -294,7 +294,7 @@ export async function chooseContextAttachments(projectId: string): Promise<Conte
       errors: [],
     };
   }
-  return invoke<ContextAttachmentSelection | null>("choose_context_attachments", { projectId });
+  return invoke<ContextAttachmentSelection | null>("choose_context_attachments", { projectId, selectionId });
 }
 
 export async function removeContextAttachment(selectionId: string, attachmentId: string): Promise<void> {

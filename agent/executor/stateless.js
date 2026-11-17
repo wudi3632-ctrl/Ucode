@@ -66,6 +66,7 @@ export class StatelessExecutor {
     const actual = new Set(this.tools.listFiles(root));
     const allowed = [...indexed].filter((file) => actual.has(file));
     const query = request.inputs.map((input) => input.text).join("\n").trim();
+    const attached = attachmentFiles(request);
 
     if (/(有哪些文件|文件列表|目录结构|列出.{0,6}(文件|目录)|what files|list files)/i.test(query)) {
       const shown = allowed.slice(0, 40);
@@ -80,6 +81,19 @@ export class StatelessExecutor {
       return `找到多个同名文件，请指定相对路径：\n\n${selected.paths.map((file) => `- ${file}`).join("\n")}`;
     }
     if (!selected.paths.length) {
+      if (attached.length) {
+        const coder = this.coder();
+        if (!coder) throw new AppError("chat_provider_unavailable", "对话模型尚未启动。", 503);
+        const messages = projectMessages(request, attached, PROJECT_PROMPT, { currentTurnOnly: true });
+        const content = await trustedProjectContent(coder, {
+          task_id: request.turnId,
+          messages,
+          workspace: { root, files: [] },
+          tools: [],
+          mode: "project_read",
+        }, options);
+        return `${content.trim()}\n\n来源\n${attached.map(projectSourceLine).join("\n")}`;
+      }
       const requested = extractRequestedPaths(query);
       const unsafe = requested.find((file) => unsafeRequestedPath(file)) || (hasPathTraversalIntent(query) ? ".." : null);
       if (unsafe) {
@@ -143,8 +157,8 @@ export class StatelessExecutor {
 
     const coder = this.coder();
     if (!coder) throw new AppError("chat_provider_unavailable", "对话模型尚未启动。", 503);
-    const contextFiles = [...files, ...attachmentFiles(request)];
-    const messages = projectMessages(request, contextFiles, PROJECT_PROMPT);
+    const contextFiles = [...files, ...attached];
+    const messages = projectMessages(request, contextFiles, PROJECT_PROMPT, { currentTurnOnly: attached.length > 0 });
     const payload = {
       task_id: request.turnId,
       messages,
@@ -156,7 +170,7 @@ export class StatelessExecutor {
       mode: "project_read",
     };
     const content = await trustedProjectContent(coder, payload, options);
-    return `${content.trim()}\n\n来源\n${files.map((file) => `- \`${file.path}\``).join("\n")}`;
+    return `${content.trim()}\n\n来源\n${contextFiles.map(projectSourceLine).join("\n")}`;
   }
 
   async action(request, options) {
@@ -390,9 +404,10 @@ function boundedStop(options, content) {
   return content;
 }
 
-function projectMessages(request, files, system) {
+function projectMessages(request, files, system, { currentTurnOnly = false } = {}) {
   const messages = modelMessages(request, system);
   const current = messages.pop();
+  if (currentTurnOnly) messages.splice(1);
   let remaining = 1_800;
   const excerpts = [];
   for (const file of files) {
@@ -408,6 +423,12 @@ function projectMessages(request, files, system) {
     content: `以下是桌面宿主刚读取的真实文件内容。不要再调用读取工具，只回答末尾的问题。${excerpts.join("")}\n\n问题：${question}`,
   });
   return messages;
+}
+
+function projectSourceLine(file) {
+  if (!file.attachment) return `- \`${file.path}\``;
+  const origin = file.source === "project" ? "项目附件" : "外部只读附件";
+  return `- \`${file.displayName || file.path}\`（${origin}）`;
 }
 
 function questionAfterRead(query, files) {

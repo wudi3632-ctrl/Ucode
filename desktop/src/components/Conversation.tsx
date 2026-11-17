@@ -3,6 +3,7 @@ import { chooseContextAttachments, removeContextAttachment } from "../bridge/des
 import type { AppliedEffect, AppSettings, ContextAttachmentSelection, ContextAttachmentSummary, EvidenceReceipt, OnboardingState, ProposedEffect, RuntimeEvent, TicketSummary } from "../domain/types";
 import type { ObservedModelPerformance } from "../domain/modelPerformance";
 import { changedLineCounts } from "../domain/diff";
+import { buildComposerHistory, canStartComposerHistory, exitComposerHistory, moveComposerHistory, type ComposerHistoryState } from "../domain/composerHistory";
 import { RichText } from "./RichText";
 import { completedOnboardingState, OnboardingTip, OnboardingWelcome } from "./Onboarding";
 
@@ -72,11 +73,13 @@ export function Conversation({ projectId, ticket, events, effect, receipt, appli
   const [copied, setCopied] = useState<string | null>(null);
   const [rollbackConfirm, setRollbackConfirm] = useState(false);
   const [effectSelection, setEffectSelection] = useState<{ effectId: string; paths: string[] } | null>(null);
+  const [historyState, setHistoryState] = useState<ComposerHistoryState>({ cursor: null, draft: "" });
   const endRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const submittingRef = useRef(false);
   const ticketEvents = useMemo(() => events.filter((event) => event.ticketId === ticket?.id), [events, ticket?.id]);
   const items = useMemo(() => buildTimeline(ticket, ticketEvents, busy), [ticket, ticketEvents, busy]);
+  const requestHistory = useMemo(() => buildComposerHistory(items.flatMap((item) => item.kind === "user" ? [item.content] : [])), [items]);
   const taskContext = useMemo(() => latestTaskContext(ticketEvents), [ticketEvents]);
   const recoveryRequired = items.some((item) => item.kind === "recovery");
   const latestUserRequest = useMemo(() => [...items].reverse().find((item) => item.kind === "user")?.content ?? ticket?.request ?? "", [items, ticket?.request]);
@@ -97,6 +100,7 @@ export function Conversation({ projectId, ticket, events, effect, receipt, appli
   useEffect(() => {
     setSelection(null);
     setRollbackConfirm(false);
+    setHistoryState({ cursor: null, draft: "" });
   }, [projectId, ticket?.id]);
 
   async function submit(event?: FormEvent) {
@@ -108,11 +112,13 @@ export function Conversation({ projectId, ticket, events, effect, receipt, appli
     const clientRequestId = crypto.randomUUID();
     setRequest("");
     setSelection(null);
+    setHistoryState({ cursor: null, draft: "" });
     try {
       const accepted = await onSubmit(value, submittedSelection, clientRequestId);
       if (!accepted) {
         setRequest((current) => current || value);
         setSelection((current) => current || submittedSelection);
+        setHistoryState({ cursor: null, draft: value });
       }
     } finally {
       submittingRef.current = false;
@@ -120,17 +126,55 @@ export function Conversation({ projectId, ticket, events, effect, receipt, appli
   }
 
   function keyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
+    if (event.nativeEvent.isComposing || event.keyCode === 229) return;
+    if (event.key === "ArrowUp" && (historyState.cursor !== null || canStartComposerHistory(request, event.currentTarget.selectionStart, event.currentTarget.selectionEnd))) {
+      const next = moveComposerHistory(requestHistory, historyState, request, "older");
+      if (next) {
+        event.preventDefault();
+        applyHistory(next);
+      }
+      return;
+    }
+    if (event.key === "ArrowDown" && historyState.cursor !== null) {
+      const next = moveComposerHistory(requestHistory, historyState, request, "newer");
+      if (next) {
+        event.preventDefault();
+        applyHistory(next);
+      }
+      return;
+    }
+    if (event.key === "Escape") {
+      const next = exitComposerHistory(historyState);
+      if (next) {
+        event.preventDefault();
+        applyHistory(next, false);
+      }
+      return;
+    }
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
       void submit();
     }
   }
 
+  function applyHistory(next: ReturnType<typeof moveComposerHistory> & object, select = true) {
+    setHistoryState({ cursor: next.cursor, draft: next.draft });
+    setRequest(next.value);
+    window.setTimeout(() => {
+      const input = inputRef.current;
+      if (!input) return;
+      const start = select && next.cursor !== null ? 0 : next.value.length;
+      input.setSelectionRange(start, next.value.length);
+    }, 0);
+  }
+
   async function addAttachments() {
     if (!projectId || attachmentLoading) return;
     setAttachmentLoading(true);
     try {
-      const selected = await chooseContextAttachments(projectId);
+      const selected = selection
+        ? await chooseContextAttachments(projectId, selection.selectionId)
+        : await chooseContextAttachments(projectId);
       if (selected) setSelection(selected);
     } finally {
       setAttachmentLoading(false);
@@ -242,19 +286,28 @@ export function Conversation({ projectId, ticket, events, effect, receipt, appli
           </div>}
           {selection.errors.map((item) => <div className="attachment-error" role="status" key={`${item.displayName}-${item.code}`}><b>{item.displayName}</b><span>{item.message}</span></div>)}
         </div>}
-        <textarea
-          ref={inputRef}
-          aria-label="任务输入"
-          placeholder={recoveryRequired ? "该任务已锁定，请先检查恢复文件…" : ticket ? "继续追问或交代任务…" : "描述你想完成的任务…"}
-          value={request}
-          onChange={(event) => setRequest(event.target.value)}
-          onKeyDown={keyDown}
-          rows={1}
-          disabled={!hasProject || providerStatus !== "ready" || recoveryRequired}
-        />
+        <div className="composer-input-wrap">
+          <textarea
+            ref={inputRef}
+            aria-label="任务输入"
+            placeholder={recoveryRequired ? "该任务已锁定，请先检查恢复文件…" : ticket ? "继续追问或交代任务…" : "描述你想完成的任务…"}
+            value={request}
+            onChange={(event) => {
+              setRequest(event.target.value);
+              if (historyState.cursor !== null) setHistoryState({ cursor: null, draft: event.target.value });
+            }}
+            onKeyDown={keyDown}
+            rows={1}
+            disabled={!hasProject || providerStatus !== "ready" || recoveryRequired}
+          />
+          {historyState.cursor !== null && <span className="composer-history-indicator" role="status">历史 {historyState.cursor + 1}/{requestHistory.length}</span>}
+        </div>
         <div className="composer-footer">
           <div className="composer-tools">
-            <button type="button" className="tool-button" aria-label="添加上下文文件" onClick={addAttachments} disabled={!projectId || attachmentLoading}>{attachmentLoading ? "…" : "＋"}</button>
+            <span className="attachment-tool">
+              <button type="button" className="tool-button" aria-label={attachmentLoading ? "正在添加上下文文件" : "添加上下文文件"} aria-busy={attachmentLoading} title="添加上下文文件（最多 8 个 UTF-8 文本）" onClick={addAttachments} disabled={!projectId || attachmentLoading}>{attachmentLoading ? "…" : "＋"}</button>
+              <span className="attachment-tool-tip" role="tooltip">最多 8 个 UTF-8 文本文件</span>
+            </span>
             <div className="model-control">
               <button type="button" className="model-button" aria-expanded={modelMenuOpen} onClick={() => setModelMenuOpen((value) => !value)}>{modelProvider === "bundled" ? "内置模型" : providerModel || "外部模型"} <span>⌄</span></button>
               {modelMenuOpen && <div className="model-menu" role="dialog" aria-label="模型状态">

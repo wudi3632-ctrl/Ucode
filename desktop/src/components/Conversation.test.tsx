@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { chooseContextAttachments } from "../bridge/desktop";
-import type { EvidenceReceipt, RuntimeEvent, TicketSummary } from "../domain/types";
+import type { ContextAttachmentSelection, EvidenceReceipt, RuntimeEvent, TicketSummary } from "../domain/types";
 import { buildTimeline, Conversation } from "./Conversation";
 
 vi.mock("../bridge/desktop", async (importOriginal) => ({
@@ -9,7 +9,10 @@ vi.mock("../bridge/desktop", async (importOriginal) => ({
   chooseContextAttachments: vi.fn(async () => null),
 }));
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.clearAllMocks();
+});
 
 const ticket: TicketSummary = {
   id: "ticket-1",
@@ -318,6 +321,115 @@ describe("conversation timeline projection", () => {
     expect(onSubmit).toHaveBeenCalledTimes(1);
     expect(input).toHaveValue("");
     finish?.(true);
+  });
+
+  it("navigates current-conversation input history and restores the original draft", () => {
+    render(<Conversation
+      projectId="project-1" ticket={ticket} events={[event(1, "user.message", { content: "第二条问题" })]} effect={null} receipt={null} appliedEffect={null} busy={false}
+      onSubmit={vi.fn()} onCancel={vi.fn()} onRetry={vi.fn()} onExport={vi.fn()} onBranch={vi.fn()}
+      onApprove={vi.fn()} onReject={vi.fn()} onRollback={vi.fn()} onExportReceipt={vi.fn()} hasProject onOpenProject={vi.fn()} error={null}
+      sidebarOpen inspectorOpen={false} onToggleSidebar={vi.fn()} onToggleInspector={vi.fn()}
+      providerStatus="ready" modelProvider="bundled" providerModel="" modelPerformance={null}
+    />);
+    const input = screen.getByLabelText("任务输入") as HTMLTextAreaElement;
+    fireEvent.change(input, { target: { value: "尚未发送的草稿" } });
+    input.setSelectionRange(0, 0);
+
+    fireEvent.keyDown(input, { key: "ArrowUp" });
+    expect(input).toHaveValue("第二条问题");
+    expect(screen.getByRole("status")).toHaveTextContent("历史 2/2");
+    fireEvent.keyDown(input, { key: "ArrowUp" });
+    expect(input).toHaveValue("你好");
+    expect(screen.getByRole("status")).toHaveTextContent("历史 1/2");
+    fireEvent.keyDown(input, { key: "ArrowDown" });
+    expect(input).toHaveValue("第二条问题");
+    fireEvent.keyDown(input, { key: "ArrowDown" });
+    expect(input).toHaveValue("尚未发送的草稿");
+    expect(screen.queryByText(/历史 \d+\/\d+/)).not.toBeInTheDocument();
+
+    input.setSelectionRange(0, 0);
+    fireEvent.keyDown(input, { key: "ArrowUp" });
+    fireEvent.keyDown(input, { key: "Escape" });
+    expect(input).toHaveValue("尚未发送的草稿");
+  });
+
+  it("leaves multiline and IME direction keys to the native editor", () => {
+    render(<Conversation
+      projectId="project-1" ticket={ticket} events={[]} effect={null} receipt={null} appliedEffect={null} busy={false}
+      onSubmit={vi.fn()} onCancel={vi.fn()} onRetry={vi.fn()} onExport={vi.fn()} onBranch={vi.fn()}
+      onApprove={vi.fn()} onReject={vi.fn()} onRollback={vi.fn()} onExportReceipt={vi.fn()} hasProject onOpenProject={vi.fn()} error={null}
+      sidebarOpen inspectorOpen={false} onToggleSidebar={vi.fn()} onToggleInspector={vi.fn()}
+      providerStatus="ready" modelProvider="bundled" providerModel="" modelPerformance={null}
+    />);
+    const input = screen.getByLabelText("任务输入") as HTMLTextAreaElement;
+    fireEvent.change(input, { target: { value: "第一行\n第二行" } });
+    input.setSelectionRange(4, 4);
+    fireEvent.keyDown(input, { key: "ArrowUp" });
+    expect(input).toHaveValue("第一行\n第二行");
+    expect(screen.queryByText(/历史 \d+\/\d+/)).not.toBeInTheDocument();
+
+    fireEvent.change(input, { target: { value: "" } });
+    fireEvent.keyDown(input, { key: "ArrowUp", isComposing: true });
+    expect(input).toHaveValue("");
+  });
+
+  it("keeps selected attachments while recalling history and explains attachment limits", async () => {
+    const selected: ContextAttachmentSelection = {
+      selectionId: "selection-test",
+      attachments: [{ id: "attachment-test", displayName: "notes.md", source: "project", relativePath: "notes.md", sizeBytes: 20, includedBytes: 20, truncated: false, sha256: "a".repeat(64) }],
+      errors: [],
+    };
+    vi.mocked(chooseContextAttachments).mockResolvedValueOnce(selected);
+    render(<Conversation
+      projectId="project-1" ticket={ticket} events={[]} effect={null} receipt={null} appliedEffect={null} busy={false}
+      onSubmit={vi.fn()} onCancel={vi.fn()} onRetry={vi.fn()} onExport={vi.fn()} onBranch={vi.fn()}
+      onApprove={vi.fn()} onReject={vi.fn()} onRollback={vi.fn()} onExportReceipt={vi.fn()} hasProject onOpenProject={vi.fn()} error={null}
+      sidebarOpen inspectorOpen={false} onToggleSidebar={vi.fn()} onToggleInspector={vi.fn()}
+      providerStatus="ready" modelProvider="bundled" providerModel="" modelPerformance={null}
+    />);
+    const add = screen.getByRole("button", { name: "添加上下文文件" });
+    expect(add).toHaveAttribute("title", "添加上下文文件（最多 8 个 UTF-8 文本）");
+    fireEvent.click(add);
+    expect(await screen.findByLabelText("已添加上下文")).toHaveTextContent("notes.md");
+
+    const input = screen.getByLabelText("任务输入") as HTMLTextAreaElement;
+    fireEvent.keyDown(input, { key: "ArrowUp" });
+    expect(input).toHaveValue("你好");
+    expect(screen.getByLabelText("已添加上下文")).toHaveTextContent("notes.md");
+  });
+
+  it("appends files to the current attachment selection instead of replacing it", async () => {
+    const first: ContextAttachmentSelection = {
+      selectionId: "selection-test",
+      attachments: [{ id: "attachment-first", displayName: "inside.md", source: "project", relativePath: "inside.md", sizeBytes: 10, includedBytes: 10, truncated: false, sha256: "a".repeat(64) }],
+      errors: [],
+    };
+    const second: ContextAttachmentSelection = {
+      selectionId: "selection-test",
+      attachments: [
+        ...first.attachments,
+        { id: "attachment-second", displayName: "outside.txt", source: "external_readonly", relativePath: null, sizeBytes: 12, includedBytes: 12, truncated: false, sha256: "b".repeat(64) },
+      ],
+      errors: [],
+    };
+    vi.mocked(chooseContextAttachments)
+      .mockResolvedValueOnce(first)
+      .mockResolvedValueOnce(second);
+    render(<Conversation
+      projectId="project-1" ticket={ticket} events={[]} effect={null} receipt={null} appliedEffect={null} busy={false}
+      onSubmit={vi.fn()} onCancel={vi.fn()} onRetry={vi.fn()} onExport={vi.fn()} onBranch={vi.fn()}
+      onApprove={vi.fn()} onReject={vi.fn()} onRollback={vi.fn()} onExportReceipt={vi.fn()} hasProject onOpenProject={vi.fn()} error={null}
+      sidebarOpen inspectorOpen={false} onToggleSidebar={vi.fn()} onToggleInspector={vi.fn()}
+      providerStatus="ready" modelProvider="bundled" providerModel="" modelPerformance={null}
+    />);
+
+    fireEvent.click(screen.getByRole("button", { name: "添加上下文文件" }));
+    expect(await screen.findByText("inside.md")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "添加上下文文件" }));
+    expect(await screen.findByText("outside.txt")).toBeInTheDocument();
+    expect(screen.getByLabelText("已添加上下文")).toHaveTextContent("inside.md");
+    expect(chooseContextAttachments).toHaveBeenNthCalledWith(1, "project-1");
+    expect(chooseContextAttachments).toHaveBeenNthCalledWith(2, "project-1", "selection-test");
   });
 
   it("approves only the explicitly selected files from a visible batch", () => {

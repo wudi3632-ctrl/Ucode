@@ -135,6 +135,7 @@ pub fn hide_main_window(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 pub async fn choose_context_attachments(
     project_id: String,
+    selection_id: Option<String>,
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Option<ContextAttachmentSelection>, String> {
@@ -156,11 +157,19 @@ pub async fn choose_context_attachments(
         .into_iter()
         .map(|value| value.into_path().map_err(|error| error.to_string()))
         .collect::<Result<Vec<_>, _>>()?;
-    let selection = state
+    let mut attachments = state
         .attachments
         .lock()
-        .map_err(|_| "attachment store lock was poisoned".to_string())?
-        .prepare(&project_id, Path::new(&project.path), paths);
+        .map_err(|_| "attachment store lock was poisoned".to_string())?;
+    let selection = match selection_id {
+        Some(selection_id) => attachments.append(
+            &selection_id,
+            &project_id,
+            Path::new(&project.path),
+            paths,
+        )?,
+        None => attachments.prepare(&project_id, Path::new(&project.path), paths),
+    };
     Ok(Some(selection))
 }
 

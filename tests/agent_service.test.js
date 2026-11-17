@@ -340,9 +340,10 @@ test("grounds one turn with an external read-only attachment without persisting 
   const ticket = value.service.createTicket("这个附件主要讲了什么？");
   value.service.setAttachmentContext(ticket.id, [attachment(`会议结论：${marker}`)]);
   const result = await value.service.plan(ticket.id);
-  const workspaceAttachment = value.coder.calls.at(-1).workspace.files.find((file) => file.attachment);
-  assert.equal(workspaceAttachment.content, `会议结论：${marker}`);
-  assert.match(workspaceAttachment.path, /^attachment:\/\/external\//);
+  const attachmentCall = value.coder.calls.at(-1);
+  assert.deepEqual(attachmentCall.workspace.files, []);
+  assert.match(attachmentCall.messages.at(-1).content, new RegExp(`会议结论：${marker}`));
+  assert.match(attachmentCall.messages.at(-1).content, /当前问题：这个附件主要讲了什么/);
   assert.equal(result.evidence[0].toolName, "attachment_read");
   assert.equal(result.evidence[0].preview, null);
   const persisted = fs.readdirSync(value.data).map((name) => fs.readFileSync(path.join(value.data, name), "utf8")).join("\n");
@@ -401,9 +402,11 @@ test("never exposes attachments as tool paths or overwrites a same-named project
   const second = value.service.createTicket("比较这个附件和 README.md");
   value.service.setAttachmentContext(second.id, [item]);
   await value.service.plan(second.id);
-  const files = value.coder.calls.at(-1).workspace.files;
-  assert.ok(files.some((file) => file.path === "README.md" && !file.attachment));
-  assert.ok(files.some((file) => file.path.startsWith("attachment://external/") && file.attachment));
+  const comparisonCall = value.coder.calls.at(-1);
+  assert.deepEqual(comparisonCall.workspace.files, []);
+  assert.match(comparisonCall.messages.at(-1).content, /# Paper Workspace/);
+  assert.match(comparisonCall.messages.at(-1).content, /external-only/);
+  assert.match(comparisonCall.messages.at(-1).content, /当前问题：比较这个附件和 README\.md/);
 });
 
 test("repairs one unsafe generated Python path and prevents the coder from redirecting it", async (t) => {

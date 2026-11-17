@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { ProjectTools } from "../agent/tools/tools.js";
 import { StatelessExecutor } from "../agent/executor/stateless.js";
 
@@ -147,6 +148,51 @@ test("project read uses only the Rust-supplied index and emits factual activity"
   assert.match(value.calls[0].messages.at(-1).content, /桌面宿主刚读取的真实文件内容/);
   assert.match(value.calls[0].messages.at(-1).content, /Portable desktop agent/);
   assert.match(value.calls[0].messages.at(-1).content, /问题：解释 README\.md/);
+});
+
+test("attachment-only project read grounds the current turn and excludes stale task history", async (t) => {
+  const value = fixture("project_read", "请分别用一句话概括这两个附件的内容，并标明文件名。");
+  const projectContent = "# UCode Starter\n\n这是便携项目示例。";
+  const externalContent = "# 原型说明\n\n这是 UCode 桌面原型设计。";
+  value.request.history = [
+    { role: "user", content: "创建 fibonacci.py 和 test_fibonacci.py" },
+    { role: "assistant", content: "fibonacci.py：实现 fib(n)，test_fibonacci.py：包含 pytest 测试。" },
+  ];
+  value.request.attachmentToken = "selection";
+  value.request.attachments = [
+    {
+      id: "project-readme",
+      displayName: "README.md",
+      source: "project",
+      relativePath: "README.md",
+      contentDigest: createHash("sha256").update(projectContent).digest("hex"),
+      content: projectContent,
+    },
+    {
+      id: "external-readme",
+      displayName: "README-原型.md",
+      source: "external_readonly",
+      relativePath: null,
+      contentDigest: createHash("sha256").update(externalContent).digest("hex"),
+      content: externalContent,
+    },
+  ];
+  t.after(() => fs.rmSync(value.root, { recursive: true, force: true }));
+
+  const content = await value.executor.execute(value.request, { onEvent: (event) => value.events.push(event) });
+
+  assert.match(content, /README\.md/);
+  assert.match(content, /README-原型\.md/);
+  assert.match(content, /项目附件/);
+  assert.match(content, /外部只读附件/);
+  assert.equal(value.calls.length, 1);
+  assert.equal(value.calls[0].mode, "project_read");
+  assert.deepEqual(value.calls[0].workspace.files, []);
+  assert.equal(value.calls[0].messages.length, 2);
+  assert.match(value.calls[0].messages.at(-1).content, /这是便携项目示例/);
+  assert.match(value.calls[0].messages.at(-1).content, /这是 UCode 桌面原型设计/);
+  assert.match(value.calls[0].messages.at(-1).content, /请分别用一句话概括这两个附件/);
+  assert.doesNotMatch(value.calls[0].messages.at(-1).content, /fibonacci/);
 });
 
 test("project read retries once without streaming after a tool-shaped answer", async (t) => {

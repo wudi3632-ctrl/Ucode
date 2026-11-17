@@ -413,10 +413,15 @@ export class AgentService {
     const workspace = projectContext?.workspace || { root: ticket.projectRoot, files: [] };
     if (!this.activeCoder()) throw new AppError("chat_provider_unavailable", "对话模型尚未启动。", 503);
     const prompt = skillPrompt(intent === Intent.PROJECT_QUESTION ? PROJECT_PROMPT : CHAT_PROMPT, ticket.execution.skillContext);
-    const messages = conversationMessages(ticket.execution.messages, prompt);
+    const attachmentTurn = intent === Intent.PROJECT_QUESTION
+      && workspace.files.some((file) => file.attachment && typeof file.content === "string");
+    const messages = attachmentTurn
+      ? groundedTurnMessages(request, workspace.files, `${prompt}\n本轮包含用户刚选择的只读附件。忽略此前任务的文件目标，只依据下方本轮内容回答当前问题。`)
+      : conversationMessages(ticket.execution.messages, prompt);
+    const modelWorkspace = attachmentTurn ? { root: workspace.root, files: [] } : workspace;
     const content = intent === Intent.PROJECT_QUESTION
-      ? await this.generateTrustedProjectText(ticket, { messages, workspace, mode: intent, options, failureMessage: "本地对话模型没有生成可用的项目回答，请重试或切换模型。" })
-      : await this.generateChatText(ticket, { messages, workspace, mode: intent, options });
+      ? await this.generateTrustedProjectText(ticket, { messages, workspace: modelWorkspace, mode: intent, options, failureMessage: "本地对话模型没有生成可用的项目回答，请重试或切换模型。" })
+      : await this.generateChatText(ticket, { messages, workspace: modelWorkspace, mode: intent, options });
     const grounded = intent === Intent.PROJECT_QUESTION ? groundProjectAnswer(content, workspace) : content;
     return this.finishAnswer(ticket, { type: "final", content: grounded, route: intent, evidence: projectContext?.evidence || [] });
   }
@@ -1396,6 +1401,28 @@ function groundProjectAnswer(content, workspace) {
   const contradicted = codeClaims.some((line) => !source.includes(line));
   if (contradicted) return withSources("本地模型的解释未通过文件内容一致性检查，因此没有展示可能错误的结论。", selected.map(sourceLabel));
   return withSources(normalized, selected.map(sourceLabel));
+}
+
+function groundedTurnMessages(request, files, systemPrompt) {
+  const readable = files.filter((file) => typeof file.content === "string");
+  let remaining = 12_000;
+  const excerpts = [];
+  for (const file of readable) {
+    if (remaining <= 0) break;
+    const label = sourceLabel(file);
+    const heading = `\n--- ${label} ---\n`;
+    const available = Math.max(0, remaining - heading.length);
+    const content = String(file.content).slice(0, available);
+    excerpts.push(`${heading}${content}`);
+    remaining -= heading.length + content.length;
+  }
+  return [
+    { role: "system", content: systemPrompt },
+    {
+      role: "user",
+      content: `以下是本轮刚读取的真实内容。每个分隔标题就是对应文件名；不要引用此前对话中的其他文件。${excerpts.join("")}\n\n当前问题：${String(request || "").trim()}`,
+    },
+  ];
 }
 
 function normalizeAttachments(value) {
