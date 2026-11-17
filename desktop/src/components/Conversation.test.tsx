@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { chooseContextAttachments } from "../bridge/desktop";
 import type { ContextAttachmentSelection, EvidenceReceipt, RuntimeEvent, TicketSummary } from "../domain/types";
@@ -323,7 +323,7 @@ describe("conversation timeline projection", () => {
     finish?.(true);
   });
 
-  it("navigates current-conversation input history and restores the original draft", () => {
+  it("navigates current-conversation input history with a collapsed end caret and restores the original draft", async () => {
     render(<Conversation
       projectId="project-1" ticket={ticket} events={[event(1, "user.message", { content: "第二条问题" })]} effect={null} receipt={null} appliedEffect={null} busy={false}
       onSubmit={vi.fn()} onCancel={vi.fn()} onRetry={vi.fn()} onExport={vi.fn()} onBranch={vi.fn()}
@@ -337,20 +337,36 @@ describe("conversation timeline projection", () => {
 
     fireEvent.keyDown(input, { key: "ArrowUp" });
     expect(input).toHaveValue("第二条问题");
+    await waitFor(() => {
+      expect(input.selectionStart).toBe("第二条问题".length);
+      expect(input.selectionEnd).toBe("第二条问题".length);
+    });
     expect(screen.getByRole("status")).toHaveTextContent("历史 2/2");
     fireEvent.keyDown(input, { key: "ArrowUp" });
     expect(input).toHaveValue("你好");
+    await waitFor(() => {
+      expect(input.selectionStart).toBe("你好".length);
+      expect(input.selectionEnd).toBe("你好".length);
+    });
     expect(screen.getByRole("status")).toHaveTextContent("历史 1/2");
     fireEvent.keyDown(input, { key: "ArrowDown" });
     expect(input).toHaveValue("第二条问题");
     fireEvent.keyDown(input, { key: "ArrowDown" });
     expect(input).toHaveValue("尚未发送的草稿");
+    await waitFor(() => {
+      expect(input.selectionStart).toBe("尚未发送的草稿".length);
+      expect(input.selectionEnd).toBe("尚未发送的草稿".length);
+    });
     expect(screen.queryByText(/历史 \d+\/\d+/)).not.toBeInTheDocument();
 
     input.setSelectionRange(0, 0);
     fireEvent.keyDown(input, { key: "ArrowUp" });
     fireEvent.keyDown(input, { key: "Escape" });
     expect(input).toHaveValue("尚未发送的草稿");
+    await waitFor(() => {
+      expect(input.selectionStart).toBe("尚未发送的草稿".length);
+      expect(input.selectionEnd).toBe("尚未发送的草稿".length);
+    });
   });
 
   it("leaves multiline and IME direction keys to the native editor", () => {

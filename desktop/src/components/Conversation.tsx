@@ -147,7 +147,7 @@ export function Conversation({ projectId, ticket, events, effect, receipt, appli
       const next = exitComposerHistory(historyState);
       if (next) {
         event.preventDefault();
-        applyHistory(next, false);
+        applyHistory(next);
       }
       return;
     }
@@ -157,14 +157,13 @@ export function Conversation({ projectId, ticket, events, effect, receipt, appli
     }
   }
 
-  function applyHistory(next: ReturnType<typeof moveComposerHistory> & object, select = true) {
+  function applyHistory(next: ReturnType<typeof moveComposerHistory> & object) {
     setHistoryState({ cursor: next.cursor, draft: next.draft });
     setRequest(next.value);
     window.setTimeout(() => {
       const input = inputRef.current;
       if (!input) return;
-      const start = select && next.cursor !== null ? 0 : next.value.length;
-      input.setSelectionRange(start, next.value.length);
+      input.setSelectionRange(next.value.length, next.value.length);
     }, 0);
   }
 
