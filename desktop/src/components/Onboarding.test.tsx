@@ -36,7 +36,7 @@ describe("progressive onboarding", () => {
     expect(screen.getByText(/完成 2 项，跳过 1 项/)).toBeInTheDocument();
     const list = screen.getByRole("list");
     expect(within(list).getByText("打开一个项目").closest("li")).toHaveClass("done");
-    expect(within(list).getByText("查看 Git 状态").closest("li")).toHaveClass("skipped");
+    expect(within(list).getByText("了解本地版本保护").closest("li")).toHaveClass("skipped");
     fireEvent.click(screen.getByRole("button", { name: "打开 Diff" }));
     expect(action).toHaveBeenCalledWith("review_change");
   });

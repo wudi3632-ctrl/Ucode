@@ -170,7 +170,10 @@ export class StatelessExecutor {
       mode: "project_read",
     };
     const content = await trustedProjectContent(coder, payload, options);
-    return `${content.trim()}\n\n来源\n${contextFiles.map(projectSourceLine).join("\n")}`;
+    const grounded = selected.summary && !projectAnswerIsGrounded(content, contextFiles)
+      ? groundedProjectOverview(contextFiles)
+      : content.trim();
+    return `${grounded}\n\n来源\n${contextFiles.map(projectSourceLine).join("\n")}`;
   }
 
   async action(request, options) {
@@ -396,6 +399,9 @@ function formatTaskContext(value) {
     const items = Array.isArray(value[key]) ? value[key].filter((item) => typeof item === "string" && item.trim()).slice(0, 10) : [];
     if (items.length) lines.push(`${label}：${items.join("；")}`);
   }
+  if (typeof value.scoutFindings === "string" && value.scoutFindings.trim()) {
+    lines.push(`并行只读分析：\n${value.scoutFindings.trim().slice(0, 2500)}`);
+  }
   return lines.join("\n").slice(0, 4_000);
 }
 
@@ -545,6 +551,41 @@ function describeFile(file) {
     ? `其中定义了 ${symbols.map((name) => `\`${name}\``).join("、")}。`
     : "当前内容中没有识别到可列出的函数或类定义。");
   return `\`${file.path}\` 是一个${type}。${detail}\n\n来源\n- \`${file.path}\``;
+}
+
+function projectAnswerIsGrounded(content, files) {
+  const value = String(content || "").trim();
+  if (!value || value.length > 1_600) return false;
+  const allowed = new Set(files.flatMap((file) => {
+    const normalized = String(file.path || "").replaceAll("\\", "/").toLowerCase();
+    return [normalized, path.basename(normalized)];
+  }));
+  const mentioned = extractRequestedPaths(value).map((item) => normalizeRequestedPath(item).toLowerCase());
+  if (mentioned.some((item) => !allowed.has(item) && !allowed.has(path.basename(item)))) return false;
+  const clauses = value.split(/[。！？!?\n]+/u).map((item) => item.trim()).filter((item) => item.length >= 12);
+  return !clauses.some((clause, index) => clauses.indexOf(clause) !== index);
+}
+
+function groundedProjectOverview(files) {
+  const testFiles = files.filter((file) => /(^|\/)(?:test[_-].+|.+[_-]test)\.[^/]+$/i.test(file.path));
+  const configFiles = files.filter((file) => /(^|\/)(?:package\.json|cargo\.toml|pyproject\.toml|requirements[^/]*\.txt|dockerfile|\.gitignore)$/i.test(file.path));
+  const implementationFiles = files.filter((file) => !testFiles.includes(file) && !configFiles.includes(file));
+  const line = (label, values) => values.length
+    ? `- ${label}：${values.map((file) => `\`${file.path}\``).join("、")}`
+    : `- ${label}：本轮没有读取到可核验文件`;
+  const symbols = implementationFiles.flatMap((file) => [...file.content.matchAll(/^(?:async\s+)?(?:def|function|class)\s+([A-Za-z_$][\w$]*)|^(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)/gm)]
+    .map((match) => match[1] || match[2])
+    .filter(Boolean)
+    .slice(0, 4)
+    .map((name) => `\`${name}\``));
+  return [
+    `本轮核验了 ${files.length} 个代表性文件，结论只覆盖这些来源：`,
+    line("实现与文档", implementationFiles),
+    line("测试", testFiles),
+    line("构建与配置", configFiles),
+    symbols.length ? `- 可确认的主要符号：${symbols.join("、")}` : "- 可确认的主要符号：本轮内容中未识别到明确入口",
+    "- 风险：本轮没有执行测试，也没有读取全部文件；不能据此声称整个项目已经验证。",
+  ].join("\n");
 }
 
 function describeReadmePurpose(content) {

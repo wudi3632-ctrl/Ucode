@@ -6,8 +6,8 @@ export const onboardingSteps: Array<{ id: OnboardingStepId; title: string; descr
   { id: "conversation", title: "完成一次对话", description: "提问、解释代码或分析项目；回答完成后才计入。", action: "去提问" },
   { id: "review_change", title: "审查并批准修改", description: "先看 Diff，再明确批准；批准前文件不会改变。", action: "打开 Diff" },
   { id: "terminal", title: "使用持久终端", description: "命令需要审批，可以在运行中发送 Ctrl+C。", action: "打开终端" },
-  { id: "git", title: "查看 Git 状态", description: "查看变更与历史；非 Git 项目可以跳过。", action: "打开 Git" },
-  { id: "agent", title: "完成一次 Agent 任务", description: "只读分析直接运行，编辑任务进入隔离 Worktree。", action: "打开 Agents" },
+  { id: "git", title: "了解本地版本保护", description: "UCode 在后台使用本地 Git 与 Diff 保护修改，不需要联网或手动管理。", action: "已了解" },
+  { id: "agent", title: "了解自动并行分析", description: "复杂任务会自动启用只读 Agent，简单任务不会增加等待。", action: "已了解" },
   { id: "evidence", title: "查看结果证据", description: "区分实际观察、执行结果和仅提出的计划。", action: "查看证据" },
 ];
 

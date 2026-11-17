@@ -91,6 +91,25 @@ describe("conversation timeline projection", () => {
     expect(evidence).not.toHaveTextContent("文件已变更");
   });
 
+  it("describes chat without pretending project evidence was checked", () => {
+    const receipt: EvidenceReceipt = {
+      ticketId: ticket.id, request: "15", route: "chat", outcome: "completed",
+      sources: [], commands: [], tests: [], effects: [], decisions: [], finalState: {},
+      contentDigest: "digest", updatedAt: "2026-11-10T00:00:01Z",
+    };
+    render(<Conversation
+      projectId="project-1" ticket={ticket} events={[]} effect={null} receipt={receipt} appliedEffect={null} busy={false}
+      onSubmit={vi.fn()} onCancel={vi.fn()} onRetry={vi.fn()} onExport={vi.fn()} onBranch={vi.fn()}
+      onApprove={vi.fn()} onReject={vi.fn()} onRollback={vi.fn()} onExportReceipt={vi.fn()} hasProject onOpenProject={vi.fn()} error={null}
+      sidebarOpen inspectorOpen={false} onToggleSidebar={vi.fn()} onToggleInspector={vi.fn()}
+      providerStatus="ready" modelProvider="bundled" providerModel="" modelPerformance={null}
+    />);
+    const evidence = screen.getByRole("article", { name: "结果证据" });
+    expect(evidence).toHaveTextContent("本轮请求15");
+    expect(evidence).toHaveTextContent("本轮不需要项目证据");
+    expect(evidence).toHaveTextContent("回答由本地模型生成，未读取项目文件");
+  });
+
   it("shows the observed pytest result instead of counting it as a generic source", () => {
     const receipt: EvidenceReceipt = {
       ticketId: ticket.id,

@@ -1,5 +1,5 @@
 import { CSSProperties, KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent, useEffect, useMemo, useRef, useState } from "react";
-import { archiveTicket, bootstrap, branchTicket, cancelTicket, chooseProject, clearNotificationIdentity, completeOnboardingStep, continueTicket, createOnboardingDemo, createTicket, deleteTicket, dismissOnboardingTip, exportEvidenceReceipt, exportMarkdown, getRuntimeDiagnostics, listEvents, mainWindowActivity, markFrontendReady, pinTicket, recheckCapsule, recoverLocalRuntime, renameTicket, resetOnboarding, resolveEffect, rollbackEffect, runTicket, saveSettings, selectProject, setOnboardingWelcome, showCompletionNotification, skipOnboardingStep, subscribeRuntimeEvents } from "../bridge/desktop";
+import { archiveTicket, bootstrap, branchTicket, cancelTicket, chooseProject, clearNotificationIdentity, completeOnboardingStep, continueTicket, createOnboardingDemo, createTicket, deleteTicket, dismissOnboardingTip, exportEvidenceReceipt, exportMarkdown, getRuntimeDiagnostics, listEvents, mainWindowActivity, markFrontendReady, pinTicket, recheckCapsule, recoverLocalRuntime, renameTicket, resetOnboarding, resolveEffect, rollbackEffect, runTicket, saveSettings, selectProject, setOnboardingWelcome, showCompletionNotification, skipOnboardingStep, subscribeRuntimeEvents, syncNativeTheme } from "../bridge/desktop";
 import { Conversation } from "../components/Conversation";
 import { Inspector } from "../components/Inspector";
 import { Sidebar } from "../components/Sidebar";
@@ -112,6 +112,7 @@ export function App() {
     const applyTheme = () => {
       document.documentElement.dataset.themePreference = settings.theme;
       document.documentElement.dataset.theme = resolveTheme(settings.theme, media?.matches ?? false);
+      void syncNativeTheme(settings.theme);
     };
     applyTheme();
     if (settings.theme !== "system" || !media) return;

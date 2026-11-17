@@ -16,7 +16,7 @@ function openInspector() {
   return screen.getByRole("tablist", { name: "任务上下文" });
 }
 
-function selectInspectorTab(name: "Diff" | "文件" | "终端" | "Git" | "Agents") {
+function selectInspectorTab(name: "Diff" | "文件" | "终端") {
   fireEvent.click(within(openInspector()).getByRole("tab", { name }));
 }
 
@@ -152,8 +152,8 @@ describe("UCode desktop", () => {
     fireEvent.change(filter, { target: { value: "calculator.py" } });
     fireEvent.click(document.querySelector<HTMLElement>('button[role="treeitem"] b[title="calculator.py"]')!.closest("button")!);
     expect(await screen.findByRole("region", { name: "calculator.py 文件内容" })).toHaveTextContent("return a - b");
-    selectInspectorTab("Git");
-    expect(await screen.findByText("1 个变更")).toBeInTheDocument();
+    expect(within(openInspector()).queryByRole("tab", { name: "Git" })).not.toBeInTheDocument();
+    expect(within(openInspector()).queryByRole("tab", { name: "Agents" })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /内置模型/ }));
     expect(screen.getByRole("dialog", { name: "模型状态" })).toHaveTextContent("UCode 安全路由器");
     expect(screen.getByRole("dialog", { name: "模型状态" })).toHaveTextContent("已验证的本地模型包");
@@ -164,8 +164,8 @@ describe("UCode desktop", () => {
     const project = { id: "project-review", name: "review-project", path: "E:\\review-project", trusted: true } as never;
     const props = { ticket, project, events: [], onExpandedChange: () => undefined, onOpenProject: async () => undefined, onClose: () => undefined };
     const view = render(<Inspector {...props} effect={null} />);
-    fireEvent.click(screen.getByRole("tab", { name: "Agents" }));
-    expect(screen.getByRole("tab", { name: "Agents" })).toHaveAttribute("aria-selected", "true");
+    fireEvent.click(screen.getByRole("tab", { name: "文件" }));
+    expect(screen.getByRole("tab", { name: "文件" })).toHaveAttribute("aria-selected", "true");
 
     view.rerender(<Inspector {...props} effect={{ id: "effect-review", changes: [
       { path: "knapsack.py", operation: "modify", before: "value = 1\n", after: "# reviewed\nvalue = 1\n", beforeDigest: null, afterDigest: null },
@@ -361,62 +361,16 @@ describe("UCode desktop", () => {
     const approval = screen.getByText("批准写入交互终端？").closest<HTMLElement>(".inline-approval")!;
     fireEvent.click(within(approval).getByRole("button", { name: "批准执行" }));
     await screen.findByText(/demo output/);
-    selectInspectorTab("Git");
-    await screen.findByText("1 个变更");
+    selectInspectorTab("文件");
+    await screen.findByRole("tree", { name: "项目文件" });
     selectInspectorTab("终端");
     expect(screen.getByText(/demo output/)).toBeInTheDocument();
   });
 
-  it("creates a Git worktree only after inline approval", async () => {
+  it("keeps Git and Agent management out of the primary workflow", async () => {
     render(<App />);
     await screen.findByRole("heading", { name: "修复加法函数" });
-    selectInspectorTab("Git");
-    await screen.findByText("1 个变更");
-    fireEvent.click(screen.getByRole("button", { name: "工作树" }));
-    expect(await screen.findByText("main")).toBeInTheDocument();
-    fireEvent.change(screen.getByLabelText("Worktree 目录名称"), { target: { value: "feature-login" } });
-    fireEvent.change(screen.getByLabelText("Worktree 分支名称"), { target: { value: "feature/login" } });
-    fireEvent.click(screen.getByRole("button", { name: "创建 Worktree" }));
-    const approval = screen.getByText("批准创建 Worktree？").closest<HTMLElement>(".inline-approval")!;
-    expect(screen.queryByText("E:\\UCode\\worktrees\\feature-login")).not.toBeInTheDocument();
-    fireEvent.click(within(approval).getByRole("button", { name: "批准并执行" }));
-    expect(await screen.findByText("E:\\UCode\\worktrees\\feature-login")).toBeInTheDocument();
-  });
-
-  it("delegates multiple read-only subagents after approval and shows results", async () => {
-    render(<App />);
-    await screen.findByRole("heading", { name: "修复加法函数" });
-    selectInspectorTab("Agents");
-    await screen.findByText("并行子任务");
-    fireEvent.change(screen.getByLabelText("子任务 1 名称"), { target: { value: "检查测试" } });
-    fireEvent.change(screen.getByLabelText("子任务 1 内容"), { target: { value: "分析现有测试覆盖范围" } });
-    fireEvent.click(screen.getByRole("button", { name: "+ 添加子任务" }));
-    fireEvent.change(screen.getByLabelText("子任务 2 名称"), { target: { value: "检查结构" } });
-    fireEvent.change(screen.getByLabelText("子任务 2 内容"), { target: { value: "分析项目模块边界" } });
-    fireEvent.click(screen.getByRole("button", { name: "委派 2 个任务" }));
-    const approval = screen.getByText("批准启动 2 个 Sub-agent？").closest<HTMLElement>(".inline-approval")!;
-    fireEvent.click(within(approval).getByRole("button", { name: "批准并启动" }));
-    expect(await screen.findByText("已完成“检查测试”的只读分析。")).toBeInTheDocument();
-    expect(screen.getByText("已完成“检查结构”的只读分析。")).toBeInTheDocument();
-  });
-
-  it("reviews an isolated edit subagent before writing and merging", async () => {
-    render(<App />);
-    await screen.findByRole("heading", { name: "修复加法函数" });
-    selectInspectorTab("Agents");
-    await screen.findByText("并行子任务");
-    fireEvent.click(within(screen.getByLabelText("子任务 1 权限")).getByRole("button", { name: "隔离编辑" }));
-    fireEvent.change(screen.getByLabelText("子任务 1 名称"), { target: { value: "修复实现" } });
-    fireEvent.change(screen.getByLabelText("子任务 1 内容"), { target: { value: "修改 app.ts 中的现有函数" } });
-    fireEvent.click(screen.getByRole("button", { name: "委派 1 个任务" }));
-    fireEvent.click(within(screen.getByText("批准启动 1 个 Sub-agent？").closest<HTMLElement>(".inline-approval")!).getByRole("button", { name: "批准并启动" }));
-    expect(await screen.findByText(/修改已生成，等待审批/)).toBeInTheDocument();
-    expect(screen.getByText(/\+new/)).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "批准写入 Worktree" }));
-    expect(await screen.findByRole("button", { name: "审查并合并" })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "审查并合并" }));
-    const approval = screen.getByText("批准合并到主工作区？").closest<HTMLElement>(".inline-approval")!;
-    fireEvent.click(within(approval).getByRole("button", { name: "批准合并" }));
-    expect(await screen.findByText(/已合并 · 主工作区仍需自行暂存或提交/)).toBeInTheDocument();
+    const tabs = openInspector();
+    expect(within(tabs).getAllByRole("tab").map((tab) => tab.textContent)).toEqual(["Diff", "文件", "终端"]);
   });
 });

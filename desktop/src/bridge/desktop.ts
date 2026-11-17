@@ -98,6 +98,12 @@ export async function mainWindowActivity(): Promise<MainWindowActivity> {
   return invoke<MainWindowActivity>("main_window_activity");
 }
 
+export async function syncNativeTheme(theme: AppSettings["theme"]): Promise<void> {
+  if (!inTauri()) return;
+  const { getCurrentWindow } = await import("@tauri-apps/api/window");
+  await getCurrentWindow().setTheme(theme === "system" ? null : theme);
+}
+
 export async function showCompletionNotification(): Promise<void> {
   if (inTauri()) await invoke<void>("show_completion_notification");
 }

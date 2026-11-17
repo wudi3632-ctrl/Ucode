@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { chooseSkillDirectory, clearProviderSecret, getNotificationDiagnostics, getNotificationIdentityStatus, getProviderSecretStatus, getRuntimeDiagnostics, installSkill, listModelPacks, listSkills, previewSkill, recoverLocalRuntime, repairNotificationIdentity, saveProviderSecret, setSkillEnabled, testModelProvider, uninstallSkill } from "../bridge/desktop";
+import { chooseSkillDirectory, clearProviderSecret, getNotificationDiagnostics, getNotificationIdentityStatus, getProviderSecretStatus, getRuntimeDiagnostics, installSkill, listModelPacks, listSkills, previewSkill, recoverLocalRuntime, repairNotificationIdentity, saveProviderSecret, setSkillEnabled, syncNativeTheme, testModelProvider, uninstallSkill } from "../bridge/desktop";
 import type { AppSettings, ModelPackInfo, NotificationDiagnostics, NotificationIdentityStatus, RuntimeDiagnosticSnapshot, SkillPreview, SkillSummary } from "../domain/types";
 import { clampSoundVolume, previewAudioCue } from "../domain/audioFeedback";
 import { CODE_FONT_DEFAULT, CODE_FONT_MAX, CODE_FONT_MIN, UI_FONT_DEFAULT, UI_FONT_MAX, UI_FONT_MIN, codeFontScale, codeFontSize, uiFontScale, uiFontSize } from "../domain/typography";
@@ -48,11 +48,13 @@ export function Settings({ value, onClose, onSave, onClearNotificationIdentity }
       : theme;
     root.dataset.themePreference = draft.theme;
     root.dataset.theme = resolve(draft.theme);
+    void syncNativeTheme(draft.theme);
     root.classList.toggle("reduce-motion", draft.reduceMotion);
     return () => {
       if (committedRef.current) return;
       root.dataset.themePreference = value.theme;
       root.dataset.theme = resolve(value.theme);
+      void syncNativeTheme(value.theme);
       root.classList.toggle("reduce-motion", value.reduceMotion);
     };
   }, [draft.theme, draft.reduceMotion, value.theme, value.reduceMotion]);

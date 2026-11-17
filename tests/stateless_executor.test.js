@@ -122,6 +122,7 @@ test("persisted task context is supplied to the model without granting authority
     constraints: ["保持公开 API 不变"],
     verification: ["运行 pytest"],
     unresolvedQuestions: [],
+    scoutFindings: "实现定位：入口是 src/app.py\n\n验证与风险：tests/test_app.py 覆盖公开 API",
   };
   t.after(() => fs.rmSync(value.root, { recursive: true, force: true }));
 
@@ -131,6 +132,8 @@ test("persisted task context is supplied to the model without granting authority
   assert.match(system, /宿主持久化的任务上下文/);
   assert.match(system, /目标：修复 src\/app\.py/);
   assert.match(system, /保持公开 API 不变/);
+  assert.match(system, /并行只读分析/);
+  assert.match(system, /tests\/test_app\.py/);
   assert.equal(value.request.mandate, null);
 });
 
@@ -148,6 +151,32 @@ test("project read uses only the Rust-supplied index and emits factual activity"
   assert.match(value.calls[0].messages.at(-1).content, /桌面宿主刚读取的真实文件内容/);
   assert.match(value.calls[0].messages.at(-1).content, /Portable desktop agent/);
   assert.match(value.calls[0].messages.at(-1).content, /问题：解释 README\.md/);
+});
+
+test("broad project analysis falls back to a bounded grounded overview when the small model invents files", async (t) => {
+  const value = fixture("project_read", "全面分析整个项目架构、测试风险和构建配置");
+  fs.writeFileSync(path.join(value.root, "calculator.py"), "def add(a, b):\n    return a + b\n");
+  fs.writeFileSync(path.join(value.root, "test_calculator.py"), "from calculator import add\n\ndef test_add():\n    assert add(1, 2) == 3\n");
+  value.request.workspace.files.push(
+    { path: "calculator.py", sizeBytes: 35, contentDigest: null },
+    { path: "test_calculator.py", sizeBytes: 75, contentDigest: null },
+  );
+  const coder = value.executor.coder();
+  coder.generateStream = async (payload, { onEvent }) => {
+    value.calls.push(payload);
+    const content = "项目由 setup.py、manage.py、ghost.py 构成。项目由 setup.py、manage.py、ghost.py 构成。";
+    onEvent({ type: "text_delta", delta: content });
+    return { type: "final", content };
+  };
+  t.after(() => fs.rmSync(value.root, { recursive: true, force: true }));
+
+  const content = await value.executor.execute(value.request, { onEvent: (event) => value.events.push(event) });
+
+  assert.match(content, /本轮核验了 3 个代表性文件/);
+  assert.match(content, /`calculator\.py`/);
+  assert.match(content, /`test_calculator\.py`/);
+  assert.match(content, /没有执行测试/);
+  assert.doesNotMatch(content, /setup\.py|manage\.py|ghost\.py/);
 });
 
 test("attachment-only project read grounds the current turn and excludes stale task history", async (t) => {

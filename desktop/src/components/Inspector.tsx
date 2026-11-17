@@ -29,7 +29,7 @@ interface InspectorProps {
 
 type InspectorTab = "guide" | "diff" | "files" | "terminal" | "git" | "agents";
 
-const tabOrder: InspectorTab[] = ["guide", "diff", "files", "terminal", "git", "agents"];
+const tabOrder: InspectorTab[] = ["guide", "diff", "files", "terminal"];
 const tabLabels: Record<InspectorTab, string> = { guide: "开始", diff: "Diff", files: "文件", terminal: "终端", git: "Git", agents: "Agents" };
 
 export function Inspector({ ticket, project, effect, events, codeFontSize = 14, onExpandedChange, onOpenProject, onClose, onboarding = completedOnboardingState, openOnboarding = false, onOnboardingStep = async () => undefined, onSkipOnboardingStep = async () => undefined, onResetOnboarding = async () => undefined, onDismissOnboardingTip = async () => undefined, onChooseProject = async () => undefined, onCreateDemo = async () => undefined }: InspectorProps) {
@@ -119,8 +119,7 @@ export function Inspector({ ticket, project, effect, events, codeFontSize = 14, 
     if (step === "conversation") { onClose(); window.setTimeout(() => document.querySelector<HTMLTextAreaElement>('[aria-label="任务输入"]')?.focus(), 0); return; }
     if (step === "review_change") { selectTab("diff"); return; }
     if (step === "terminal") { selectTab("terminal"); return; }
-    if (step === "git") { selectTab("git"); return; }
-    if (step === "agent") { selectTab("agents"); return; }
+    if (step === "git" || step === "agent") { void onOnboardingStep(step); return; }
     void onOnboardingStep("evidence");
     onClose();
     window.setTimeout(() => document.querySelector<HTMLElement>('[aria-label="结果证据"]')?.scrollIntoView({ behavior: "smooth", block: "center" }), 0);
@@ -154,7 +153,7 @@ export function Inspector({ ticket, project, effect, events, codeFontSize = 14, 
           </div>
           <InspectorStatus steps={steps} projectName={project?.name ?? "未选择项目"} />
         </div>
-      ) : <div className="inspector-empty"><b>还没有活动任务</b><p>开始对话后，文件、执行记录和 Git 状态会在这里展开。</p></div>}
+      ) : <div className="inspector-empty"><b>还没有活动任务</b><p>开始对话后，文件、执行记录和安全审查会在这里展开。</p></div>}
     </aside>
   );
 }

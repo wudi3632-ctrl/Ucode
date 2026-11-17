@@ -1349,6 +1349,19 @@ fn refresh_evidence_receipt(connection: &Connection, ticket_id: &str) -> Result<
             row.get::<_, String>(2)?,
         ))
     })?;
+    let rows = rows.collect::<Result<Vec<_>, _>>()?;
+    let turn_start = rows
+        .iter()
+        .rposition(|(event_type, _, _)| event_type == "user.message")
+        .unwrap_or(0);
+    if let Some((_, payload_json, _)) = rows.get(turn_start) {
+        let payload: Value = serde_json::from_str(payload_json)?;
+        if let Some(content) = payload.get("content").and_then(Value::as_str) {
+            if !content.trim().is_empty() {
+                request = content.to_string();
+            }
+        }
+    }
     let mut route = None;
     let mut sources = Vec::new();
     let mut commands = Vec::new();
@@ -1357,18 +1370,11 @@ fn refresh_evidence_receipt(connection: &Connection, ticket_id: &str) -> Result<
     let mut decisions = Vec::new();
     let mut last_event = String::new();
     let mut unresolved_effects = HashSet::new();
-    for row in rows {
-        let (event_type, payload_json, created_at) = row?;
+    for (event_type, payload_json, created_at) in rows.into_iter().skip(turn_start) {
         let payload: Value = serde_json::from_str(&payload_json)?;
         last_event = event_type.clone();
         match event_type.as_str() {
-            "user.message" => {
-                if let Some(content) = payload.get("content").and_then(Value::as_str) {
-                    if !content.trim().is_empty() {
-                        request = content.to_string();
-                    }
-                }
-            }
+            "user.message" => {}
             "tool.completed" => {
                 let tool = payload
                     .get("tool")
@@ -2442,6 +2448,39 @@ mod tests {
 
         let receipt = storage.evidence_receipts().unwrap().pop().unwrap();
         assert_eq!(receipt.request, "Explain calculator.py");
+    }
+
+    #[test]
+    fn evidence_receipt_excludes_sources_from_previous_turns() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("ucode.db");
+        let mut storage = Storage::open(&database).unwrap();
+        let locator = ProjectLocator {
+            absolute_path: directory.path().display().to_string(),
+            relative_path: None,
+            fingerprint: "turn-scoped-receipt".into(),
+        };
+        let project = storage.upsert_project(&locator, true).unwrap();
+        let ticket = storage.create_ticket(&project.id, "Inspect README").unwrap();
+        storage.append_event(Some(&ticket.id), "tool.completed", json!({
+            "tool": "read_file", "evidence": { "path": "README.md" }
+        })).unwrap();
+        storage.append_event(Some(&ticket.id), "delivery.ready", json!({
+            "content": "README summary", "route": "project_read", "evidence": []
+        })).unwrap();
+        storage.append_event(Some(&ticket.id), "user.message", json!({
+            "content": "15"
+        })).unwrap();
+        storage.append_event(Some(&ticket.id), "delivery.ready", json!({
+            "content": "你希望我用 15 做什么？", "route": "chat", "evidence": []
+        })).unwrap();
+
+        let receipt = storage.evidence_receipts().unwrap().pop().unwrap();
+        assert_eq!(receipt.request, "15");
+        assert_eq!(receipt.route.as_deref(), Some("chat"));
+        assert!(receipt.sources.is_empty());
+        assert!(receipt.commands.is_empty());
+        assert!(receipt.tests.is_empty());
     }
 
     #[test]

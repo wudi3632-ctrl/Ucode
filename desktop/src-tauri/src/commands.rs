@@ -3432,6 +3432,26 @@ pub async fn run_ticket(
             .map_err(|error| error.to_string())?;
         classify_desktop_route(&ticket.request, None)
     };
+    let request = {
+        let guard = storage
+            .lock()
+            .map_err(|_| "storage lock was poisoned".to_string())?;
+        guard
+            .ticket(&task_ticket_id)
+            .map_err(|error| error.to_string())?
+            .request
+    };
+    if let Some(content) = low_information_clarification(&request) {
+        record_deterministic_clarification(
+            &storage,
+            &task_ticket_id,
+            &request,
+            &content,
+            false,
+            &app,
+        )?;
+        return snapshot(&state);
+    }
     let result = tauri::async_runtime::spawn_blocking(move || {
         if route == DesktopRoute::Action {
             run_legacy_ticket(
@@ -3444,12 +3464,6 @@ pub async fn run_ticket(
                 &task_app,
             )
         } else {
-            let request = storage
-                .lock()
-                .map_err(|_| "storage lock was poisoned".to_string())?
-                .ticket(&task_ticket_id)
-                .map_err(|error| error.to_string())?
-                .request;
             run_executor_ticket(
                 &storage,
                 &skills,
@@ -3522,6 +3536,22 @@ pub async fn continue_ticket(
             .map_err(|error| error.to_string())?;
         classify_desktop_route(&request, previous.as_deref())
     };
+    if let Some(content) = low_information_clarification(&request) {
+        record_deterministic_clarification(
+            &storage,
+            &ticket_id,
+            &request,
+            &content,
+            true,
+            &app,
+        )?;
+        state
+            .attachments
+            .lock()
+            .map_err(|_| "attachment store lock was poisoned".to_string())?
+            .complete(selection_id.as_deref());
+        return snapshot(&state);
+    }
     if route != DesktopRoute::Action {
         let skills = Arc::clone(&state.skills);
         let legacy = state.legacy.clone();
@@ -4078,6 +4108,56 @@ fn classify_desktop_route(request: &str, previous: Option<&str>) -> DesktopRoute
     DesktopRoute::Chat
 }
 
+fn low_information_clarification(request: &str) -> Option<String> {
+    let value = request.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let numeric = value.chars().all(|character| character.is_ascii_digit()) && value.len() <= 12;
+    let punctuation = value.chars().all(|character| {
+        character.is_ascii_punctuation()
+            || matches!(character, '。' | '，' | '？' | '！' | '；' | '：' | '、' | '…')
+    });
+    if numeric {
+        return Some(format!(
+            "你希望我用 {value} 做什么？例如把它作为函数参数、查看第 {value} 行，或继续某个编号选项。请补充一个动作，我就能准确执行。"
+        ));
+    }
+    punctuation.then(|| "我还不知道你希望我执行什么。请补充一句具体目标，例如“解释当前文件”或“运行测试”。".to_string())
+}
+
+fn record_deterministic_clarification(
+    storage: &Arc<Mutex<Storage>>,
+    ticket_id: &str,
+    request: &str,
+    content: &str,
+    followup: bool,
+    app: &AppHandle,
+) -> Result<(), String> {
+    {
+        let guard = storage
+            .lock()
+            .map_err(|_| "storage lock was poisoned".to_string())?;
+        guard
+            .set_ticket_state(ticket_id, TicketState::Waiting)
+            .map_err(|error| error.to_string())?;
+        if followup {
+            guard
+                .append_event(Some(ticket_id), "user.message", json!({ "content": request }))
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    append_runtime_event(
+        storage,
+        ticket_id,
+        "delivery.ready",
+        json!({ "content": content, "route": "clarification", "evidence": [] }),
+        app,
+    );
+    append_runtime_event(storage, ticket_id, "ticket.needs_clarification", json!({}), app);
+    Ok(())
+}
+
 fn without_negated_desktop_actions(value: &str) -> String {
     const NEGATIONS: &[&str] = &[
         "不要",
@@ -4140,7 +4220,7 @@ fn contains_any(value: &str, needles: &[&str]) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn run_executor_ticket(
     storage: &Arc<Mutex<Storage>>,
-    skills: &SkillRuntime,
+    skills: &Arc<SkillRuntime>,
     attachments: &Arc<Mutex<AttachmentStore>>,
     legacy: &LegacyAgentClient,
     executor: &ExecutorClient,
@@ -4190,6 +4270,18 @@ fn run_executor_ticket(
             content_digest: None,
         })
         .collect::<Vec<_>>();
+    let scout_context = run_automatic_scouts(
+        storage,
+        skills,
+        legacy,
+        executor,
+        ticket_id,
+        &project.path,
+        request_text,
+        route,
+        files.len(),
+        app,
+    );
     let mut history = history;
     if followup
         && !history
@@ -4236,6 +4328,10 @@ fn run_executor_ticket(
         .collect::<Vec<_>>();
     let request_id = format!("executor-request-{}", Uuid::new_v4());
     let turn_id = format!("turn-{}", Uuid::new_v4());
+    let mut task_context = serde_json::to_value(task_context).map_err(|error| error.to_string())?;
+    if let (Some(findings), Some(object)) = (scout_context, task_context.as_object_mut()) {
+        object.insert("scoutFindings".into(), json!(findings));
+    }
     let request = ExecutorRequest {
         version: EXECUTOR_PROTOCOL_V1.into(),
         request_id: request_id.clone(),
@@ -4325,6 +4421,106 @@ fn run_executor_ticket(
         return Err(message);
     }
     Ok(())
+}
+
+fn automatic_scout_requests(
+    request: &str,
+    route: DesktopRoute,
+    file_count: usize,
+) -> Vec<SubagentRequest> {
+    if route != DesktopRoute::ProjectRead {
+        return Vec::new();
+    }
+    let normalized = request.to_lowercase();
+    let broad = contains_any(&normalized, &[
+        "整个项目", "全面", "架构", "跨模块", "重构", "安全", "性能", "整体", "多模块",
+        "同时", "分别", "architecture", "security", "performance", "cross-module",
+    ]);
+    let named_files = [
+        ".md", ".js", ".ts", ".tsx", ".py", ".rs", ".go", ".java", ".json", ".toml",
+        ".yaml", ".yml",
+    ]
+    .iter()
+    .map(|extension| normalized.matches(extension).count())
+    .sum::<usize>();
+    if !broad && named_files < 2 && !(file_count >= 40 && normalized.contains("项目")) {
+        return Vec::new();
+    }
+    let requests = vec![
+        SubagentRequest {
+            label: "实现定位".into(),
+            request: format!("围绕主任务“{request}”，定位入口、依赖关系和最相关的实现文件，并引用实际路径。"),
+            capability: "read".into(),
+        },
+        SubagentRequest {
+            label: "验证与风险".into(),
+            request: format!("围绕主任务“{request}”，检查现有测试、失败模式和可能的回归风险，并引用实际路径。"),
+            capability: "read".into(),
+        },
+    ];
+    requests
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_automatic_scouts(
+    storage: &Arc<Mutex<Storage>>,
+    skills: &Arc<SkillRuntime>,
+    legacy: &LegacyAgentClient,
+    executor: &ExecutorClient,
+    ticket_id: &str,
+    project_path: &str,
+    request: &str,
+    route: DesktopRoute,
+    file_count: usize,
+    app: &AppHandle,
+) -> Option<String> {
+    let requests = automatic_scout_requests(request, route, file_count);
+    if requests.is_empty() {
+        return None;
+    }
+    let (root, children) = {
+        let guard = storage.lock().ok()?;
+        let root = guard
+            .create_assignment(ticket_id, None, "自动并行分析", request, "orchestrate")
+            .ok()?;
+        let children = requests
+            .iter()
+            .filter_map(|item| {
+                guard
+                    .create_assignment(
+                        ticket_id,
+                        Some(&root.id),
+                        &item.label,
+                        &item.request,
+                        "read",
+                    )
+                    .ok()
+            })
+            .collect::<Vec<_>>();
+        (root, children)
+    };
+    if children.is_empty() {
+        return None;
+    }
+    run_subagent_batch(
+        Arc::clone(storage),
+        legacy.clone(),
+        executor.clone(),
+        Arc::clone(skills),
+        app.clone(),
+        ticket_id.to_string(),
+        project_path.to_string(),
+        PathBuf::new(),
+        root.clone(),
+        children,
+    );
+    storage
+        .lock()
+        .ok()
+        .and_then(|guard| guard.assignments(ticket_id).ok())
+        .and_then(|assignments| assignments.into_iter().find(|item| item.id == root.id))
+        .and_then(|assignment| assignment.result)
+        .map(|result| result.chars().take(4_000).collect())
 }
 
 fn persist_executor_event(
@@ -4920,6 +5116,23 @@ mod tests {
             classify_desktop_route("继续", Some("action")),
             DesktopRoute::Action
         );
+    }
+
+    #[test]
+    fn low_information_input_is_clarified_before_model_routing() {
+        assert!(low_information_clarification("15").unwrap().contains("用 15 做什么"));
+        assert!(low_information_clarification("？").unwrap().contains("具体目标"));
+        assert!(low_information_clarification("解释第 15 行").is_none());
+        assert!(low_information_clarification("继续").is_none());
+    }
+
+    #[test]
+    fn automatic_scouts_only_activate_for_complex_project_work() {
+        assert!(automatic_scout_requests("解释 README.md", DesktopRoute::ProjectRead, 80).is_empty());
+        assert!(automatic_scout_requests("你好", DesktopRoute::Chat, 80).is_empty());
+        assert_eq!(automatic_scout_requests("全面分析整个项目架构和测试风险", DesktopRoute::ProjectRead, 80).len(), 2);
+        assert_eq!(automatic_scout_requests("分析整个项目的安全、性能和构建配置", DesktopRoute::ProjectRead, 80).len(), 2);
+        assert_eq!(automatic_scout_requests("比较 src/a.py 和 src/b.py", DesktopRoute::ProjectRead, 8).len(), 2);
     }
 
     #[test]

@@ -61,6 +61,12 @@ interface TaskRescue {
 
 const activityCopy: Record<string, string> = {
   "tool.completed": "已完成项目读取",
+  "subagents.started": "正在并行分析项目",
+  "subagent.started": "已启动只读分析",
+  "subagent.completed": "只读分析已完成",
+  "subagent.failed": "一项只读分析未完成",
+  "subagents.completed": "并行分析已汇总",
+  "subagents.failed": "并行分析部分失败",
   "provider.reconnecting": "连接中断，正在恢复生成",
   "provider.reconnected": "连接已恢复，缺失内容已补齐",
 };
@@ -374,7 +380,9 @@ function EvidenceReceiptCard({ receipt, onExport }: { receipt: EvidenceReceipt; 
       ? `${visibleSources.length} 项项目来源已核验`
       : appliedEffects.length
         ? "尚未记录测试结果"
-        : "本轮不需要运行测试";
+        : receipt.route === "chat" || receipt.route === "code_generate"
+          ? "本轮不需要项目证据"
+          : "本轮不需要运行测试";
   const risk = rejected
     ? "修改已拒绝，项目文件未改变"
     : receipt.outcome === "completed"
@@ -382,7 +390,9 @@ function EvidenceReceiptCard({ receipt, onExport }: { receipt: EvidenceReceipt; 
       ? "文件已变更，仍应审查 Diff 和测试结果"
       : visibleSources.length
         ? "回答范围仅限于本轮实际读取的项目内容"
-        : "本轮未修改项目文件"
+        : receipt.route === "chat" || receipt.route === "code_generate"
+          ? "回答由本地模型生成，未读取项目文件"
+          : "本轮未修改项目文件"
     : receipt.outcome === "failed"
       ? "任务失败，不能视为完成"
       : "任务尚未完成或仍需人工确认";
@@ -391,7 +401,7 @@ function EvidenceReceiptCard({ receipt, onExport }: { receipt: EvidenceReceipt; 
     <header><span className="receipt-seal">{rejected ? "×" : receipt.outcome === "completed" ? "✓" : "·"}</span><span><b>任务收据</b><small>{outcome}</small></span></header>
     <dl className="receipt-summary">
       <div><dt>改了什么</dt><dd>{changed}</dd></div>
-      <div><dt>为什么</dt><dd>{receipt.request}</dd></div>
+      <div><dt>本轮请求</dt><dd>{receipt.request}</dd></div>
       <div><dt>验证结果</dt><dd>{verified}</dd></div>
       <div><dt>剩余风险</dt><dd>{risk}</dd></div>
       <div><dt>如何撤销</dt><dd>{undo}</dd></div>
@@ -570,7 +580,10 @@ function ActivityBlock({ events, active }: { events: RuntimeEvent[]; active: boo
   const [open, setOpen] = useState(active);
   useEffect(() => { setOpen(active); }, [active]);
   const completed = events.filter((event) => event.eventType === "tool.completed");
-  const label = active
+  const scoutCount = Number(events.find((event) => event.eventType === "subagents.started")?.payload.count ?? 0);
+  const label = scoutCount > 0
+    ? `${active ? "并行分析中" : "并行分析完成"} · ${scoutCount} 个本地 Agent`
+    : active
     ? "正在处理"
     : completed.length === 1
       ? activityLabel(completed[0])
