@@ -309,8 +309,22 @@ function EvidenceReceiptCard({ receipt, onExport }: { receipt: EvidenceReceipt; 
   const total = receipt.sources.length + receipt.commands.length + receipt.tests.length + receipt.effects.length + receipt.decisions.length;
   const outcome = ({ completed: "已完成", failed: "失败", cancelled: "已停止", rolled_back: "已回滚", waiting_input: "等待输入", waiting_approval: "等待审批", in_progress: "进行中" } as Record<string, string>)[receipt.outcome] ?? receipt.outcome;
   const changed = receipt.effects.length ? `${receipt.effects.length} 个已记录变更` : "没有写入文件";
-  const verified = receipt.tests.length ? `${receipt.tests.length} 项测试已有记录` : "未记录测试结果";
-  const risk = receipt.outcome === "completed" ? "仍应审查 Diff；模型结论以实际测试为准" : receipt.outcome === "failed" ? "任务失败，不能视为完成" : "任务尚未完成或仍需人工确认";
+  const verified = receipt.tests.length
+    ? `${receipt.tests.length} 项测试已有记录`
+    : receipt.sources.length
+      ? `${receipt.sources.length} 项项目来源已核验`
+      : receipt.effects.length
+        ? "尚未记录测试结果"
+        : "本轮不需要运行测试";
+  const risk = receipt.outcome === "completed"
+    ? receipt.effects.length
+      ? "文件已变更，仍应审查 Diff 和测试结果"
+      : receipt.sources.length
+        ? "回答范围仅限于本轮实际读取的项目内容"
+        : "本轮未修改项目文件"
+    : receipt.outcome === "failed"
+      ? "任务失败，不能视为完成"
+      : "任务尚未完成或仍需人工确认";
   const undo = receipt.effects.length ? "可使用本任务下方的回滚入口撤销已应用批次" : "没有需要撤销的文件批次";
   return <article className="evidence-receipt" aria-label="结果证据">
     <header><span className="receipt-seal">{receipt.outcome === "completed" ? "✓" : "·"}</span><span><b>任务收据</b><small>{outcome}</small></span></header>

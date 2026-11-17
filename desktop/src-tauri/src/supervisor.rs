@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::env;
 use std::fs::{self, File};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
@@ -119,10 +121,35 @@ impl CompatibilitySupervisor {
 
     pub fn ensure_started(&self) {
         self.stop_requested.store(false, Ordering::SeqCst);
-        if self.status("agent") == ServiceStatus::Ready {
-            if self.can_adopt_capsule_runtime() {
+        let agent_status = self.status("agent");
+        let adoptable = agent_status == ServiceStatus::Ready && self.can_adopt_capsule_runtime();
+        let requires_refresh = agent_status == ServiceStatus::Ready
+            && !adoptable
+            && self.runtime_state_requires_refresh();
+        self.trace_lifecycle(
+            "ensure_started",
+            &format!(
+                "agent={agent_status:?} adoptable={adoptable} requires_refresh={requires_refresh}"
+            ),
+        );
+        if agent_status == ServiceStatus::Ready {
+            if adoptable {
                 self.owned.store(true, Ordering::SeqCst);
                 self.set_last_error(None);
+            } else if requires_refresh {
+                if self.starting.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                let supervisor = self.clone();
+                thread::spawn(move || {
+                    let result = supervisor.refresh_stale_runtime();
+                    let ready = result.is_ok();
+                    supervisor.owned.store(ready, Ordering::SeqCst);
+                    supervisor.set_last_error(result.err().map(|error| {
+                        format!("升级后本地 Agent 未能刷新到当前胶囊版本：{error}")
+                    }));
+                    supervisor.starting.store(false, Ordering::SeqCst);
+                });
             } else {
                 self.owned.store(false, Ordering::SeqCst);
                 self.set_last_error(Some(
@@ -137,8 +164,8 @@ impl CompatibilitySupervisor {
         }
         let supervisor = self.clone();
         thread::spawn(move || {
-            let result = supervisor.start_compatibility_runtime();
-            if result.is_ok() && supervisor.status("agent") == ServiceStatus::Ready {
+            let result = supervisor.start_current_capsule_runtime();
+            if result.is_ok() {
                 supervisor.owned.store(true, Ordering::SeqCst);
                 supervisor.set_last_error(None);
             } else if let Err(error) = result {
@@ -204,6 +231,29 @@ impl CompatibilitySupervisor {
         }
         let before = self.diagnostics();
         if core_services_ready(&before.services) {
+            if !self.can_adopt_capsule_runtime() {
+                if self.runtime_state_requires_refresh() {
+                    if self.starting.swap(true, Ordering::SeqCst) {
+                        return Err("本地模型服务已经在刷新，请稍候。".into());
+                    }
+                    let result = self.refresh_stale_runtime();
+                    let ready = result.is_ok();
+                    self.starting.store(false, Ordering::SeqCst);
+                    self.owned.store(ready, Ordering::SeqCst);
+                    if ready {
+                        self.set_last_error(None);
+                        return Ok(self.diagnostics());
+                    }
+                    let error = format!(
+                        "升级后本地 Agent 未能刷新到当前胶囊版本：{}",
+                        result.err().unwrap_or_else(|| "未知错误".into())
+                    );
+                    self.set_last_error(Some(error.clone()));
+                    return Err(error);
+                }
+                return Err("检测到不属于当前胶囊的本地 Agent，已拒绝连接。".into());
+            }
+            self.owned.store(true, Ordering::SeqCst);
             let controller = before
                 .services
                 .iter()
@@ -335,25 +385,103 @@ impl CompatibilitySupervisor {
         }
     }
 
+    fn trace_lifecycle(&self, event: &str, detail: &str) {
+        if fs::create_dir_all(&self.logs_root).is_err() {
+            return;
+        }
+        let path = self.logs_root.join("supervisor-lifecycle.log");
+        if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(file, "{} {event} {detail}", chrono::Utc::now().to_rfc3339());
+        }
+    }
+
     fn can_adopt_capsule_runtime(&self) -> bool {
         let Ok(content) = fs::read(&self.runtime_state_path) else {
             return false;
         };
-        let Ok(state) = serde_json::from_slice::<RuntimeState>(&content) else {
+        let Ok(state) = serde_json::from_slice::<RuntimeState>(json_without_utf8_bom(&content)) else {
             return false;
         };
         runtime_state_is_adoptable(
             &state,
             self.status("agent") == ServiceStatus::Ready,
             self.status("coder") == ServiceStatus::Ready,
+            self.agent_capsule_matches(&state),
         )
+    }
+
+    fn runtime_state_requires_refresh(&self) -> bool {
+        let Ok(content) = fs::read(&self.runtime_state_path) else {
+            return false;
+        };
+        let Ok(state) =
+            serde_json::from_slice::<RuntimeAgentState>(json_without_utf8_bom(&content))
+        else {
+            return false;
+        };
+        self.portable_root.join("ucode-manifest.json").is_file()
+            && state.agent_pid > 0
+            && !self.agent_capsule_matches_pid(state.agent_pid)
+    }
+
+    fn start_current_capsule_runtime(&self) -> Result<(), String> {
+        self.start_compatibility_runtime()?;
+        if self.status("agent") != ServiceStatus::Ready {
+            return Err("本地 Agent 启动后未通过健康检查。".into());
+        }
+        if self.can_adopt_capsule_runtime() {
+            return Ok(());
+        }
+        if self.runtime_state_requires_refresh() {
+            return self.refresh_stale_runtime();
+        }
+        Err("端口 3082 上的 Agent 不属于当前胶囊，已拒绝收养。".into())
+    }
+
+    fn refresh_stale_runtime(&self) -> Result<(), String> {
+        self.trace_lifecycle("refresh_stale_runtime", "stopping old capsule runtime");
+        self.stop_compatibility_runtime()
+            .map_err(|error| format!("停止旧 Agent 失败：{error}"))?;
+        self.trace_lifecycle("refresh_stale_runtime", "starting current capsule runtime");
+        self.start_compatibility_runtime()
+            .map_err(|error| format!("启动当前 Agent 失败：{error}"))?;
+        if self.status("agent") != ServiceStatus::Ready {
+            return Err("当前 Agent 启动后未通过健康检查。".into());
+        }
+        if !self.can_adopt_capsule_runtime() {
+            return Err("当前 Agent 的胶囊身份仍未通过校验。".into());
+        }
+        self.trace_lifecycle("refresh_stale_runtime", "current capsule runtime adopted");
+        Ok(())
+    }
+
+    fn agent_capsule_matches(&self, state: &RuntimeState) -> bool {
+        self.agent_capsule_matches_pid(state.agent_pid)
+    }
+
+    fn agent_capsule_matches_pid(&self, agent_pid: u32) -> bool {
+        let manifest = self.portable_root.join("ucode-manifest.json");
+        if !manifest.is_file() {
+            return true;
+        }
+        let Some(expected) = sha256_file(&manifest) else {
+            return false;
+        };
+        let identity_path = self.portable_root.join("data/agent-runtime.json");
+        let Ok(content) = fs::read(identity_path) else {
+            return false;
+        };
+        let Ok(identity) = serde_json::from_slice::<AgentRuntimeIdentity>(&content) else {
+            return false;
+        };
+        identity.pid == agent_pid && identity.capsule_digest.as_deref() == Some(&expected)
     }
 
     fn controller_is_warming_up(&self) -> bool {
         let Ok(content) = fs::read(&self.runtime_state_path) else {
             return false;
         };
-        let Ok(state) = serde_json::from_slice::<RuntimeState>(&content) else {
+        let Ok(state) = serde_json::from_slice::<RuntimeState>(json_without_utf8_bom(&content)) else {
             return false;
         };
         let Some(started_at) = state.controller_started_at else {
@@ -369,7 +497,7 @@ impl CompatibilitySupervisor {
         let Ok(content) = fs::read(&self.runtime_state_path) else {
             return false;
         };
-        let Ok(state) = serde_json::from_slice::<RuntimeState>(&content) else {
+        let Ok(state) = serde_json::from_slice::<RuntimeState>(json_without_utf8_bom(&content)) else {
             return false;
         };
         let Some(started_at) = state.controller_started_at else {
@@ -406,11 +534,22 @@ impl CompatibilitySupervisor {
                         supervisor.owned.load(Ordering::SeqCst),
                         supervisor.starting.load(Ordering::SeqCst),
                         supervisor.status("agent") == ServiceStatus::Ready,
-                    ) && supervisor.can_adopt_capsule_runtime()
-                    {
-                        supervisor.owned.store(true, Ordering::SeqCst);
-                        supervisor.restart_attempts.store(0, Ordering::SeqCst);
-                        supervisor.set_last_error(None);
+                    ) {
+                        if supervisor.can_adopt_capsule_runtime() {
+                            supervisor.owned.store(true, Ordering::SeqCst);
+                            supervisor.restart_attempts.store(0, Ordering::SeqCst);
+                            supervisor.set_last_error(None);
+                        } else if supervisor.runtime_state_requires_refresh()
+                            && !supervisor.starting.swap(true, Ordering::SeqCst)
+                        {
+                            let result = supervisor.refresh_stale_runtime();
+                            let ready = result.is_ok();
+                            supervisor.owned.store(ready, Ordering::SeqCst);
+                            supervisor.set_last_error(result.err().map(|error| {
+                                format!("升级后本地 Agent 未能刷新到当前胶囊版本：{error}")
+                            }));
+                            supervisor.starting.store(false, Ordering::SeqCst);
+                        }
                     }
                     consecutive_failures = 0;
                     continue;
@@ -662,12 +801,40 @@ struct RuntimeState {
     controller_started_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-fn runtime_state_is_adoptable(state: &RuntimeState, agent_ready: bool, coder_ready: bool) -> bool {
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentRuntimeIdentity {
+    pid: u32,
+    capsule_digest: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeAgentState {
+    agent_pid: u32,
+}
+
+fn runtime_state_is_adoptable(
+    state: &RuntimeState,
+    agent_ready: bool,
+    coder_ready: bool,
+    capsule_matches: bool,
+) -> bool {
     state.agent_pid > 0
         && state.coder_pid > 0
         && state.llama_pid.is_none_or(|pid| pid > 0)
         && agent_ready
         && coder_ready
+        && capsule_matches
+}
+
+fn sha256_file(path: &Path) -> Option<String> {
+    let bytes = fs::read(path).ok()?;
+    Some(format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn json_without_utf8_bom(content: &[u8]) -> &[u8] {
+    content.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(content)
 }
 
 fn watchdog_may_restart(owned: bool, stop_requested: bool, starting: bool, attempts: u8) -> bool {
@@ -883,9 +1050,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(runtime_state_is_adoptable(&state, true, true));
-        assert!(!runtime_state_is_adoptable(&state, false, true));
-        assert!(!runtime_state_is_adoptable(&state, true, false));
+        assert!(runtime_state_is_adoptable(&state, true, true, true));
+        assert!(!runtime_state_is_adoptable(&state, false, true, true));
+        assert!(!runtime_state_is_adoptable(&state, true, false, true));
+        assert!(!runtime_state_is_adoptable(&state, true, true, false));
     }
 
     #[test]
@@ -897,7 +1065,7 @@ mod tests {
             agent_pid: 203,
             controller_started_at: None,
         };
-        assert!(runtime_state_is_adoptable(&without_llama, true, true));
+        assert!(runtime_state_is_adoptable(&without_llama, true, true, true));
 
         for state in [
             RuntimeState {
@@ -913,7 +1081,7 @@ mod tests {
                 ..without_llama
             },
         ] {
-            assert!(!runtime_state_is_adoptable(&state, true, true));
+            assert!(!runtime_state_is_adoptable(&state, true, true, true));
         }
 
         let controller_timed_out = RuntimeState {
@@ -922,6 +1090,7 @@ mod tests {
         };
         assert!(runtime_state_is_adoptable(
             &controller_timed_out,
+            true,
             true,
             true
         ));
@@ -944,5 +1113,40 @@ mod tests {
             service("agent", ServiceStatus::Ready),
             service("coder", ServiceStatus::Stopped),
         ]));
+    }
+
+    #[test]
+    fn stale_capsule_identity_requires_refresh_even_before_health_converges() {
+        let root = tempdir().unwrap();
+        let portable = root.path().join("capsule");
+        let runtime = portable.join("runtime-pack");
+        fs::create_dir_all(portable.join("data")).unwrap();
+        fs::create_dir_all(runtime.join("runtime/node")).unwrap();
+        fs::create_dir_all(runtime.join("runtime/python")).unwrap();
+        fs::write(runtime.join("Start-PocketMind-Research.ps1"), "").unwrap();
+        fs::write(runtime.join("runtime/node/node.exe"), "").unwrap();
+        fs::write(runtime.join("runtime/python/python.exe"), "").unwrap();
+        fs::write(portable.join("ucode-manifest.json"), "current manifest").unwrap();
+        fs::write(
+            portable.join("data/runtime.json"),
+            b"\xef\xbb\xbf{\"modelPid\":1,\"coderPid\":2,\"llamaPid\":3,\"agentPid\":4}",
+        )
+        .unwrap();
+        fs::write(
+            portable.join("data/agent-runtime.json"),
+            r#"{"pid":4,"capsuleDigest":"old"}"#,
+        )
+        .unwrap();
+
+        let supervisor = CompatibilitySupervisor::discover(&portable, "profile");
+        assert!(supervisor.runtime_state_requires_refresh());
+
+        let digest = sha256_file(&portable.join("ucode-manifest.json")).unwrap();
+        fs::write(
+            portable.join("data/agent-runtime.json"),
+            serde_json::json!({ "pid": 4, "capsuleDigest": digest }).to_string(),
+        )
+        .unwrap();
+        assert!(!supervisor.runtime_state_requires_refresh());
     }
 }

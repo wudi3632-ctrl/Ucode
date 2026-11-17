@@ -26,7 +26,13 @@ const config = {
 };
 if (config.host !== "127.0.0.1" && config.host !== "localhost") throw new Error("PocketMind only binds to loopback");
 const installRoot = process.env.POCKETMIND_ROOT ? path.resolve(process.env.POCKETMIND_ROOT) : projectRoot;
+const capsuleManifestPath = path.join(installRoot, "ucode-manifest.json");
+const capsuleDigest = fs.existsSync(capsuleManifestPath)
+  ? createHash("sha256").update(fs.readFileSync(capsuleManifestPath)).digest("hex")
+  : null;
 const dataDir = path.resolve(installRoot, config.dataDir);
+fs.mkdirSync(dataDir, { recursive: true });
+fs.writeFileSync(path.join(dataDir, "agent-runtime.json"), JSON.stringify({ pid: process.pid, capsuleDigest, startedAt: new Date().toISOString() }));
 const service = new AgentService({
   store: new Store(dataDir),
   audit: new AuditLog(dataDir),
@@ -209,7 +215,7 @@ const server = http.createServer(async (request, response) => {
     if (request.method === "GET" && url.pathname === "/health") {
       let model = { status: "unavailable" };
       try { model = await service.model.health(); } catch {}
-      return json(response, 200, { status: "ok", model, provider: providerState }, requestId);
+      return json(response, 200, { status: "ok", model, provider: providerState, capsuleDigest }, requestId);
     }
     if (request.method === "GET" && url.pathname === "/ready") return json(response, 200, { status: "ready" }, requestId);
     if (request.method === "POST" && segments[0] === "v3" && segments[1] === "executor" && segments[2] === "runs" && segments[4] === "cancel") {

@@ -232,16 +232,18 @@ impl TaskContext {
             value,
             &["改为", "改成", "不是", "而是", "只修改", "仅修改", "目标是", "instead", "only edit"],
         );
-        if correction {
+        let constraints = extract_context_clauses(value, ContextClause::Constraint);
+        let verification = extract_context_clauses(value, ContextClause::Verification);
+        if correction || !looks_like_context_follow_up(value) {
             self.objective = value.to_string();
-            if !paths.is_empty() {
-                self.target_files = paths;
-            }
+            self.target_files = paths;
+            self.constraints = constraints;
+            self.verification = verification;
         } else {
             extend_unique(&mut self.target_files, paths);
+            extend_unique(&mut self.constraints, constraints);
+            extend_unique(&mut self.verification, verification);
         }
-        extend_unique(&mut self.constraints, extract_context_clauses(value, ContextClause::Constraint));
-        extend_unique(&mut self.verification, extract_context_clauses(value, ContextClause::Verification));
         self.revision = self.revision.saturating_add(1);
         self.updated_at = Utc::now().to_rfc3339();
         self.refresh_questions(value);
@@ -1334,7 +1336,7 @@ fn refresh_evidence_receipt(connection: &Connection, ticket_id: &str) -> Result<
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )
         .optional()?;
-    let Some((request, state)) = ticket else {
+    let Some((mut request, state)) = ticket else {
         return Ok(());
     };
     let mut statement = connection.prepare(
@@ -1360,6 +1362,13 @@ fn refresh_evidence_receipt(connection: &Connection, ticket_id: &str) -> Result<
         let payload: Value = serde_json::from_str(&payload_json)?;
         last_event = event_type.clone();
         match event_type.as_str() {
+            "user.message" => {
+                if let Some(content) = payload.get("content").and_then(Value::as_str) {
+                    if !content.trim().is_empty() {
+                        request = content.to_string();
+                    }
+                }
+            }
             "tool.completed" => {
                 let tool = payload
                     .get("tool")
@@ -1521,14 +1530,21 @@ fn extract_context_paths(value: &str) -> Vec<String> {
         character.is_whitespace()
             || matches!(character, '`' | '\'' | '"' | '“' | '”' | '‘' | '’' | '，' | ',' | '。' | '；' | ';' | '：' | ':' | '（' | '(' | '）' | ')' | '、')
     }) {
-        let candidate = token.trim_matches(|character: char| matches!(character, '.' | '!' | '?' | '！' | '？'));
+        let candidate = token.trim_end_matches(|character: char| matches!(character, '.' | '!' | '?' | '！' | '？'));
+        let candidate = ["的内容", "的源码", "内容", "源码"]
+            .iter()
+            .find_map(|suffix| candidate.strip_suffix(suffix))
+            .unwrap_or(candidate);
+        let normalized = candidate.replace('\\', "/");
         let extension = candidate.rsplit_once('.').map(|(_, extension)| extension.to_ascii_lowercase());
         if candidate.len() <= 260
             && !candidate.starts_with('.')
+            && !normalized.starts_with('/')
+            && !normalized.split('/').any(|segment| segment == "..")
             && extension.as_deref().is_some_and(|extension| EXTENSIONS.contains(&extension))
-            && !paths.iter().any(|path: &String| path.eq_ignore_ascii_case(candidate))
+            && !paths.iter().any(|path: &String| path.eq_ignore_ascii_case(&normalized))
         {
-            paths.push(candidate.replace('\\', "/"));
+            paths.push(normalized);
         }
     }
     paths
@@ -1539,6 +1555,7 @@ fn extract_context_clauses(value: &str, kind: ContextClause) -> Vec<String> {
         .split(['。', '；', ';', '\n'])
         .map(str::trim)
         .filter(|clause| !clause.is_empty())
+        .filter(|clause| !looks_like_exact_reply_constraint(clause))
         .filter(|clause| match kind {
             ContextClause::Constraint => contains_context_marker(
                 clause,
@@ -1551,6 +1568,26 @@ fn extract_context_clauses(value: &str, kind: ContextClause) -> Vec<String> {
         })
         .map(|clause| clause.chars().take(240).collect())
         .collect()
+}
+
+fn looks_like_context_follow_up(value: &str) -> bool {
+    let normalized = value.trim().to_lowercase();
+    [
+        "继续", "接着", "然后", "再", "另外", "同时", "为什么", "详细", "展开", "它", "这个",
+        "刚才", "continue", "then", "also", "why", "more",
+    ]
+    .iter()
+    .any(|prefix| normalized.starts_with(prefix))
+}
+
+fn looks_like_exact_reply_constraint(value: &str) -> bool {
+    let normalized = value.to_lowercase();
+    (normalized.contains("只回答")
+        || normalized.contains("只回复")
+        || normalized.contains("仅回答")
+        || normalized.contains("仅回复"))
+        || ((normalized.contains("reply") || normalized.contains("answer"))
+            && (normalized.contains("only") || normalized.contains("exactly")))
 }
 
 fn contains_context_marker(value: &str, markers: &[&str]) -> bool {
@@ -2324,6 +2361,38 @@ mod tests {
     }
 
     #[test]
+    fn evidence_receipt_describes_the_latest_follow_up_request() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("ucode.db");
+        let mut storage = Storage::open(&database).unwrap();
+        let locator = ProjectLocator {
+            absolute_path: directory.path().display().to_string(),
+            relative_path: None,
+            fingerprint: "latest-receipt-request".into(),
+        };
+        let project = storage.upsert_project(&locator, true).unwrap();
+        let ticket = storage.create_ticket(&project.id, "First request").unwrap();
+
+        storage
+            .append_event(
+                Some(&ticket.id),
+                "user.message",
+                json!({ "content": "Explain calculator.py" }),
+            )
+            .unwrap();
+        storage
+            .append_event(
+                Some(&ticket.id),
+                "delivery.ready",
+                json!({ "content": "done", "route": "project_read", "evidence": [] }),
+            )
+            .unwrap();
+
+        let receipt = storage.evidence_receipts().unwrap().pop().unwrap();
+        assert_eq!(receipt.request, "Explain calculator.py");
+    }
+
+    #[test]
     fn waiting_receipt_distinguishes_user_input_from_effect_approval() {
         let directory = tempdir().unwrap();
         let database = directory.path().join("ucode.db");
@@ -2685,6 +2754,21 @@ mod tests {
     fn task_context_marks_missing_action_scope_and_verification() {
         let context = TaskContext::from_request("帮我修复这个项目");
         assert_eq!(context.unresolved_questions.len(), 2);
+        assert!(context.target_files.is_empty());
+    }
+
+    #[test]
+    fn task_context_does_not_leak_exact_reply_or_unsafe_paths_into_later_turns() {
+        let mut context = TaskContext::from_request("只回答：你好");
+        assert!(context.constraints.is_empty());
+
+        context.merge_message("calculator.py的内容");
+        assert_eq!(context.objective, "calculator.py的内容");
+        assert_eq!(context.target_files, vec!["calculator.py"]);
+        assert!(context.constraints.is_empty());
+
+        context.merge_message("读取 ../secret.txt 并解释");
+        assert_eq!(context.objective, "读取 ../secret.txt 并解释");
         assert!(context.target_files.is_empty());
     }
 }

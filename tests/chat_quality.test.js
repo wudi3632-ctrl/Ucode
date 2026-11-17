@@ -18,3 +18,7 @@ test("exact-reply comparison accepts only the complete requested string", () => 
   assert.equal(exactReplyMatches("`progressive_startup_ok`", constraint), false);
   assert.equal(exactReplyMatches("progressive_startup_ok。", constraint), false);
 });
+
+test("Chinese punctuation after an exact-reply instruction is not part of the target", () => {
+  assert.deepEqual(exactReplyConstraint("只回答：你好"), { target: "你好" });
+});

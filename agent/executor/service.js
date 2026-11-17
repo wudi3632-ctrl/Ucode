@@ -7,7 +7,7 @@ import { buildEscalationPayload } from "../escalation/escalation.js";
 import { AppError } from "../shared/errors.js";
 import { TOOL_DEFINITIONS } from "../tools/definitions.js";
 import { Intent, classifyIntent, conversationMessages, looksLikeRawToolOutput, validateToolRequest } from "./router.js";
-import { exactReplyConstraint, exactReplyMatches, exactReplyRetryMessages } from "./chat_quality.js";
+import { exactReplyConstraint } from "./chat_quality.js";
 
 const CHAT_PROMPT = "你是 UCode 桌面应用中的本地编码助手，不是 Python 脚本，也不是用户项目中的代码。请直接、自然、简洁地使用中文回答。当前是普通聊天模式：不要输出工具调用、JSON 或虚构文件操作。保留并延续对话上下文。";
 const PROJECT_PROMPT = "你是 UCode 的项目问答助手。只能依据提供的项目文件索引和文件内容回答；信息不足时明确说明需要哪个文件，不得猜测路径，不得输出工具调用或 JSON，不得声称已经修改文件。展示代码时必须使用带语言名的 Markdown 围栏，禁止把换行写成字面量 \\n。来源路径由桌面宿主统一展示，不要在回答中重复来源。使用简洁中文。";
@@ -502,30 +502,11 @@ export class AgentService {
   }
 
   async generateExactReply(ticket, { exact, workspace, mode, options }) {
-    const coder = this.activeCoder();
-    const attempts = [
-      conversationMessages(ticket.execution.messages, CHAT_PROMPT),
-      exactReplyRetryMessages(exact.target),
-    ];
-    for (let index = 0; index < attempts.length; index += 1) {
-      if (options.signal?.aborted) throw new AppError("cancelled", "Generation cancelled", 499);
-      const result = await coder.generate({
-        task_id: ticket.id,
-        messages: attempts[index],
-        workspace,
-        tools: [],
-        mode,
-      }, { signal: options.signal });
-      this.audit.append("coder.response", ticket.id, { intent: mode, attempt: index + 1, exactReply: true, ...responseAuditMetadata(result) });
-      if (result?.type === "cancelled" || options.signal?.aborted) throw new AppError("cancelled", "Generation cancelled", 499);
-      const content = String(result?.content || "").trim();
-      if (result?.type !== "tool_request" && !looksLikeRawToolOutput(content) && exactReplyMatches(content, exact)) {
-        options.onEvent?.({ type: "text_delta", delta: content });
-        return content;
-      }
-      this.audit.append("model.protocol_rejected", ticket.id, { reason: "exact_reply_mismatch", attempt: index + 1 });
-    }
-    throw new AppError("chat_constraint_error", "本地模型连续两次没有遵守你要求的精确回答格式，已停止输出，避免把错误答案当成成功。", 422);
+    if (options.signal?.aborted) throw new AppError("cancelled", "Generation cancelled", 499);
+    const content = exact.target;
+    options.onEvent?.({ type: "text_delta", delta: content });
+    this.audit.append("host.exact_reply", ticket.id, { intent: mode, deterministic: true, contentLength: content.length });
+    return content;
   }
 
   async generateTrustedProjectText(ticket, { messages, workspace, mode, options, failureMessage }) {

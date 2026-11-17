@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { chooseContextAttachments } from "../bridge/desktop";
-import type { RuntimeEvent, TicketSummary } from "../domain/types";
+import type { EvidenceReceipt, RuntimeEvent, TicketSummary } from "../domain/types";
 import { buildTimeline, Conversation } from "./Conversation";
 
 vi.mock("../bridge/desktop", async (importOriginal) => ({
@@ -30,6 +30,37 @@ function event(sequence: number, eventType: string, payload: Record<string, unkn
 }
 
 describe("conversation timeline projection", () => {
+  it("describes read-only evidence without implying that tests or Diff review were required", () => {
+    const receipt: EvidenceReceipt = {
+      ticketId: ticket.id,
+      request: "calculator.py的内容",
+      route: "project_read",
+      outcome: "completed",
+      sources: [{ path: "calculator.py" }],
+      commands: [],
+      tests: [],
+      effects: [],
+      decisions: [],
+      finalState: {},
+      contentDigest: "digest",
+      updatedAt: "2026-11-10T00:00:01Z",
+    };
+    render(<Conversation
+      projectId="project-1" ticket={ticket} events={[]} effect={null} receipt={receipt} appliedEffect={null} busy={false}
+      onSubmit={vi.fn()} onCancel={vi.fn()} onRetry={vi.fn()} onExport={vi.fn()} onBranch={vi.fn()}
+      onApprove={vi.fn()} onReject={vi.fn()} onRollback={vi.fn()} onExportReceipt={vi.fn()} hasProject onOpenProject={vi.fn()} error={null}
+      sidebarOpen inspectorOpen={false} onToggleSidebar={vi.fn()} onToggleInspector={vi.fn()}
+      providerStatus="ready" modelProvider="bundled" providerModel="" modelPerformance={null}
+    />);
+
+    const evidence = screen.getByRole("article", { name: "结果证据" });
+    expect(evidence).toHaveTextContent("calculator.py的内容");
+    expect(evidence).toHaveTextContent("1 项项目来源已核验");
+    expect(evidence).toHaveTextContent("回答范围仅限于本轮实际读取的项目内容");
+    expect(evidence).not.toHaveTextContent("未记录测试结果");
+    expect(evidence).not.toHaveTextContent("审查 Diff");
+  });
+
   it("reveals observed response performance only inside the model menu", () => {
     render(<Conversation
       projectId="project-1" ticket={ticket} events={[]} effect={null} receipt={null} appliedEffect={null} busy={false}

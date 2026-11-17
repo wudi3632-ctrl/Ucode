@@ -5,7 +5,7 @@ import { looksLikeRawToolOutput, validateToolRequest } from "./router.js";
 import { validateExecutorRequest } from "./protocol.js";
 import { resolveProjectRoot } from "../local_source/workspace.js";
 import { TOOL_DEFINITIONS } from "../tools/definitions.js";
-import { exactReplyConstraint, exactReplyMatches, exactReplyRetryMessages } from "./chat_quality.js";
+import { exactReplyConstraint } from "./chat_quality.js";
 
 const CHAT_PROMPT = "你是 UCode 桌面应用中的本地编码助手。禁止读写项目文件只是本轮权限约束，不是取消回答。直接针对用户当前问题自然、简洁地使用中文回答，不套用固定开头，不复述权限说明，不输出工具调用或 JSON。只有用户明确要求代码时才给完整可运行代码；只有用户询问复杂度或复杂度确实有助于理解时才说明。";
 const PROJECT_PROMPT = "你是 UCode 的项目问答助手。文件已经由桌面宿主读取完毕，你只做文本信息提取和解释，不再执行读取。只依据本轮真实文件内容，用完整、简洁的中文句子回答；先说明文件用途，再列出能够确认的关键内容。展示代码时必须使用带语言名的 Markdown 围栏，禁止把换行写成字面量 \\n。不猜测，不声称修改，不输出列表字面量、JSON、XML、函数调用、工具名称或任何虚构文件路径。来源路径由桌面宿主统一追加，你不需要重复。";
@@ -28,21 +28,21 @@ export class StatelessExecutor {
   }
 
   async chat(request, options) {
+    const query = request.inputs.filter((item) => item.human).map((item) => item.text).join("\n");
+    const historyAnswer = answerFromConversationHistory(query, request.history);
+    if (historyAnswer) {
+      options.onEvent?.({ type: "text_delta", delta: historyAnswer });
+      return historyAnswer;
+    }
+    const exact = exactReplyConstraint(query);
+    if (exact) {
+      const content = safeIdentityAnswer(request, exact.target);
+      options.onEvent?.({ type: "text_delta", delta: content });
+      return content;
+    }
     const coder = this.coder();
     if (!coder) throw new AppError("chat_provider_unavailable", "对话模型尚未启动。", 503);
     const messages = modelMessages(request, CHAT_PROMPT);
-    const query = request.inputs.filter((item) => item.human).map((item) => item.text).join("\n");
-    const exact = exactReplyConstraint(query);
-    if (exact) {
-      const content = await exactChatContent(coder, {
-        task_id: request.turnId,
-        messages,
-        workspace: { root: request.workspace.canonicalRoot, files: attachmentFiles(request) },
-        tools: [],
-        mode: "chat",
-      }, exact, options);
-      return safeIdentityAnswer(request, content);
-    }
     const result = await generate(coder, {
       task_id: request.turnId,
       messages,
@@ -73,6 +73,19 @@ export class StatelessExecutor {
       return `找到多个同名文件，请指定相对路径：\n\n${selected.paths.map((file) => `- ${file}`).join("\n")}`;
     }
     if (!selected.paths.length) {
+      const requested = extractRequestedPaths(query);
+      const unsafe = requested.find((file) => unsafeRequestedPath(file)) || (hasPathTraversalIntent(query) ? ".." : null);
+      if (unsafe) {
+        const content = `为保护项目边界，不能读取项目外路径 \`${unsafe}\`。请指定项目索引中的相对路径。`;
+        options.onEvent?.({ type: "report", state: "waiting", summary: content });
+        return content;
+      }
+      const missing = requested.filter((file) => !allowed.some((allowedFile) => allowedFile.toLowerCase() === normalizeRequestedPath(file).toLowerCase()));
+      if (missing.length) {
+        const content = `项目索引中不存在 \`${normalizeRequestedPath(missing[0])}\`。请从项目文件列表中选择存在的相对路径。`;
+        options.onEvent?.({ type: "report", state: "waiting", summary: content });
+        return content;
+      }
       if (requiresProjectEvidence(query)) {
         const content = "这个问题依赖项目中的真实报错信息，但我还没有可核验的文件或日志。请提供报错文本，或指定要检查的相对路径（例如 `src/main.py`）。";
         options.onEvent?.({ type: "report", state: "waiting", summary: content });
@@ -314,21 +327,6 @@ export class StatelessExecutor {
   }
 }
 
-async function exactChatContent(coder, payload, constraint, options) {
-  const attempts = [payload.messages, exactReplyRetryMessages(constraint.target)];
-  for (const messages of attempts) {
-    if (options.signal?.aborted) throw new AppError("cancelled", "Generation cancelled", 499);
-    const result = await coder.generate({ ...payload, messages }, { signal: options.signal });
-    if (result?.type === "cancelled" || options.signal?.aborted) throw new AppError("cancelled", "Generation cancelled", 499);
-    const content = String(result?.content || "").trim();
-    if (result?.type !== "tool_request" && !looksLikeRawToolOutput(content) && exactReplyMatches(content, constraint)) {
-      options.onEvent?.({ type: "text_delta", delta: content });
-      return content;
-    }
-  }
-  throw new AppError("chat_constraint_error", "本地模型连续两次没有遵守你要求的精确回答格式，已停止输出，避免把错误答案当成成功。", 422);
-}
-
 async function generate(coder, payload, { signal, onEvent } = {}) {
   const forward = (event) => {
     if (event?.type === "text_delta" && typeof event.delta === "string" && event.delta) onEvent?.({ type: "text_delta", delta: event.delta });
@@ -454,6 +452,37 @@ function selectFiles(query, allowed) {
     return { paths, summary: true };
   }
   return { paths: [], summary: false };
+}
+
+function extractRequestedPaths(query) {
+  const value = String(query || "").replaceAll("\\", "/");
+  const matches = value.match(/(?:[A-Za-z]:\/|\.{1,2}\/|\/)?(?:[\p{L}\p{N}_@.+-]+\/)*[\p{L}\p{N}_@+-]+\.[A-Za-z0-9]{1,12}/gu) || [];
+  return [...new Set(matches.map((item) => item.replace(/^[`'"“”]+|[`'"“”，,。；;：:！？!?]+$/gu, "")))].filter(Boolean);
+}
+
+function normalizeRequestedPath(value) {
+  return String(value || "").replaceAll("\\", "/").replace(/^\.\//, "");
+}
+
+function unsafeRequestedPath(value) {
+  const normalized = String(value || "").replaceAll("\\", "/");
+  const segments = normalized.split("/").filter(Boolean);
+  return path.isAbsolute(normalized)
+    || /^[A-Za-z]:\//.test(normalized)
+    || normalized.startsWith("/")
+    || normalized.includes("://")
+    || segments.includes("..");
+}
+
+function hasPathTraversalIntent(query) {
+  const value = String(query || "").replaceAll("\\", "/");
+  return /(?:^|[\s`'"“”])(?:\.\.\/|[A-Za-z]:\/|\/[^\s`'"“”]+)/u.test(value) || /[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(value);
+}
+
+function answerFromConversationHistory(query, history) {
+  if (!/(?:我)?上一句.{0,12}(?:只回答|只回复|只输出|要求)|what did i (?:just |last )?(?:ask|tell).{0,30}(?:answer|reply|say)/i.test(String(query || ""))) return null;
+  const previousUser = [...(Array.isArray(history) ? history : [])].reverse().find((item) => item?.role === "user" && typeof item.content === "string");
+  return exactReplyConstraint(previousUser?.content)?.target || null;
 }
 
 function asksForFileContent(query) {

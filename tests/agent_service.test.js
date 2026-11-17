@@ -72,7 +72,7 @@ test("injects approved skill context into system prompt without changing user me
   assert.throws(() => value.service.setSkillContext(ticket.id, "x".repeat(51 * 1024)), /50 KiB/);
 });
 
-test("legacy chat exact-reply quality gate retries without streaming the invalid answer", async (t) => {
+test("legacy chat exact-reply is deterministic and does not call the model", async (t) => {
   const value = fixture();
   t.after(() => fs.rmSync(value.root, { recursive: true, force: true }));
   let attempt = 0;
@@ -86,7 +86,7 @@ test("legacy chat exact-reply quality gate retries without streaming the invalid
   const result = await value.service.plan(ticket.id, { onEvent: (event) => events.push(event) });
 
   assert.equal(result.content, "progressive_startup_ok");
-  assert.equal(attempt, 2);
+  assert.equal(attempt, 0);
   assert.deepEqual(events.filter((event) => event.type === "text_delta"), [{ type: "text_delta", delta: "progressive_startup_ok" }]);
   assert.doesNotMatch(JSON.stringify(events), /True/);
   assert.equal(result.evidence.length, 0);

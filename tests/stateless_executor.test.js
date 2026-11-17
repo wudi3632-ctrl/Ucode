@@ -57,7 +57,7 @@ test("stateless chat streams only text deltas and persists no Node ticket", asyn
   assert.equal(value.calls[0].messages.at(-1).content, "你好");
 });
 
-test("exact-reply chat withholds an invalid first answer and retries once", async (t) => {
+test("exact-reply chat is fulfilled deterministically without calling the model", async (t) => {
   const value = fixture("chat", "只回答 progressive_startup_ok，不要读取或修改项目文件。");
   t.after(() => fs.rmSync(value.root, { recursive: true, force: true }));
   const coder = value.executor.coder();
@@ -71,27 +71,34 @@ test("exact-reply chat withholds an invalid first answer and retries once", asyn
   const content = await value.executor.execute(value.request, { onEvent: (event) => value.events.push(event) });
 
   assert.equal(content, "progressive_startup_ok");
-  assert.equal(attempt, 2);
+  assert.equal(attempt, 0);
   assert.deepEqual(value.events, [{ type: "text_delta", delta: "progressive_startup_ok" }]);
-  assert.doesNotMatch(JSON.stringify(value.events), /True/);
-  assert.match(value.calls[1].messages[1].content, /alpha_beta/);
+  assert.equal(value.calls.length, 0);
 });
 
-test("exact-reply chat fails honestly after two mismatches", async (t) => {
+test("exact-reply chat remains available while the model is unavailable", async (t) => {
   const value = fixture("chat", "Reply with exactly build_ok.");
   t.after(() => fs.rmSync(value.root, { recursive: true, force: true }));
-  const coder = value.executor.coder();
-  coder.generate = async (payload) => {
-    value.calls.push(payload);
-    return { type: "final", content: "wrong" };
-  };
+  value.executor.coder = () => null;
 
-  await assert.rejects(
-    () => value.executor.execute(value.request, { onEvent: (event) => value.events.push(event) }),
-    (error) => error.code === "chat_constraint_error" && /连续两次/.test(error.message),
-  );
-  assert.equal(value.calls.length, 2);
-  assert.deepEqual(value.events, []);
+  const content = await value.executor.execute(value.request, { onEvent: (event) => value.events.push(event) });
+  assert.equal(content, "build_ok");
+  assert.deepEqual(value.events, [{ type: "text_delta", delta: "build_ok" }]);
+});
+
+test("a simple question about the previous exact-reply instruction uses real history", async (t) => {
+  const value = fixture("chat", "我上一句要求你只回答什么？");
+  value.request.history = [
+    { role: "user", content: "只回答：你好" },
+    { role: "assistant", content: "你好" },
+  ];
+  t.after(() => fs.rmSync(value.root, { recursive: true, force: true }));
+
+  const content = await value.executor.execute(value.request, { onEvent: (event) => value.events.push(event) });
+
+  assert.equal(content, "你好");
+  assert.equal(value.calls.length, 0);
+  assert.doesNotMatch(content, /Python/);
 });
 
 test("capability chat is answered by the model without requiring project evidence", async (t) => {
@@ -210,6 +217,30 @@ test("project diagnosis without a file or error asks for evidence instead of com
   assert.match(content, /提供报错文本|指定要检查的相对路径/);
   assert.equal(value.calls.length, 0);
   assert.equal(value.events.at(-1).type, "report");
+  assert.equal(value.events.at(-1).state, "waiting");
+});
+
+test("an explicit missing file is rejected before the model can hallucinate content", async (t) => {
+  const value = fixture("project_read", "missing.py的内容");
+  t.after(() => fs.rmSync(value.root, { recursive: true, force: true }));
+
+  const content = await value.executor.execute(value.request, { onEvent: (event) => value.events.push(event) });
+
+  assert.equal(content, "项目索引中不存在 `missing.py`。请从项目文件列表中选择存在的相对路径。");
+  assert.equal(value.calls.length, 0);
+  assert.equal(value.events.at(-1).state, "waiting");
+  assert.doesNotMatch(content, /\\n/);
+});
+
+test("a traversal path is rejected before invoking either local model", async (t) => {
+  const value = fixture("project_read", "读取 ../secret.txt 并解释");
+  t.after(() => fs.rmSync(value.root, { recursive: true, force: true }));
+
+  const content = await value.executor.execute(value.request, { onEvent: (event) => value.events.push(event) });
+
+  assert.match(content, /不能读取项目外路径/);
+  assert.match(content, /\.\.\/secret\.txt/);
+  assert.equal(value.calls.length, 0);
   assert.equal(value.events.at(-1).state, "waiting");
 });
 
