@@ -79,7 +79,10 @@ export const CASES = Object.freeze([
     prompt: "为 slug.py 新增 tests/test_slug.py，覆盖空格转连字符和大小写归一化。",
     expected: { files: { "tests/test_slug.py": ["from slug import slugify", "Hello World", "hello-world"] } },
     solution: { "tests/test_slug.py": "from slug import slugify\n\ndef test_slugify_normalizes_case_and_spaces():\n    assert slugify('Hello World') == 'hello-world'\n" },
-    files: { "slug.py": "def slugify(value):\n    return value.strip().lower().replace(' ', '-')\n" },
+    files: {
+      "slug.py": "def slugify(value):\n    return value.strip().lower().replace(' ', '-')\n",
+      "tests/.keep": "fixture directory marker\n",
+    },
   },
   {
     id: "two-file-api-change",
