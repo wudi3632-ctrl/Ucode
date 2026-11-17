@@ -6,6 +6,7 @@
   "engines": { "node": ">=22.19.0" },
   "scripts": {
     "start": "node agent/runtime/server.js",
-    "check": "node --test tests/*.test.js"
+    "check": "node --test tests/*.test.js",
+    "benchmark:harness": "node benchmarks/harness-comparison/run.js"
   }
 }

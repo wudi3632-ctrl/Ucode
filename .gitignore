@@ -38,6 +38,7 @@ UCode.exe
 /evidence/
 /artifacts/
 desktop/artifacts/
+/.benchmark-runs/
 *.db
 *.db-*
 *.sqlite
