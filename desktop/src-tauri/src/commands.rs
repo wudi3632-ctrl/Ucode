@@ -20,6 +20,9 @@ use crate::race_workspace::{
 use crate::rescue::{
     compact_report as compact_rescue_report, diagnose as diagnose_rescue, is_rescue_request,
 };
+use crate::rescue_probe::{
+    requested_probe_description, NetworkProbeService, ProbeStatus, R1ProbeRecord,
+};
 use crate::rescue_repair::{RepairRecord, RepairService, RepairStatus};
 use crate::skills::{SkillPreview, SkillRuntime};
 use crate::storage::{
@@ -64,6 +67,7 @@ pub struct AppState {
     pub attachments: Arc<Mutex<AttachmentStore>>,
     pub capsule_health: Arc<Mutex<CapsuleHealth>>,
     pub rescue_repairs: Arc<RepairService>,
+    pub rescue_probes: Arc<NetworkProbeService>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3828,6 +3832,7 @@ pub async fn run_ticket(
     let legacy = state.legacy.clone();
     let executor = state.executor.clone();
     let rescue_repairs = Arc::clone(&state.rescue_repairs);
+    let rescue_probes = Arc::clone(&state.rescue_probes);
     let attachments = Arc::clone(&state.attachments);
     let task_ticket_id = ticket_id.clone();
     let task_selection_id = selection_id.clone();
@@ -3884,6 +3889,7 @@ pub async fn run_ticket(
                 &legacy,
                 &executor,
                 &rescue_repairs,
+                &rescue_probes,
                 &task_ticket_id,
                 &request,
                 &client_request_id,
@@ -3968,6 +3974,7 @@ pub async fn continue_ticket(
         let legacy = state.legacy.clone();
         let executor = state.executor.clone();
         let rescue_repairs = Arc::clone(&state.rescue_repairs);
+        let rescue_probes = Arc::clone(&state.rescue_probes);
         let attachments = Arc::clone(&state.attachments);
         let task_ticket_id = ticket_id.clone();
         let task_request = request.clone();
@@ -3982,6 +3989,7 @@ pub async fn continue_ticket(
                 &legacy,
                 &executor,
                 &rescue_repairs,
+                &rescue_probes,
                 &task_ticket_id,
                 &task_request,
                 &task_client_request_id,
@@ -4750,6 +4758,99 @@ pub fn rollback_rescue_repair(
     snapshot(&state)
 }
 
+#[tauri::command]
+pub fn resolve_rescue_probe(
+    ticket_id: String,
+    proposal_id: String,
+    approved: bool,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<BootstrapSnapshot, String> {
+    if approved {
+        ensure_capsule_writable(&state)?;
+    }
+    let record = if approved {
+        state.rescue_probes.execute(&proposal_id, &ticket_id)?
+    } else {
+        state.rescue_probes.reject(&proposal_id, &ticket_id)?
+    };
+    record_rescue_probe_event(&state.storage, &ticket_id, &record, approved, &app)?;
+    snapshot(&state)
+}
+
+fn record_rescue_probe_event(
+    storage: &Arc<Mutex<Storage>>,
+    ticket_id: &str,
+    record: &R1ProbeRecord,
+    approved: bool,
+    app: &AppHandle,
+) -> Result<(), String> {
+    let event_type = if !approved {
+        "rescue.network_probe.rejected"
+    } else {
+        match record.proposal.status {
+            ProbeStatus::Observed => "rescue.network_probe.observed",
+            ProbeStatus::Unavailable => "rescue.network_probe.unavailable",
+            _ => "rescue.network_probe.safe_stop",
+        }
+    };
+    {
+        let guard = storage
+            .lock()
+            .map_err(|_| "storage lock was poisoned".to_string())?;
+        guard
+            .set_ticket_state(ticket_id, TicketState::Waiting)
+            .map_err(|error| error.to_string())?;
+    }
+    if let Some(evidence) = &record.evidence {
+        append_runtime_event(
+            storage,
+            ticket_id,
+            "rescue.probe.completed",
+            json!({
+                "evidenceId": evidence.id,
+                "toolId": evidence.tool_id,
+                "state": evidence.state,
+                "summary": evidence.summary,
+                "contentDigest": evidence.content_digest,
+                "elapsedMs": evidence.elapsed_ms,
+                "risk": "r1",
+                "approved": true,
+                "target": record.proposal.target,
+            }),
+            app,
+        );
+    }
+    append_runtime_event(
+        storage,
+        ticket_id,
+        event_type,
+        json!({ "proposalId": record.proposal.id, "toolId": record.proposal.tool_id, "status": record.proposal.status, "detail": record.detail, "record": record }),
+        app,
+    );
+    if approved && record.evidence.is_some() {
+        let content = format!(
+            "## 本次联网探测结果\n\n- **目标：** `{}`\n- **探针：** `{}`\n- **结果：** {}\n- **证据：** `{}`\n\n本次只执行了你批准的单个 DNS 或 TCP 探针，没有发送 HTTP 内容，也没有修改 DNS、代理、路由、防火墙或服务。",
+            record.proposal.target,
+            record.proposal.tool_id,
+            record.detail,
+            record
+                .evidence
+                .as_ref()
+                .map(|value| value.id.as_str())
+                .unwrap_or("evidence-unavailable")
+        );
+        append_runtime_event(
+            storage,
+            ticket_id,
+            "provider.message",
+            json!({ "content": content, "route": "rescue", "hostGrounded": true }),
+            app,
+        );
+    }
+    Ok(())
+}
+
 fn record_rescue_repair_event(
     storage: &Arc<Mutex<Storage>>,
     ticket_id: &str,
@@ -4855,7 +4956,13 @@ fn classify_desktop_route(request: &str, previous: Option<&str>) -> DesktopRoute
             _ => {}
         }
     }
-    if is_rescue_request(&normalized) && !mentions_project_file(&actionable) {
+    // A URL contains slash-delimited text that the project-file heuristic can
+    // otherwise mistake for an absolute workspace path. An explicit bounded
+    // network target is stronger Rescue evidence than that generic heuristic.
+    if is_rescue_request(&normalized)
+        && (requested_probe_description(&normalized).is_some()
+            || !mentions_project_file(&actionable))
+    {
         return DesktopRoute::Rescue;
     }
     let conversational_code_request = contains_any(
@@ -5126,6 +5233,7 @@ fn run_executor_ticket(
     legacy: &LegacyAgentClient,
     executor: &ExecutorClient,
     rescue_repairs: &RepairService,
+    rescue_probes: &NetworkProbeService,
     ticket_id: &str,
     request_text: &str,
     client_request_id: &str,
@@ -5186,8 +5294,13 @@ fn run_executor_ticket(
             content_digest: None,
         })
         .collect::<Vec<_>>();
-    let rescue_report = (route == DesktopRoute::Rescue).then(|| diagnose_rescue(request_text));
-    if let Some(report) = &rescue_report {
+    let mut rescue_report = (route == DesktopRoute::Rescue).then(|| diagnose_rescue(request_text));
+    if let Some(report) = rescue_report.as_mut() {
+        if report.domain == "network" && report.next_probe.is_some() {
+            report.next_probe = Some(requested_probe_description(request_text).unwrap_or_else(
+                || "请明确一个受影响域名，或一个主机与端口；UCode 不会自行选择外部目标".into(),
+            ));
+        }
         for evidence in &report.evidence {
             append_runtime_event(
                 storage,
@@ -5238,6 +5351,35 @@ fn run_executor_ticket(
                     ticket_id,
                     "rescue.repair.unavailable",
                     json!({ "operationId": "system.user_path.normalize", "error": error }),
+                    app,
+                ),
+            }
+        } else if report.domain == "network" && report.next_probe.is_some() {
+            let evidence_ids = report
+                .evidence
+                .iter()
+                .map(|item| item.id.clone())
+                .collect::<Vec<_>>();
+            match rescue_probes.propose_for_request(ticket_id, request_text, evidence_ids) {
+                Ok(Some(proposal)) => append_runtime_event(
+                    storage,
+                    ticket_id,
+                    "rescue.network_probe.proposed",
+                    json!({ "proposal": proposal }),
+                    app,
+                ),
+                Ok(None) => append_runtime_event(
+                    storage,
+                    ticket_id,
+                    "rescue.network_probe.target_required",
+                    json!({ "detail": "需要明确一个受影响域名，或一个主机与端口；UCode 不会自行选择外部目标" }),
+                    app,
+                ),
+                Err(error) => append_runtime_event(
+                    storage,
+                    ticket_id,
+                    "rescue.network_probe.unavailable",
+                    json!({ "error": error }),
                     app,
                 ),
             }
@@ -6787,6 +6929,17 @@ mod tests {
         );
         assert_eq!(
             classify_desktop_route("Windows 电脑无法上网，请帮我诊断", None),
+            DesktopRoute::Rescue
+        );
+        assert_eq!(
+            classify_desktop_route(
+                "https://example.com 无法打开，请根据真实系统证据诊断；联网探测前必须让我确认。",
+                None
+            ),
+            DesktopRoute::Rescue
+        );
+        assert_eq!(
+            classify_desktop_route("example.com:443 端口连接失败，请排查", None),
             DesktopRoute::Rescue
         );
         assert_eq!(

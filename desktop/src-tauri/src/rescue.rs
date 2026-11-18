@@ -29,7 +29,7 @@ pub struct RescueToolDefinition {
 }
 
 pub fn tool_registry() -> &'static [RescueToolDefinition] {
-    static TOOLS: [RescueToolDefinition; 8] = [
+    static TOOLS: [RescueToolDefinition; 9] = [
         RescueToolDefinition {
             id: "system.inventory",
             version: 1,
@@ -93,6 +93,14 @@ pub fn tool_registry() -> &'static [RescueToolDefinition] {
             risk: RiskClass::R1,
             authority: "network_read",
             description: "Resolve an approved hostname; never runs without network consent",
+        },
+        RescueToolDefinition {
+            id: "network.tcp.probe",
+            version: 1,
+            domain: "network",
+            risk: RiskClass::R1,
+            authority: "network_read",
+            description: "Connect to one approved host and port without sending application data",
         },
     ];
     &TOOLS
@@ -183,7 +191,7 @@ fn probe_script(tool_id: &str) -> Option<&'static str> {
         "network.proxy.inspect" => Some("$winHttp=(netsh winhttp show proxy|Out-String).Trim(); [pscustomobject]@{winHttp=$winHttp;httpProxy=$env:HTTP_PROXY;httpsProxy=$env:HTTPS_PROXY;noProxy=$env:NO_PROXY}|ConvertTo-Json -Compress"),
         // R1 probes are deliberately absent from the automatic runner. A future
         // consent envelope supplies a validated hostname to a dedicated adapter.
-        "network.dns.resolve" => None,
+        "network.dns.resolve" | "network.tcp.probe" => None,
         _ => None,
     }
 }
@@ -272,10 +280,15 @@ pub fn is_rescue_request(request: &str) -> bool {
         "服务",
         "进程",
         "端口",
+        "网站",
+        "域名",
         "path",
         "环境变量",
         "powershell",
         "cmd",
+        "http",
+        "site",
+        "port",
     ];
     let symptom = [
         "不能",
@@ -354,8 +367,8 @@ pub fn diagnose_with_runner(request: &str, runner: &dyn ProbeRunner) -> Diagnosi
 fn is_network_request(request: &str) -> bool {
     let value = request.to_lowercase();
     [
-        "网络", "上网", "wifi", "wi-fi", "dns", "代理", "proxy", "网关", "路由", "network",
-        "internet",
+        "网络", "上网", "wifi", "wi-fi", "dns", "代理", "proxy", "网关", "路由", "网站", "域名",
+        "端口", "network", "internet", "http", "site", "port",
     ]
     .iter()
     .any(|item| value.contains(item))
@@ -816,6 +829,12 @@ mod tests {
             .unwrap();
         assert_eq!(dns.risk, RiskClass::R1);
         assert!(probe_script(dns.id).is_none());
+        let tcp = tool_registry()
+            .iter()
+            .find(|tool| tool.id == "network.tcp.probe")
+            .unwrap();
+        assert_eq!(tcp.risk, RiskClass::R1);
+        assert!(probe_script(tcp.id).is_none());
     }
 
     #[cfg(target_os = "windows")]
@@ -881,6 +900,18 @@ mod tests {
             serde_json::to_string(&stale_proxy.hypotheses).unwrap()
         );
         assert!(!missing_gateway.mutation_performed && !stale_proxy.mutation_performed);
+    }
+
+    #[test]
+    fn explicit_site_and_port_failures_route_to_network_rescue() {
+        for request in [
+            "https://example.com 无法打开，请诊断",
+            "example.com:443 端口连接失败，请排查",
+            "这个网站访问异常，请检查网络",
+        ] {
+            assert!(is_rescue_request(request), "did not route: {request}");
+            assert!(is_network_request(request), "wrong domain: {request}");
+        }
     }
 
     #[test]

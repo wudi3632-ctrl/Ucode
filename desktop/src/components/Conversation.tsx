@@ -1,6 +1,6 @@
 import { FormEvent, KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
 import { chooseContextAttachments, removeContextAttachment } from "../bridge/desktop";
-import type { AppliedEffect, AppSettings, ContextAttachmentSelection, ContextAttachmentSummary, EvidenceReceipt, OnboardingState, ProposedEffect, RaceBundle, RaceCandidate, RescueRepairProposal, RescueRepairRecord, RuntimeEvent, TicketSummary } from "../domain/types";
+import type { AppliedEffect, AppSettings, ContextAttachmentSelection, ContextAttachmentSummary, EvidenceReceipt, OnboardingState, ProposedEffect, R1ProbeProposal, R1ProbeRecord, RaceBundle, RaceCandidate, RescueRepairProposal, RescueRepairRecord, RuntimeEvent, TicketSummary } from "../domain/types";
 import type { ObservedModelPerformance } from "../domain/modelPerformance";
 import { changedLineCounts } from "../domain/diff";
 import { buildComposerHistory, canStartComposerHistory, exitComposerHistory, moveComposerHistory, type ComposerHistoryState } from "../domain/composerHistory";
@@ -27,6 +27,7 @@ interface ConversationProps {
   onRollback: () => Promise<void>;
   onResolveRescueRepair?: (proposalId: string, approved: boolean) => Promise<void>;
   onRollbackRescueRepair?: (proposalId: string) => Promise<void>;
+  onResolveRescueProbe?: (proposalId: string, approved: boolean) => Promise<void>;
   onExportReceipt: (receipt: EvidenceReceipt, format: "json" | "md") => Promise<void>;
   hasProject: boolean;
   onOpenProject: () => void | Promise<void>;
@@ -77,7 +78,7 @@ const activityCopy: Record<string, string> = {
   "provider.reconnected": "连接已恢复，缺失内容已补齐",
 };
 
-export function Conversation({ projectId, ticket, events, effect, receipt, appliedEffect, busy, races = [], onCancelRace = async () => undefined, onSubmit, onCancel, onRetry, onExport, onBranch, onApprove, onReject, onRollback, onResolveRescueRepair = async () => undefined, onRollbackRescueRepair = async () => undefined, onExportReceipt, hasProject, onOpenProject, onboarding = completedOnboardingState, onboardingBusy = false, onCreateDemo = async () => undefined, onDismissOnboarding = async () => undefined, onDismissOnboardingTip = async () => undefined, onOpenSettings = () => undefined, error, sidebarOpen, inspectorOpen, onToggleSidebar, onToggleInspector, providerStatus, modelProvider, providerModel, modelPerformance, providerRecovering = false, onRecoverProvider = async () => undefined }: ConversationProps) {
+export function Conversation({ projectId, ticket, events, effect, receipt, appliedEffect, busy, races = [], onCancelRace = async () => undefined, onSubmit, onCancel, onRetry, onExport, onBranch, onApprove, onReject, onRollback, onResolveRescueRepair = async () => undefined, onRollbackRescueRepair = async () => undefined, onResolveRescueProbe = async () => undefined, onExportReceipt, hasProject, onOpenProject, onboarding = completedOnboardingState, onboardingBusy = false, onCreateDemo = async () => undefined, onDismissOnboarding = async () => undefined, onDismissOnboardingTip = async () => undefined, onOpenSettings = () => undefined, error, sidebarOpen, inspectorOpen, onToggleSidebar, onToggleInspector, providerStatus, modelProvider, providerModel, modelPerformance, providerRecovering = false, onRecoverProvider = async () => undefined }: ConversationProps) {
   const [request, setRequest] = useState("");
   const [selection, setSelection] = useState<ContextAttachmentSelection | null>(null);
   const [attachmentLoading, setAttachmentLoading] = useState(false);
@@ -94,6 +95,7 @@ export function Conversation({ projectId, ticket, events, effect, receipt, appli
   const requestHistory = useMemo(() => buildComposerHistory(items.flatMap((item) => item.kind === "user" ? [item.content] : [])), [items]);
   const taskContext = useMemo(() => latestTaskContext(ticketEvents), [ticketEvents]);
   const rescueRepair = useMemo(() => rescueRepairFrom(ticketEvents), [ticketEvents]);
+  const rescueProbe = useMemo(() => rescueProbeFrom(ticketEvents), [ticketEvents]);
   const recoveryRequired = items.some((item) => item.kind === "recovery");
   const latestUserRequest = useMemo(() => [...items].reverse().find((item) => item.kind === "user")?.content ?? ticket?.request ?? "", [items, ticket?.request]);
 
@@ -248,6 +250,7 @@ export function Conversation({ projectId, ticket, events, effect, receipt, appli
               return <AssistantMessage key={item.key} content={item.content} streaming={item.streaming} copied={copied === item.key} onCopy={() => copyText(item.key, item.content)} onRetry={() => void onSubmit(latestUserRequest)} onBranch={() => onBranch(item.sequence)} />;
             })}
             {races.map((race) => <CandidateRaceCard key={race.race.id} bundle={race} onCancel={() => onCancelRace(race.race.id)} />)}
+            {rescueProbe && <R1NetworkProbeCard value={rescueProbe} busy={busy} onResolve={onResolveRescueProbe} />}
             {rescueRepair && <RescueRepairCard value={rescueRepair} busy={busy} onResolve={onResolveRescueRepair} onRollback={onRollbackRescueRepair} />}
             {effect && (
               <article className="approval-card">
@@ -698,6 +701,34 @@ function TaskRescueRow({ recovery, onAttachContext, onConfigureModel }: { recove
 }
 
 interface VisibleRescueRepair { proposal: RescueRepairProposal; record: RescueRepairRecord | null }
+
+interface VisibleRescueProbe { proposal: R1ProbeProposal; record: R1ProbeRecord | null }
+
+function rescueProbeFrom(events: RuntimeEvent[]): VisibleRescueProbe | null {
+  const proposed = [...events].reverse().find((event) => event.eventType === "rescue.network_probe.proposed");
+  const value = proposed?.payload.proposal;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const proposal = value as unknown as R1ProbeProposal;
+  if (proposal.schemaVersion !== 1 || proposal.risk !== "r1" || !["network.dns.resolve", "network.tcp.probe"].includes(proposal.toolId) || typeof proposal.id !== "string") return null;
+  const result = [...events].reverse().find((event) => String(event.payload.proposalId ?? "") === proposal.id && event.eventType.startsWith("rescue.network_probe.") && event.eventType !== "rescue.network_probe.proposed");
+  const recordValue = result?.payload.record;
+  const record = recordValue && typeof recordValue === "object" && !Array.isArray(recordValue) ? recordValue as unknown as R1ProbeRecord : null;
+  return { proposal: record?.proposal ?? proposal, record };
+}
+
+function R1NetworkProbeCard({ value, busy, onResolve }: { value: VisibleRescueProbe; busy: boolean; onResolve: (proposalId: string, approved: boolean) => Promise<void> }) {
+  const proposal = value.proposal;
+  const status = proposal.status;
+  const statusCopy = status === "awaiting_approval" ? "等待允许" : status === "observed" ? "探测完成" : status === "rejected" ? "保持离线" : status === "running" ? "探测中" : status === "unavailable" ? "探针不可用" : "已安全停止";
+  const toolCopy = proposal.toolId === "network.dns.resolve" ? "DNS 解析" : "TCP 连接";
+  return <article className={`rescue-network-probe-card ${status}`} aria-label="Rescue 联网探测">
+    <header><span>R1</span><div><b>一次性{toolCopy}</b><small>{statusCopy} · 不会记住本次授权</small></div></header>
+    <p>{value.record?.detail ?? proposal.purpose}</p>
+    <dl><div><dt>目标</dt><dd><code>{proposal.target}</code></dd></div><div><dt>发送</dt><dd>{proposal.dataBoundary}</dd></div><div><dt>限制</dt><dd>不发送 HTTP 内容，不修改系统，不扫描其他目标</dd></div></dl>
+    {value.record?.evidence?.id && <div className="rescue-probe-evidence">证据 <code>{value.record.evidence.id}</code></div>}
+    {status === "awaiting_approval" && <div className="approval-actions"><button className="quiet" disabled={busy} onClick={() => void onResolve(proposal.id, false)}>保持离线</button><button className="approve" disabled={busy} onClick={() => void onResolve(proposal.id, true)}>{busy ? "正在探测…" : "允许本次探测"}</button></div>}
+  </article>;
+}
 
 function rescueRepairFrom(events: RuntimeEvent[]): VisibleRescueRepair | null {
   const proposed = [...events].reverse().find((event) => event.eventType === "rescue.repair.proposed");

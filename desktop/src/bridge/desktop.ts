@@ -553,3 +553,8 @@ export async function rollbackRescueRepair(ticketId: string, proposalId: string,
   if (inTauri()) return invoke<BootstrapSnapshot>("rollback_rescue_repair", { ticketId, proposalId, approved });
   return demoSnapshot;
 }
+
+export async function resolveRescueProbe(ticketId: string, proposalId: string, approved: boolean): Promise<BootstrapSnapshot> {
+  if (inTauri()) return invoke<BootstrapSnapshot>("resolve_rescue_probe", { ticketId, proposalId, approved });
+  return demoSnapshot;
+}

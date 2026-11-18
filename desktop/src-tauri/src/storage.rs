@@ -1679,6 +1679,31 @@ fn refresh_evidence_receipt(connection: &Connection, ticket_id: &str) -> Result<
                 route = Some("rescue".into());
                 decisions.push(json!({ "event": event_type, "detail": payload, "at": created_at }));
             }
+            "rescue.network_probe.proposed" => {
+                route = Some("rescue".into());
+                if let Some(id) = payload
+                    .get("proposal")
+                    .and_then(|value| value.get("id"))
+                    .and_then(Value::as_str)
+                {
+                    unresolved_effects.insert(id.to_string());
+                }
+                decisions.push(json!({ "event": event_type, "detail": payload, "at": created_at }));
+            }
+            "rescue.network_probe.observed"
+            | "rescue.network_probe.unavailable"
+            | "rescue.network_probe.safe_stop"
+            | "rescue.network_probe.rejected" => {
+                route = Some("rescue".into());
+                if let Some(id) = payload.get("proposalId").and_then(Value::as_str) {
+                    unresolved_effects.remove(id);
+                }
+                decisions.push(json!({ "event": event_type, "detail": payload, "at": created_at }));
+            }
+            "rescue.network_probe.target_required" => {
+                route = Some("rescue".into());
+                decisions.push(json!({ "event": event_type, "detail": payload, "at": created_at }));
+            }
             "rescue.repair.proposed" => {
                 route = Some("rescue".into());
                 if let Some(id) = payload
@@ -2873,6 +2898,61 @@ mod tests {
             |item| item.get("event").and_then(Value::as_str) == Some("rescue.diagnosis.ready")
         ));
         assert!(receipt.effects.is_empty());
+    }
+
+    #[test]
+    fn r1_network_probe_receipt_tracks_consent_and_observed_evidence() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("ucode.db");
+        let mut storage = Storage::open(&database).unwrap();
+        let locator = ProjectLocator {
+            absolute_path: directory.path().display().to_string(),
+            relative_path: None,
+            fingerprint: "rescue-r1-receipt".into(),
+        };
+        let project = storage.upsert_project(&locator, true).unwrap();
+        let ticket = storage
+            .create_ticket(&project.id, "example.com 无法访问，请诊断")
+            .unwrap();
+        storage
+            .set_ticket_state(&ticket.id, TicketState::Waiting)
+            .unwrap();
+        storage
+            .append_event(
+                Some(&ticket.id),
+                "rescue.network_probe.proposed",
+                json!({ "proposal": { "id": "probe-1", "toolId": "network.dns.resolve", "target": "example.com" } }),
+            )
+            .unwrap();
+        let waiting = storage.evidence_receipts().unwrap().pop().unwrap();
+        assert_eq!(waiting.outcome, "waiting_approval");
+
+        storage
+            .append_event(
+                Some(&ticket.id),
+                "rescue.probe.completed",
+                json!({
+                    "toolId": "network.dns.resolve", "evidenceId": "evidence-r1",
+                    "state": "observed", "summary": "DNS 已解析", "contentDigest": "d".repeat(64), "elapsedMs": 4,
+                }),
+            )
+            .unwrap();
+        storage
+            .append_event(
+                Some(&ticket.id),
+                "rescue.network_probe.observed",
+                json!({ "proposalId": "probe-1", "status": "observed", "detail": "DNS 已解析" }),
+            )
+            .unwrap();
+        let observed = storage.evidence_receipts().unwrap().pop().unwrap();
+        assert_eq!(observed.outcome, "waiting_input");
+        assert!(observed
+            .sources
+            .iter()
+            .any(|item| { item.get("evidenceId").and_then(Value::as_str) == Some("evidence-r1") }));
+        assert!(observed.decisions.iter().any(|item| {
+            item.get("event").and_then(Value::as_str) == Some("rescue.network_probe.observed")
+        }));
     }
 
     #[test]

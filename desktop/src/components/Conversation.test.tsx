@@ -681,6 +681,40 @@ describe("conversation timeline projection", () => {
     expect(screen.getByRole("button", { name: "回滚本次系统修改" })).toBeInTheDocument();
   });
 
+  it("shows an exact one-time R1 network boundary and records the observed result", async () => {
+    const proposal = {
+      schemaVersion: 1, id: "probe-1", ticketId: ticket.id, toolId: "network.tcp.probe", toolVersion: 1, risk: "r1",
+      target: "example.com:443", normalizedArguments: { host: "example.com", port: 443 }, evidenceIds: ["evidence-r0"],
+      purpose: "确认目标端口是否可达", dataBoundary: "仅向 example.com 的 443 端口发起 TCP 握手；不发送 HTTP 或应用数据", timeoutMs: 12000,
+      nonce: "nonce", createdAt: "2026-11-10T00:00:00Z", expiresAt: "2026-11-10T00:10:00Z", status: "awaiting_approval", proposalDigest: "a".repeat(64),
+    };
+    const onResolve = vi.fn(async () => undefined);
+    const view = render(<Conversation
+      projectId="project-1" ticket={ticket} events={[event(1, "rescue.network_probe.proposed", { proposal })]} effect={null} receipt={null} appliedEffect={null} busy={false}
+      onSubmit={vi.fn()} onCancel={vi.fn()} onRetry={vi.fn()} onExport={vi.fn()} onBranch={vi.fn()} onApprove={vi.fn()} onReject={vi.fn()} onRollback={vi.fn()}
+      onResolveRescueProbe={onResolve} onExportReceipt={vi.fn()} hasProject onOpenProject={vi.fn()} error={null}
+      sidebarOpen inspectorOpen={false} onToggleSidebar={vi.fn()} onToggleInspector={vi.fn()} providerStatus="ready" modelProvider="bundled" providerModel="" modelPerformance={null}
+    />);
+    const card = screen.getByRole("article", { name: "Rescue 联网探测" });
+    expect(card).toHaveTextContent("example.com:443");
+    expect(card).toHaveTextContent("不发送 HTTP 内容");
+    expect(card).toHaveTextContent("不会记住本次授权");
+    fireEvent.click(within(card).getByRole("button", { name: "允许本次探测" }));
+    await waitFor(() => expect(onResolve).toHaveBeenCalledWith("probe-1", true));
+
+    const observed = { ...proposal, status: "observed" };
+    view.rerender(<Conversation
+      projectId="project-1" ticket={ticket} events={[event(1, "rescue.network_probe.proposed", { proposal }), event(2, "rescue.network_probe.observed", { proposalId: "probe-1", record: { proposal: observed, evidence: { id: "evidence-r1", summary: "TCP 可达", structured: { connected: true } }, detail: "已建立 TCP 连接", updatedAt: "2026-11-10T00:00:02Z" } })]} effect={null} receipt={null} appliedEffect={null} busy={false}
+      onSubmit={vi.fn()} onCancel={vi.fn()} onRetry={vi.fn()} onExport={vi.fn()} onBranch={vi.fn()} onApprove={vi.fn()} onReject={vi.fn()} onRollback={vi.fn()}
+      onResolveRescueProbe={onResolve} onExportReceipt={vi.fn()} hasProject onOpenProject={vi.fn()} error={null}
+      sidebarOpen inspectorOpen={false} onToggleSidebar={vi.fn()} onToggleInspector={vi.fn()} providerStatus="ready" modelProvider="bundled" providerModel="" modelPerformance={null}
+    />);
+    const completed = screen.getByRole("article", { name: "Rescue 联网探测" });
+    expect(completed).toHaveTextContent("探测完成");
+    expect(completed).toHaveTextContent("evidence-r1");
+    expect(within(completed).queryByRole("button", { name: "允许本次探测" })).not.toBeInTheDocument();
+  });
+
   it("shows a compact verified candidate comparison without private workspace data", () => {
     render(<Conversation
       projectId="project-1" ticket={ticket} events={[]} effect={null} receipt={null} appliedEffect={null} busy={false}

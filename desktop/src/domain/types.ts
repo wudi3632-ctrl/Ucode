@@ -254,6 +254,35 @@ export interface RescueRepairRecord {
   updatedAt: string;
 }
 
+export type R1ProbeStatus = "awaiting_approval" | "running" | "observed" | "unavailable" | "rejected" | "safe_stop";
+
+export interface R1ProbeProposal {
+  schemaVersion: number;
+  id: string;
+  ticketId: string;
+  toolId: "network.dns.resolve" | "network.tcp.probe";
+  toolVersion: number;
+  risk: "r1";
+  target: string;
+  normalizedArguments: { host?: string; port?: number | null };
+  evidenceIds: string[];
+  purpose: string;
+  dataBoundary: string;
+  timeoutMs: number;
+  nonce: string;
+  createdAt: string;
+  expiresAt: string;
+  status: R1ProbeStatus;
+  proposalDigest: string;
+}
+
+export interface R1ProbeRecord {
+  proposal: R1ProbeProposal;
+  evidence: { id?: string; summary?: string; structured?: Record<string, unknown> } | null;
+  detail: string;
+  updatedAt: string;
+}
+
 export interface CapsuleHealth {
   status: "ready" | "warning" | "blocked";
   integrity: "verified" | "cached" | "development" | "failed" | string;
