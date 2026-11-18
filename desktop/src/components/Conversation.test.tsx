@@ -153,6 +153,52 @@ describe("conversation timeline projection", () => {
     expect(evidence).toHaveTextContent("测试 1");
   });
 
+  it("describes a no-winner race as failed and explains why pytest was skipped", () => {
+    const receipt: EvidenceReceipt = {
+      ticketId: ticket.id, request: "修改三个文件并运行 pytest", route: "candidate_race", outcome: "failed",
+      sources: [], commands: [], tests: [], effects: [],
+      decisions: [{ event: "race.decided", detail: {
+        race: { verdict: { kind: "no_winner" } },
+        testsExecuted: false,
+        testSkippedReason: "两个候选均未完整覆盖任务目标，机械验收未执行，已在写入前安全停止。",
+        candidates: [{ id: "candidate-a", facts: [{ outcome: "failed", summary: "遗漏 report.py" }] }],
+      } }],
+      finalState: { ticketState: "failed" }, contentDigest: "digest", updatedAt: "2026-11-10T00:00:01Z",
+    };
+    render(<Conversation
+      projectId="project-1" ticket={{ ...ticket, state: "failed" }} events={[]} effect={null} receipt={receipt} appliedEffect={null} busy={false}
+      onSubmit={vi.fn()} onCancel={vi.fn()} onRetry={vi.fn()} onExport={vi.fn()} onBranch={vi.fn()}
+      onApprove={vi.fn()} onReject={vi.fn()} onRollback={vi.fn()} onExportReceipt={vi.fn()} hasProject onOpenProject={vi.fn()} error={null}
+      sidebarOpen inspectorOpen={false} onToggleSidebar={vi.fn()} onToggleInspector={vi.fn()}
+      providerStatus="ready" modelProvider="bundled" providerModel="" modelPerformance={null}
+    />);
+
+    const evidence = screen.getByRole("article", { name: "结果证据" });
+    expect(evidence).toHaveTextContent("失败");
+    expect(evidence).toHaveTextContent("机械验收未执行");
+    expect(evidence).toHaveTextContent("没有写入文件");
+    expect(evidence).toHaveTextContent("技术详情 · 1 条事实");
+    expect(evidence).not.toHaveTextContent("本轮不需要运行测试");
+  });
+
+  it("labels tests from an invalidated legacy race as candidate-only evidence", () => {
+    const receipt: EvidenceReceipt = {
+      ticketId: ticket.id, request: "旧候选任务", route: "candidate_race", outcome: "failed",
+      sources: [], commands: [], effects: [],
+      tests: [{ toolName: "candidate_test", status: "passed", exitCode: 0, preview: "3 passed" }],
+      decisions: [{ event: "race.legacy_stopped", detail: { reason: "legacy_protocol_missing_targets" } }],
+      finalState: { ticketState: "failed" }, contentDigest: "digest", updatedAt: "2026-11-10T00:00:01Z",
+    };
+    render(<Conversation
+      projectId="project-1" ticket={{ ...ticket, state: "failed" }} events={[]} effect={null} receipt={receipt} appliedEffect={null} busy={false}
+      onSubmit={vi.fn()} onCancel={vi.fn()} onRetry={vi.fn()} onExport={vi.fn()} onBranch={vi.fn()}
+      onApprove={vi.fn()} onReject={vi.fn()} onRollback={vi.fn()} onExportReceipt={vi.fn()} hasProject onOpenProject={vi.fn()} error={null}
+      sidebarOpen inspectorOpen={false} onToggleSidebar={vi.fn()} onToggleInspector={vi.fn()}
+      providerStatus="ready" modelProvider="bundled" providerModel="" modelPerformance={null}
+    />);
+    expect(screen.getByRole("article", { name: "结果证据" })).toHaveTextContent("仅旧候选验证：pytest：3 passed；任务已在写入前安全失效");
+  });
+
   it("reveals observed response performance only inside the model menu", () => {
     render(<Conversation
       projectId="project-1" ticket={ticket} events={[]} effect={null} receipt={null} appliedEffect={null} busy={false}

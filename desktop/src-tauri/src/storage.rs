@@ -1258,6 +1258,17 @@ impl Storage {
             .collect()
     }
 
+    pub fn races(&self) -> Result<Vec<Race>, StorageError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT payload_json FROM races ORDER BY updated_at")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|payload| serde_json::from_str(&payload).map_err(Into::into))
+            .collect()
+    }
+
     pub fn save_candidate(&self, candidate: &Candidate) -> Result<(), StorageError> {
         let payload = serde_json::to_string(candidate)?;
         self.connection.execute(
@@ -1638,6 +1649,48 @@ fn refresh_evidence_receipt(connection: &Connection, ticket_id: &str) -> Result<
                         push_unique(&mut commands, evidence.clone());
                     }
                 }
+            }
+            "race.decided" => {
+                decisions.push(json!({ "event": event_type, "detail": payload, "at": created_at }));
+                for candidate in payload
+                    .get("candidates")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    let candidate_id = candidate.get("id").and_then(Value::as_str).unwrap_or("");
+                    for fact in candidate
+                        .get("facts")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                    {
+                        let Some(command) = fact.get("command").and_then(Value::as_str) else {
+                            continue;
+                        };
+                        push_unique(
+                            &mut tests,
+                            json!({
+                                "toolName": "candidate_test",
+                                "candidateId": candidate_id,
+                                "checkId": fact.get("checkId"),
+                                "status": fact.get("outcome"),
+                                "command": command,
+                                "exitCode": fact.get("exitCode"),
+                                "preview": fact.get("summary"),
+                                "at": created_at,
+                            }),
+                        );
+                    }
+                }
+            }
+            "race.legacy_stopped" => {
+                route = Some("candidate_race".into());
+                decisions.push(json!({ "event": event_type, "detail": payload, "at": created_at }));
+            }
+            "race.terminal_reconciled" => {
+                route = Some("candidate_race".into());
+                decisions.push(json!({ "event": event_type, "detail": payload, "at": created_at }));
             }
             "effect.proposed" => {
                 if let Some(effect_id) = payload
@@ -2706,6 +2759,67 @@ mod tests {
         assert!(receipt.sources.is_empty());
         assert_eq!(receipt.tests.len(), 1);
         assert_eq!(receipt.tests[0]["toolName"], "pytest");
+    }
+
+    #[test]
+    fn no_winner_receipt_is_failed_and_preserves_candidate_validation_facts() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("ucode.db");
+        let mut storage = Storage::open(&database).unwrap();
+        let locator = ProjectLocator {
+            absolute_path: directory.path().display().to_string(),
+            relative_path: None,
+            fingerprint: "no-winner-receipt".into(),
+        };
+        let project = storage.upsert_project(&locator, true).unwrap();
+        let ticket = storage
+            .create_ticket(&project.id, "modify three files and run pytest")
+            .unwrap();
+        storage
+            .set_ticket_state(&ticket.id, TicketState::Failed)
+            .unwrap();
+        storage
+            .append_event(
+                Some(&ticket.id),
+                "delivery.ready",
+                json!({
+                    "content": "no safe winner",
+                    "route": "candidate_race",
+                    "originalProjectChanged": false
+                }),
+            )
+            .unwrap();
+        storage
+            .append_event(
+                Some(&ticket.id),
+                "race.decided",
+                json!({
+                    "race": { "verdict": { "kind": "no_winner" } },
+                    "testsExecuted": true,
+                    "originalProjectChanged": false,
+                    "candidates": [{
+                        "id": "candidate-a",
+                        "facts": [{
+                            "checkId": "required-tests",
+                            "outcome": "failed",
+                            "summary": "1 failed",
+                            "command": "pytest",
+                            "exitCode": 1
+                        }]
+                    }]
+                }),
+            )
+            .unwrap();
+
+        let receipt = storage.evidence_receipts().unwrap().pop().unwrap();
+        assert_eq!(receipt.outcome, "failed");
+        assert_eq!(receipt.route.as_deref(), Some("candidate_race"));
+        assert_eq!(receipt.decisions.len(), 1);
+        assert_eq!(receipt.decisions[0]["event"], "race.decided");
+        assert_eq!(receipt.tests.len(), 1);
+        assert_eq!(receipt.tests[0]["candidateId"], "candidate-a");
+        assert_eq!(receipt.tests[0]["exitCode"], 1);
+        assert!(receipt.effects.is_empty());
     }
 
     #[test]

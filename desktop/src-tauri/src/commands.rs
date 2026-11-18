@@ -335,7 +335,143 @@ fn legacy_execution_context(
 
 #[tauri::command]
 pub fn bootstrap(state: State<'_, AppState>) -> Result<BootstrapSnapshot, String> {
+    invalidate_legacy_recoverable_races(&state)?;
+    reconcile_terminal_race_states(&state)?;
     snapshot(&state)
+}
+
+fn race_targets_match_allowed_paths(race: &Race) -> bool {
+    if race.targets.is_empty() || race.targets.len() != race.allowed_paths.len() {
+        return false;
+    }
+    let targets = race
+        .targets
+        .iter()
+        .map(|target| target.path.as_str())
+        .collect::<BTreeSet<_>>();
+    let allowed = race
+        .allowed_paths
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    targets.len() == race.targets.len()
+        && allowed.len() == race.allowed_paths.len()
+        && targets == allowed
+}
+
+fn terminal_ticket_state_for_race(state: RaceState) -> Option<TicketState> {
+    match state {
+        RaceState::NoWinner | RaceState::Stale => Some(TicketState::Failed),
+        RaceState::Cancelled => Some(TicketState::Stopped),
+        _ => None,
+    }
+}
+
+fn invalidate_legacy_recoverable_races(state: &AppState) -> Result<(), String> {
+    let legacy_races = state
+        .storage
+        .lock()
+        .map_err(|_| "storage lock was poisoned".to_string())?
+        .recoverable_races()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter(|race| {
+            race.schema_version != RACE_SCHEMA_VERSION || !race_targets_match_allowed_paths(race)
+        })
+        .collect::<Vec<_>>();
+    if legacy_races.is_empty() {
+        return Ok(());
+    }
+    let managed_root = state.portable.worktrees_dir().join("races");
+    for mut race in legacy_races {
+        let candidates = state
+            .storage
+            .lock()
+            .map_err(|_| "storage lock was poisoned".to_string())?
+            .candidates_for_race(&race.id)
+            .map_err(|error| error.to_string())?;
+        for candidate in &candidates {
+            if let Some(request_id) = candidate.executor_request_id.as_deref() {
+                let _ = state.executor.cancel(request_id);
+            }
+        }
+        race.transition(RaceState::Stale, Utc::now().to_rfc3339())
+            .map_err(|error| error.to_string())?;
+        {
+            let storage = state
+                .storage
+                .lock()
+                .map_err(|_| "storage lock was poisoned".to_string())?;
+            storage
+                .save_race(&race)
+                .map_err(|error| error.to_string())?;
+            storage
+                .set_ticket_state(&race.ticket_id, TicketState::Failed)
+                .map_err(|error| error.to_string())?;
+            storage
+                .append_event(
+                    Some(&race.ticket_id),
+                    "race.legacy_stopped",
+                    json!({
+                        "raceId": race.id,
+                        "reason": "legacy_protocol_missing_targets",
+                        "summary": "该候选任务来自旧协议，缺少逐文件操作约束，已在写入前安全终止；请重新提交任务。",
+                        "originalProjectChanged": false,
+                    }),
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        cleanup_race_workspaces(&managed_root, &race.id, &state.storage);
+    }
+    Ok(())
+}
+
+fn reconcile_terminal_race_states(state: &AppState) -> Result<(), String> {
+    let corrections = {
+        let storage = state
+            .storage
+            .lock()
+            .map_err(|_| "storage lock was poisoned".to_string())?;
+        let tickets = storage
+            .tickets()
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|ticket| (ticket.id, ticket.state))
+            .collect::<BTreeMap<_, _>>();
+        storage
+            .races()
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .filter_map(|race| {
+                let expected = terminal_ticket_state_for_race(race.state)?;
+                (tickets.get(&race.ticket_id).copied() != Some(expected))
+                    .then_some((race, expected))
+            })
+            .collect::<Vec<_>>()
+    };
+    for (race, expected) in corrections {
+        let storage = state
+            .storage
+            .lock()
+            .map_err(|_| "storage lock was poisoned".to_string())?;
+        storage
+            .set_ticket_state(&race.ticket_id, expected)
+            .map_err(|error| error.to_string())?;
+        storage
+            .append_event(
+                Some(&race.ticket_id),
+                "race.terminal_reconciled",
+                json!({
+                    "raceId": race.id,
+                    "raceState": race.state,
+                    "ticketState": expected,
+                    "summary": "候选竞赛终态已与任务状态对账；失败或失效的候选不会再显示为已完成。",
+                    "originalProjectChanged": matches!(race.state, RaceState::Applied | RaceState::RolledBack),
+                }),
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -5601,20 +5737,22 @@ fn run_candidate_race_task(
             .lock()
             .map_err(|_| "storage lock was poisoned".to_string())?;
         guard.save_race(&race).map_err(|error| error.to_string())?;
-        if race.state == RaceState::NoWinner {
+        if let Some(ticket_state) = terminal_ticket_state_for_race(race.state) {
             guard
-                .set_ticket_state(&race.ticket_id, TicketState::Completed)
+                .set_ticket_state(&race.ticket_id, ticket_state)
                 .map_err(|error| error.to_string())?;
+        }
+        if race.state == RaceState::NoWinner {
             guard
                 .append_event(
                     Some(&race.ticket_id),
                     "delivery.ready",
-                    json!({ "content": "两个隔离方案都没有通过全部必要验证，因此没有推荐或写入任何修改。" }),
+                    json!({
+                        "content": "两个隔离方案都没有通过全部必要验证，因此任务未完成，也没有推荐或写入任何修改。可查看候选事实后改写任务并重试。",
+                        "route": "candidate_race",
+                        "originalProjectChanged": false,
+                    }),
                 )
-                .map_err(|error| error.to_string())?;
-        } else if race.state == RaceState::Stale {
-            guard
-                .set_ticket_state(&race.ticket_id, TicketState::Failed)
                 .map_err(|error| error.to_string())?;
         }
     }
@@ -5622,11 +5760,25 @@ fn run_candidate_race_task(
         append_runtime_event(storage, &race.ticket_id, "effect.proposed", effect, app);
     }
     let public_candidates = project_capsule(&race, &candidates).candidates;
+    let tests_executed = public_candidates
+        .iter()
+        .flat_map(|candidate| candidate.facts.iter())
+        .any(|fact| fact.command.is_some());
     append_runtime_event(
         storage,
         &race.ticket_id,
         "race.decided",
-        json!({ "race": race, "candidates": public_candidates }),
+        json!({
+            "race": race,
+            "candidates": public_candidates,
+            "testsExecuted": tests_executed,
+            "testSkippedReason": if race.state == RaceState::NoWinner && !tests_executed {
+                Some("两个候选均未完整覆盖任务目标，机械验收未执行，已在写入前安全停止。")
+            } else {
+                None
+            },
+            "originalProjectChanged": false,
+        }),
         app,
     );
     Ok(())
@@ -6706,6 +6858,56 @@ mod tests {
             );
         }
         assert!(normalize_race_paths(Vec::new()).is_err());
+    }
+
+    #[test]
+    fn candidate_race_terminal_states_do_not_report_no_winner_as_completed() {
+        assert_eq!(
+            terminal_ticket_state_for_race(RaceState::NoWinner),
+            Some(TicketState::Failed)
+        );
+        assert_eq!(
+            terminal_ticket_state_for_race(RaceState::Stale),
+            Some(TicketState::Failed)
+        );
+        assert_eq!(
+            terminal_ticket_state_for_race(RaceState::Cancelled),
+            Some(TicketState::Stopped)
+        );
+        assert_eq!(
+            terminal_ticket_state_for_race(RaceState::AwaitingReview),
+            None
+        );
+    }
+
+    #[test]
+    fn legacy_candidate_race_requires_complete_unique_target_contract() {
+        let race = Race {
+            schema_version: RACE_SCHEMA_VERSION,
+            id: "race-legacy".into(),
+            ticket_id: "ticket-legacy".into(),
+            project_fingerprint: "project".into(),
+            objective: "modify files".into(),
+            state: RaceState::Generating,
+            targets: vec![RaceTarget {
+                path: "src/app.py".into(),
+                operation: crate::race::RaceTargetOperation::Modify,
+            }],
+            allowed_paths: vec!["src/app.py".into()],
+            acceptance: vec!["pytest".into()],
+            verdict: None,
+            created_at: "created".into(),
+            updated_at: "updated".into(),
+        };
+        assert!(race_targets_match_allowed_paths(&race));
+        assert!(!race_targets_match_allowed_paths(&Race {
+            targets: Vec::new(),
+            ..race.clone()
+        }));
+        assert!(!race_targets_match_allowed_paths(&Race {
+            allowed_paths: vec!["src/other.py".into()],
+            ..race
+        }));
     }
 
     #[test]

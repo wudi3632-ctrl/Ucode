@@ -421,12 +421,23 @@ function EvidenceReceiptCard({ receipt, onExport }: { receipt: EvidenceReceipt; 
   const total = visibleSources.length + receipt.commands.length + visibleTests.length + receipt.effects.length + receipt.decisions.length;
   const appliedEffects = receipt.effects.filter((effect) => effect.event === "effect.applied");
   const rejected = appliedEffects.length === 0 && receipt.decisions.some((decision) => decision.event === "effect.rejected");
+  const noWinnerDecision = receipt.decisions.find((decision) => decision.event === "race.decided" && nestedValue(decision, ["detail", "race", "verdict", "kind"]) === "no_winner");
+  const legacyRaceStopped = receipt.decisions.find((decision) => decision.event === "race.legacy_stopped");
+  const staleRaceReconciled = receipt.decisions.find((decision) => decision.event === "race.terminal_reconciled" && nestedValue(decision, ["detail", "raceState"]) === "stale");
   const outcome = rejected ? "已取消" : ({ completed: "已完成", failed: "失败", cancelled: "已停止", rolled_back: "已回滚", waiting_input: "等待输入", waiting_approval: "等待审批", in_progress: "进行中" } as Record<string, string>)[receipt.outcome] ?? receipt.outcome;
   const changed = appliedEffects.length ? `${appliedEffects.length} 个已应用批次` : "没有写入文件";
   const verified = rejected
     ? "未执行测试（修改已拒绝）"
     : visibleTests.length
-    ? summarizeTestEvidence(visibleTests)
+    ? legacyRaceStopped
+      ? `仅旧候选验证：${summarizeTestEvidence(visibleTests)}；任务已在写入前安全失效`
+      : staleRaceReconciled
+        ? `仅候选验证：${summarizeTestEvidence(visibleTests)}；项目已变化，结果未写入`
+        : summarizeTestEvidence(visibleTests)
+    : noWinnerDecision
+      ? String(nestedValue(noWinnerDecision, ["detail", "testSkippedReason"]) ?? "机械验收未执行：候选未通过写入前完整性检查")
+      : legacyRaceStopped
+        ? "机械验收未执行：旧任务缺少安全操作约束，已在写入前终止"
     : visibleSources.length
       ? `${visibleSources.length} 项项目来源已核验`
       : appliedEffects.length
@@ -462,6 +473,15 @@ function EvidenceReceiptCard({ receipt, onExport }: { receipt: EvidenceReceipt; 
   </article>;
 }
 
+function nestedValue(value: unknown, path: string[]): unknown {
+  let current = value;
+  for (const key of path) {
+    if (!current || typeof current !== "object" || Array.isArray(current)) return undefined;
+    current = (current as Record<string, unknown>)[key];
+  }
+  return current;
+}
+
 function isTestEvidence(item: Record<string, unknown>) {
   const nested = item.evidence && typeof item.evidence === "object" ? item.evidence as Record<string, unknown> : item;
   const tool = String(nested.toolName ?? nested.tool ?? "");
@@ -478,7 +498,7 @@ function summarizeTestEvidence(tests: Record<string, unknown>[]) {
   const exitCode = typeof nested.exitCode === "number" ? nested.exitCode : null;
   const scope = paths.length ? ` · ${paths.join("、")}` : "";
   if (passed && exitCode === 0) return `pytest：${passed} passed${scope}`;
-  if (failed || (exitCode !== null && exitCode !== 0)) return `pytest：${failed ? `${failed} failed` : `退出码 ${exitCode}`}${scope}`;
+  if (failed || nested.status === "failed" || (exitCode !== null && exitCode !== 0)) return `pytest：${failed ? `${failed} failed` : exitCode !== null ? `退出码 ${exitCode}` : "未通过"}${scope}`;
   if (exitCode === 0 || nested.status === "succeeded") return `pytest 已通过 · ${tests.length} 项真实测试记录${scope}`;
   return `${tests.length} 项测试已有记录`;
 }

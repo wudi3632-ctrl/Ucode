@@ -99,6 +99,26 @@ describe("UCode desktop", () => {
     expect(effectFrom({ ...snapshot, events }, ticketId)).toBeNull();
   });
 
+  it("hides a historical approval after its candidate race becomes stale", async () => {
+    const snapshot = await bootstrap();
+    const ticketId = snapshot.tickets[0].id;
+    const events = [
+      { sequence: 1, ticketId, eventType: "effect.proposed", payload: { id: "race-effect", changes: [{ path: "a.py", operation: "modify", before: "old", after: "new" }] }, createdAt: new Date().toISOString() },
+      { sequence: 2, ticketId, eventType: "race.decided", payload: { race: { state: "stale" } }, createdAt: new Date().toISOString() },
+    ];
+    expect(effectFrom({ ...snapshot, events }, ticketId)).toBeNull();
+  });
+
+  it("hides a legacy approval when bootstrap safely stops an old race protocol", async () => {
+    const snapshot = await bootstrap();
+    const ticketId = snapshot.tickets[0].id;
+    const events = [
+      { sequence: 1, ticketId, eventType: "effect.proposed", payload: { id: "legacy-race-effect", path: "a.py", after: "new" }, createdAt: new Date().toISOString() },
+      { sequence: 2, ticketId, eventType: "race.legacy_stopped", payload: { raceId: "race-old" }, createdAt: new Date().toISOString() },
+    ];
+    expect(effectFrom({ ...snapshot, events }, ticketId)).toBeNull();
+  });
+
   it("resolves the system theme and suppresses live deltas when streaming is disabled", async () => {
     expect(resolveTheme("system", true)).toBe("light");
     expect(resolveTheme("system", false)).toBe("dark");

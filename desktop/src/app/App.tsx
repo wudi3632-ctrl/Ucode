@@ -722,7 +722,14 @@ export function effectFrom(snapshot: BootstrapSnapshot, ticketId: string | null)
   const events = snapshot.events.filter((event) => event.ticketId === ticketId).sort((a, b) => b.sequence - a.sequence);
   const proposed = events.find((event) => event.eventType === "effect.proposed");
   if (!proposed) return null;
-  const resolved = events.some((event) => event.sequence > proposed.sequence && ["effect.approved", "effect.rejected", "effect.recovery_required"].includes(event.eventType));
+  const resolved = events.some((event) => {
+    if (event.sequence <= proposed.sequence) return false;
+    if (["effect.approved", "effect.rejected", "effect.recovery_required", "race.legacy_stopped"].includes(event.eventType)) return true;
+    if (event.eventType !== "race.decided") return false;
+    const race = event.payload.race;
+    const state = race && typeof race === "object" && !Array.isArray(race) ? String((race as Record<string, unknown>).state ?? "") : "";
+    return ["no_winner", "stale", "cancelled", "rejected", "applied", "rolled_back"].includes(state);
+  });
   if (resolved) return null;
   const payload = proposed.payload;
   const rawChanges = Array.isArray(payload.changes) ? payload.changes : [{

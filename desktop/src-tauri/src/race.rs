@@ -28,13 +28,17 @@ impl RaceState {
             (self, next),
             (Prepared, Generating)
                 | (Prepared, Cancelled)
+                | (Prepared, Stale)
                 | (Generating, Validating)
                 | (Generating, Cancelled)
+                | (Generating, Stale)
                 | (Validating, Decided)
                 | (Validating, NoWinner)
                 | (Validating, Cancelled)
+                | (Validating, Stale)
                 | (Decided, AwaitingReview)
                 | (Decided, NoWinner)
+                | (Decided, Stale)
                 | (AwaitingReview, Applied)
                 | (AwaitingReview, Rejected)
                 | (AwaitingReview, Stale)
@@ -491,6 +495,16 @@ mod tests {
             candidate.transition(CandidateState::Passed, "later"),
             Err(TransitionError::Candidate { .. })
         ));
+
+        for recoverable in [
+            RaceState::Prepared,
+            RaceState::Generating,
+            RaceState::Validating,
+            RaceState::Decided,
+            RaceState::AwaitingReview,
+        ] {
+            assert!(recoverable.can_transition_to(RaceState::Stale));
+        }
     }
 
     #[test]
