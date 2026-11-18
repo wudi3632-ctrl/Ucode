@@ -20,11 +20,11 @@
 
 ## 任务 2：有界 Windows 探针
 
-- 固定 PowerShell 脚本使用 `Get-NetTCPConnection -State Listen`；
-- 端口仅通过 `UCODE_RESCUE_LOCAL_PORT` 环境变量传入；
+- 使用 Windows IP Helper `GetExtendedTcpTable` 读取 IPv4/IPv6 listener；
+- 使用受限进程查询 API，只保留进程基名；
 - 输出最多 16 个稳定排序、去重 listener；
 - 只返回 localAddress、pid、processName、ownerKind；
-- 沿用 10 秒超时、64 KiB 输出限制和隐藏窗口；
+- 不启动 shell；保留 64 KiB 序列化输出上限；
 - 非 Windows 或探针不可用时返回 unavailable，不假装空闲。
 
 验证：fake runner schema/上限/失败测试；Windows 上启动临时 loopback listener 进行真实 occupied/available 对照测试。

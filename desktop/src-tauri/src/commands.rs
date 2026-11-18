@@ -20,6 +20,7 @@ use crate::race_workspace::{
 use crate::rescue::{
     compact_report as compact_rescue_report, diagnose as diagnose_rescue, is_rescue_request,
 };
+use crate::rescue_local_port::explicit_local_port;
 use crate::rescue_probe::{
     requested_probe_description, NetworkProbeService, ProbeStatus, R1ProbeRecord,
 };
@@ -5259,6 +5260,10 @@ fn requests_service_start_repair(value: &str) -> bool {
             .any(|action| actionable.contains(action))
 }
 
+fn should_offer_r1_network_probe(request: &str, domain: &str, has_next_probe: bool) -> bool {
+    domain == "network" && has_next_probe && explicit_local_port(request).is_none()
+}
+
 fn mentions_project_file(value: &str) -> bool {
     [
         ".md", ".txt", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".py", ".rs", ".go", ".java",
@@ -5344,7 +5349,8 @@ fn run_executor_ticket(
         .collect::<Vec<_>>();
     let mut rescue_report = (route == DesktopRoute::Rescue).then(|| diagnose_rescue(request_text));
     if let Some(report) = rescue_report.as_mut() {
-        if report.domain == "network" && report.next_probe.is_some() {
+        if should_offer_r1_network_probe(request_text, &report.domain, report.next_probe.is_some())
+        {
             report.next_probe = Some(requested_probe_description(request_text).unwrap_or_else(
                 || "请明确一个受影响域名，或一个主机与端口；UCode 不会自行选择外部目标".into(),
             ));
@@ -5359,6 +5365,7 @@ fn run_executor_ticket(
                     "toolId": evidence.tool_id,
                     "state": evidence.state,
                     "summary": evidence.summary,
+                    "structured": if evidence.tool_id == "network.local_port.inspect" { evidence.structured.clone() } else { json!(null) },
                     "contentDigest": evidence.content_digest,
                     "elapsedMs": evidence.elapsed_ms,
                 }),
@@ -5483,7 +5490,11 @@ fn run_executor_ticket(
                     app,
                 ),
             }
-        } else if report.domain == "network" && report.next_probe.is_some() {
+        } else if should_offer_r1_network_probe(
+            request_text,
+            &report.domain,
+            report.next_probe.is_some(),
+        ) {
             let evidence_ids = report
                 .evidence
                 .iter()
@@ -7143,6 +7154,25 @@ mod tests {
             explicit_service_name("服务 Spooler 异常，请修复").as_deref(),
             Some("Spooler")
         );
+    }
+
+    #[test]
+    fn local_port_diagnosis_never_offers_an_r1_network_probe() {
+        assert!(!should_offer_r1_network_probe(
+            "本机端口 3082 被谁占用？请根据真实证据诊断并释放",
+            "network",
+            true,
+        ));
+        assert!(!should_offer_r1_network_probe(
+            "localhost:54321 address already in use",
+            "network",
+            true,
+        ));
+        assert!(should_offer_r1_network_probe(
+            "example.com:443 连接失败，请排查",
+            "network",
+            true,
+        ));
     }
 
     #[test]

@@ -77,7 +77,7 @@ pub struct RescueToolDefinition {
 }
 
 pub fn tool_registry() -> &'static [RescueToolDefinition] {
-    static TOOLS: [RescueToolDefinition; 13] = [
+    static TOOLS: [RescueToolDefinition; 14] = [
         RescueToolDefinition {
             id: "system.inventory",
             version: 1,
@@ -149,6 +149,14 @@ pub fn tool_registry() -> &'static [RescueToolDefinition] {
             risk: RiskClass::R0,
             authority: "read",
             description: "Inspect WinHTTP and process proxy configuration",
+        },
+        RescueToolDefinition {
+            id: "network.local_port.inspect",
+            version: 1,
+            domain: "network",
+            risk: RiskClass::R0,
+            authority: "read",
+            description: "Inspect listeners for one explicitly named local TCP port",
         },
         RescueToolDefinition {
             id: "network.dns.resolve",
@@ -267,6 +275,8 @@ impl ProbeRunner for WindowsProbeRunner {
         if let Some(result) = crate::rescue_filesystem::run(tool_id, arguments) {
             result
         } else if let Some(result) = crate::rescue_service::run(tool_id, arguments) {
+            result
+        } else if let Some(result) = crate::rescue_local_port::run(tool_id, arguments) {
             result
         } else {
             self.run(tool_id)
@@ -438,20 +448,29 @@ pub fn diagnose_with_runner(request: &str, runner: &dyn ProbeRunner) -> Diagnosi
         "system"
     };
     let mut probes = vec![("system.inventory".to_string(), Value::Null)];
+    let local_port_probe = (domain == "network")
+        .then(|| crate::rescue_local_port::requested_probe(request))
+        .flatten();
     let targeted_service = (domain == "system")
         .then(|| crate::rescue_service::requested_probe(request))
         .flatten();
     match domain {
-        "network" => probes.extend(
-            [
-                "system.environment.inspect",
-                "network.adapter.inspect",
-                "network.route.inspect",
-                "network.proxy.inspect",
-            ]
-            .into_iter()
-            .map(|id| (id.to_string(), Value::Null)),
-        ),
+        "network" => {
+            if let Some(probe) = local_port_probe {
+                probes.push(probe);
+            } else {
+                probes.extend(
+                    [
+                        "system.environment.inspect",
+                        "network.adapter.inspect",
+                        "network.route.inspect",
+                        "network.proxy.inspect",
+                    ]
+                    .into_iter()
+                    .map(|id| (id.to_string(), Value::Null)),
+                );
+            }
+        }
         "filesystem" => probes.extend(crate::rescue_filesystem::requested_probes(request)),
         _ => {
             if let Some(probe) = targeted_service {
@@ -477,7 +496,14 @@ pub fn diagnose_with_runner(request: &str, runner: &dyn ProbeRunner) -> Diagnosi
         .map(|(id, arguments)| collect_with_arguments(runner, &id, &arguments))
         .collect::<Vec<_>>();
     let (hypotheses, edges, next_probe) = match domain {
-        "network" => analyze_network(&evidence),
+        "network" => {
+            if let Some((hypotheses, next_probe)) = crate::rescue_local_port::analyze(&evidence) {
+                let edges = edges_from_hypotheses(&hypotheses);
+                (hypotheses, edges, next_probe)
+            } else {
+                analyze_network(&evidence)
+            }
+        }
         "filesystem" => {
             let (hypotheses, next_probe) = crate::rescue_filesystem::analyze(request, &evidence);
             let edges = edges_from_hypotheses(&hypotheses);
@@ -615,6 +641,19 @@ fn summarize(tool_id: &str, value: &Value, exit_code: i32, stderr: &str) -> Stri
                 "检测到代理配置".into()
             } else {
                 "未检测到显式代理配置".into()
+            }
+        }
+        "network.local_port.inspect" => {
+            let port = value.get("port").and_then(Value::as_u64).unwrap_or(0);
+            let listeners = value.get("listeners").map(array_items).unwrap_or_default();
+            if value
+                .get("occupied")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                format!("本机 TCP 端口 {port} 有 {} 个监听者", listeners.len())
+            } else {
+                format!("本机 TCP 端口 {port} 未发现监听者")
             }
         }
         "system.service.inspect" => format!("发现 {} 个未运行的自动服务", array_items(value).len()),
@@ -1120,6 +1159,7 @@ mod tests {
         for id in [
             "system.eventlog.query",
             "system.service.query",
+            "network.local_port.inspect",
             "filesystem.hash",
             "filesystem.permissions.inspect",
         ] {
@@ -1257,6 +1297,82 @@ mod tests {
             assert!(is_rescue_request(request), "did not route: {request}");
             assert!(is_network_request(request), "wrong domain: {request}");
         }
+    }
+
+    #[test]
+    fn explicit_local_port_runs_only_inventory_and_listener_probe() {
+        struct LocalPortFixture {
+            occupied: bool,
+        }
+        impl ProbeRunner for LocalPortFixture {
+            fn run(&self, tool_id: &str) -> Result<ProbeOutput, String> {
+                if tool_id == "system.inventory" {
+                    return Ok(ProbeOutput {
+                        exit_code: 0,
+                        stdout: json!({"caption":"Windows 11","build":"26100"}).to_string(),
+                        stderr: String::new(),
+                    });
+                }
+                Err(format!("unexpected probe: {tool_id}"))
+            }
+
+            fn run_with_arguments(
+                &self,
+                tool_id: &str,
+                arguments: &Value,
+            ) -> Result<ProbeOutput, String> {
+                if tool_id != "network.local_port.inspect" {
+                    return self.run(tool_id);
+                }
+                assert_eq!(arguments, &json!({"port":3082,"protocol":"tcp"}));
+                Ok(ProbeOutput {
+                    exit_code: 0,
+                    stdout: if self.occupied {
+                        json!({"port":3082,"protocol":"tcp","occupied":true,"listeners":[{"localAddress":"127.0.0.1","pid":1234,"processName":"node","ownerKind":"user_process"}],"truncated":false})
+                    } else {
+                        json!({"port":3082,"protocol":"tcp","occupied":false,"listeners":[],"truncated":false})
+                    }
+                    .to_string(),
+                    stderr: String::new(),
+                })
+            }
+        }
+
+        let occupied = diagnose_with_runner(
+            "本机端口 3082 被占用，帮我诊断并释放",
+            &LocalPortFixture { occupied: true },
+        );
+        let available = diagnose_with_runner(
+            "本机端口 3082 被占用，帮我诊断并释放",
+            &LocalPortFixture { occupied: false },
+        );
+        for report in [&occupied, &available] {
+            assert_eq!(report.evidence.len(), 2);
+            assert!(report.evidence.iter().all(|item| matches!(
+                item.tool_id.as_str(),
+                "system.inventory" | "network.local_port.inspect"
+            )));
+            assert!(!report.mutation_performed);
+            assert!(report.evidence.iter().all(|item| !matches!(
+                item.tool_id.as_str(),
+                "network.tcp.probe"
+                    | "network.adapter.inspect"
+                    | "network.route.inspect"
+                    | "network.proxy.inspect"
+            )));
+        }
+        assert!(matches!(
+            hypothesis(&occupied, "network.local_port_occupied").state,
+            HypothesisState::Supported
+        ));
+        assert!(matches!(
+            hypothesis(&available, "network.local_port_occupied").state,
+            HypothesisState::Contradicted
+        ));
+        assert_ne!(
+            serde_json::to_string(&occupied.hypotheses).unwrap(),
+            serde_json::to_string(&available.hypotheses).unwrap()
+        );
     }
 
     #[test]

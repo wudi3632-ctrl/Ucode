@@ -817,6 +817,22 @@ function activityLabel(event: RuntimeEvent) {
   if (event.eventType === "rescue.probe.completed") {
     const summary = String(event.payload.summary ?? "已采集系统证据");
     const tool = String(event.payload.toolId ?? "系统探针");
+    if (tool === "network.local_port.inspect") {
+      const structured = event.payload.structured && typeof event.payload.structured === "object" && !Array.isArray(event.payload.structured)
+        ? event.payload.structured as Record<string, unknown>
+        : null;
+      const port = Number(structured?.port ?? 0);
+      const listeners = Array.isArray(structured?.listeners) ? structured.listeners : [];
+      const first = listeners[0] && typeof listeners[0] === "object" && !Array.isArray(listeners[0])
+        ? listeners[0] as Record<string, unknown>
+        : null;
+      if (structured?.occupied === true) {
+        const process = typeof first?.processName === "string" && first.processName ? first.processName : "未知进程";
+        const pid = Number(first?.pid ?? 0);
+        return `本机端口 ${port} 正在监听 · ${process}${pid > 0 ? ` · PID ${pid}` : ""}`;
+      }
+      if (structured?.occupied === false) return `本机端口 ${port} 未发现监听者`;
+    }
     return `${tool} · ${summary}`;
   }
   if (event.eventType === "rescue.diagnosis.ready") {

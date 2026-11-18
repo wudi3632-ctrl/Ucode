@@ -47,6 +47,36 @@ describe("conversation timeline projection", () => {
     ]);
   });
 
+  it("renders bounded local-port evidence without a command line or executable path", () => {
+    const events = [
+      event(1, "rescue.probe.completed", {
+        toolId: "network.local_port.inspect",
+        summary: "本机 TCP 端口 3082 有 1 个监听者",
+        evidenceId: "evidence-port",
+        structured: {
+          port: 3082,
+          protocol: "tcp",
+          occupied: true,
+          listeners: [{ localAddress: "127.0.0.1", pid: 4242, processName: "node", ownerKind: "user_process" }],
+          truncated: false,
+        },
+      }),
+      event(2, "rescue.diagnosis.ready", { outcome: "diagnosed", mutationPerformed: false }),
+      event(3, "delivery.ready", { content: "端口冲突已由本机证据确认；没有结束进程。", route: "rescue" }),
+    ];
+    render(<Conversation
+      projectId="project-1" ticket={{ ...ticket, state: "running" }} events={events} effect={null} receipt={null} appliedEffect={null} busy
+      onSubmit={vi.fn()} onCancel={vi.fn()} onRetry={vi.fn()} onExport={vi.fn()} onBranch={vi.fn()}
+      onApprove={vi.fn()} onReject={vi.fn()} onRollback={vi.fn()} onExportReceipt={vi.fn()} hasProject onOpenProject={vi.fn()} error={null}
+      sidebarOpen inspectorOpen={false} onToggleSidebar={vi.fn()} onToggleInspector={vi.fn()}
+      providerStatus="ready" modelProvider="bundled" providerModel="" modelPerformance={null}
+    />);
+    fireEvent.click(screen.getByRole("button", { name: /已完成 2 项操作/ }));
+    expect(screen.getByText("本机端口 3082 正在监听 · node · PID 4242")).toBeInTheDocument();
+    expect(document.body).not.toHaveTextContent("CommandLine");
+    expect(document.body).not.toHaveTextContent("C:\\Program Files");
+  });
+
   it("describes a Rescue receipt as system evidence with no system mutation", () => {
     const receipt: EvidenceReceipt = {
       ticketId: ticket.id,

@@ -78,9 +78,9 @@
 实现独立模块 `rescue_local_port.rs`，负责：
 
 1. 从请求解析唯一、明确的本机 TCP 端口；
-2. 用固定 PowerShell 探针读取 `Get-NetTCPConnection -State Listen -LocalPort <port>`；
-3. 仅用固定环境变量传递数值端口，不拼接用户或模型文本；
-4. 按 PID 查询进程基名并映射有界 `ownerKind`；
+2. 用 Windows IP Helper API `GetExtendedTcpTable` 读取 IPv4/IPv6 listener；
+3. 用 `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` 与 `QueryFullProcessImageNameW` 查询进程基名，完整路径不离开执行模块；
+4. 按 PID 和进程基名映射有界 `ownerKind`；
 5. 返回结构化 `ProbeOutput`，由现有 evidence graph 计算摘要。
 
 路由优先级：
@@ -135,5 +135,5 @@
 - 不抓包；
 - 不改防火墙、端口代理、URL ACL 或保留端口；
 - 不结束进程或停止服务；
-- 不开放任意 `netstat`、PowerShell 或模型生成命令；
+- 不开放任意 `netstat`、PowerShell 或模型生成命令；原生探针不启动 shell；
 - 不声称端口空闲就证明应用一定能启动，绑定权限、地址族和应用配置仍可能失败。
