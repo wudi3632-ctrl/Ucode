@@ -188,6 +188,60 @@ describe("conversation timeline projection", () => {
     expect(document.body).not.toHaveTextContent("内存已用 0%");
   });
 
+  it("renders bounded CPU pressure evidence without command lines or paths", () => {
+    const events = [
+      event(1, "rescue.probe.completed", {
+        toolId: "system.cpu.inspect",
+        summary: "CPU 已用 82.4%，采样 503 ms",
+        evidenceId: "evidence-cpu",
+        structured: {
+          cpuLoadPercent: 82.4,
+          sampleWindowMs: 503,
+          topProcesses: [{ pid: 42, processName: "python", cpuPercent: 37.6, ownerKind: "unknown" }],
+          inaccessibleProcessCount: 2,
+          disappearedProcessCount: 1,
+          truncated: false,
+        },
+      }),
+      event(2, "rescue.diagnosis.ready", { outcome: "diagnosed", mutationPerformed: false }),
+      event(3, "delivery.ready", { content: "CPU 压力已由本机证据确认；没有结束进程。", route: "rescue" }),
+    ];
+    render(<Conversation
+      projectId="project-1" ticket={{ ...ticket, state: "running" }} events={events} effect={null} receipt={null} appliedEffect={null} busy
+      onSubmit={vi.fn()} onCancel={vi.fn()} onRetry={vi.fn()} onExport={vi.fn()} onBranch={vi.fn()}
+      onApprove={vi.fn()} onReject={vi.fn()} onRollback={vi.fn()} onExportReceipt={vi.fn()} hasProject onOpenProject={vi.fn()} error={null}
+      sidebarOpen inspectorOpen={false} onToggleSidebar={vi.fn()} onToggleInspector={vi.fn()}
+      providerStatus="ready" modelProvider="bundled" providerModel="" modelPerformance={null}
+    />);
+    fireEvent.click(screen.getByRole("button", { name: /已完成 2 项操作/ }));
+    expect(screen.getByText("CPU 已用 82.4% · 最大 python 37.6% · 采样 503 ms")).toBeInTheDocument();
+    expect(document.body).not.toHaveTextContent("CommandLine");
+    expect(document.body).not.toHaveTextContent("C:\\Program Files");
+  });
+
+  it("does not render an unavailable CPU probe as zero percent", () => {
+    const events = [
+      event(1, "rescue.probe.completed", {
+        toolId: "system.cpu.inspect",
+        summary: "Windows 无法读取 CPU 状态",
+        evidenceId: "evidence-cpu-missing",
+        structured: { error: "Windows 无法读取 CPU 状态" },
+      }),
+      event(2, "rescue.diagnosis.ready", { outcome: "safe_stop", mutationPerformed: false }),
+      event(3, "delivery.ready", { content: "CPU 探针不可用；没有结束进程。", route: "rescue" }),
+    ];
+    render(<Conversation
+      projectId="project-1" ticket={{ ...ticket, state: "running" }} events={events} effect={null} receipt={null} appliedEffect={null} busy
+      onSubmit={vi.fn()} onCancel={vi.fn()} onRetry={vi.fn()} onExport={vi.fn()} onBranch={vi.fn()}
+      onApprove={vi.fn()} onReject={vi.fn()} onRollback={vi.fn()} onExportReceipt={vi.fn()} hasProject onOpenProject={vi.fn()} error={null}
+      sidebarOpen inspectorOpen={false} onToggleSidebar={vi.fn()} onToggleInspector={vi.fn()}
+      providerStatus="ready" modelProvider="bundled" providerModel="" modelPerformance={null}
+    />);
+    fireEvent.click(screen.getByRole("button", { name: /已完成 2 项操作/ }));
+    expect(screen.getByText("system.cpu.inspect · Windows 无法读取 CPU 状态")).toBeInTheDocument();
+    expect(document.body).not.toHaveTextContent("CPU 已用 0.0%");
+  });
+
   it("describes a Rescue receipt as system evidence with no system mutation", () => {
     const receipt: EvidenceReceipt = {
       ticketId: ticket.id,

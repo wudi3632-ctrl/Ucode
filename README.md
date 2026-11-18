@@ -66,6 +66,8 @@ UCode 不是把聊天网页套进桌面壳。它把项目读取、变更审批�
 
 内存压力诊断也已进入 R0 能力集：UCode 使用 Windows 原生 API 读取当前物理内存、页面文件状态和最多 10 个高工作集进程，只展示 PID、basename、工作集与可证明的进程类别。它不读取命令行、完整路径、用户名或窗口标题，也不会把“工作集最大”误称为内存泄漏，更不会自动结束进程。详见 [Rescue R0 内存压力诊断验收报告](docs/benchmarks/2026-11-18-rescue-r0-memory-pressure-acceptance.md)。
 
+CPU 压力诊断采用约 500 ms 的 Windows 原生双快照：UCode 读取整机 CPU 时间，并用 PID + 创建时间匹配两次进程快照，返回当前窗口内最多 10 个高 CPU 进程。它不读取命令行或完整路径，不把排名第一的进程直接判为故障或恶意，也不会自动结束、挂起或调整进程。正式桌面验收记录见 [Rescue R0 CPU 压力诊断验收报告](docs/benchmarks/2026-11-18-rescue-r0-cpu-pressure-acceptance.md)。
+
 ## 能力矩阵
 
 “真实桌面”与“自动测试”分开列出，避免把入口存在或单元测试写成已经完成的用户验收。
@@ -82,6 +84,7 @@ UCode 不是把聊天网页套进桌面壳。它把项目读取、变更审批�
 | Rescue R0 本机 TCP 端口诊断 | 临时真实 listener 的占用与释放前后状态已验收 | Rust 原生 API + React + 桌面 | 每次只检查一个明确端口，最多 16 个 listener；不扫描、不联网、不结束进程，不显示命令行或完整路径 |
 | Rescue R0 单卷容量诊断 | 真实 `C:` 容量与不存在 `Z:` 的失败路径均已验收 | Rust 原生 API + React + 桌面 | 每次只检查一个明确本地盘符；不枚举文件、不扫描所有卷、不清理或删除内容 |
 | Rescue R0 内存压力诊断 | 两轮真实桌面重新采样与原生探针已验收 | Rust 原生 API + React + 桌面 | 单次快照、最多 10 个进程；不读命令行/完整路径/用户名，不判定泄漏，不结束进程 |
+| Rescue R0 CPU 压力诊断 | 两轮真实桌面重新采样与原生探针已验收 | Rust 原生 API + React + 桌面 | 约 500 ms 双快照、最多 10 个进程；只说明采样窗口，不判定恶意或缺陷，不控制进程 |
 | Rescue R1 DNS/TCP 精确探测 | 真实桌面批准与拒绝路径均已验收 | Rust + React + 桌面 | 只探测用户明确给出的单一目标；不发 HTTP、不扫描、不保存授权 |
 | Rescue R2 用户 PATH/代理修复与回滚 | 用户 PATH 已真实审批、写入验证并精确回滚；代理拒绝路径已桌面验收 | Rust + React + 桌面 | 仅修改当前用户有界目标，不删除代理地址 |
 | Rescue R3 机器 PATH | 拒绝/UAC 安全边界已桌面验收 | Rust + React + 桌面 | helper 已实现；真实管理员应用和第二次 UAC 回滚仍需用户本人验收 |
@@ -174,7 +177,7 @@ npm run tauri dev
 - 便携 staging 完整性检查；
 - 真实桌面聊天、审批、文件、测试、终端、Git 降级、Agent、主题与布局验收。
 
-最近一次正式候选验收的构建摘要、测试计数、桌面步骤与已知限制见 [Rescue R0 内存压力诊断验收报告](docs/benchmarks/2026-11-18-rescue-r0-memory-pressure-acceptance.md)；真实 R3 服务边界见 [Rescue R3 W32Time 服务验收报告](docs/benchmarks/2026-11-18-rescue-r3-w32time-service-acceptance.md)；联网批准/拒绝路径见 [Rescue R1 联网探测验收报告](docs/benchmarks/2026-11-18-rescue-r1-network-probes-acceptance.md)；用户 PATH 写入、验证与回滚见 [Rescue Phase 2 / R2 验收报告](docs/benchmarks/2026-11-18-rescue-phase2-r2-acceptance.md)。
+最近一次正式候选验收的构建摘要、测试计数、桌面步骤与已知限制见 [Rescue R0 CPU 压力诊断验收报告](docs/benchmarks/2026-11-18-rescue-r0-cpu-pressure-acceptance.md)；真实 R3 服务边界见 [Rescue R3 W32Time 服务验收报告](docs/benchmarks/2026-11-18-rescue-r3-w32time-service-acceptance.md)；联网批准/拒绝路径见 [Rescue R1 联网探测验收报告](docs/benchmarks/2026-11-18-rescue-r1-network-probes-acceptance.md)；用户 PATH 写入、验证与回滚见 [Rescue Phase 2 / R2 验收报告](docs/benchmarks/2026-11-18-rescue-phase2-r2-acceptance.md)。
 
 自动测试不能替代第二台 Windows 电脑与真实 U 盘拔插验证。项目仍处于个人/研究产品阶段，欢迎以可复现任务、日志和截图提交 Issue。
 

@@ -860,6 +860,22 @@ function activityLabel(event: RuntimeEvent) {
         return `内存已用 ${Math.round(load)}% · 可用 ${formatCapacityBytes(available)}${process && workingSet !== null ? ` · 最大 ${process} ${formatCapacityBytes(workingSet)}` : ""}`;
       }
     }
+    if (tool === "system.cpu.inspect") {
+      const structured = event.payload.structured && typeof event.payload.structured === "object" && !Array.isArray(event.payload.structured)
+        ? event.payload.structured as Record<string, unknown>
+        : null;
+      const load = typeof structured?.cpuLoadPercent === "number" ? structured.cpuLoadPercent : null;
+      const windowMs = typeof structured?.sampleWindowMs === "number" ? structured.sampleWindowMs : null;
+      const processes = Array.isArray(structured?.topProcesses) ? structured.topProcesses : [];
+      const first = processes[0] && typeof processes[0] === "object" && !Array.isArray(processes[0])
+        ? processes[0] as Record<string, unknown>
+        : null;
+      if (load !== null && windowMs !== null && load >= 0 && load <= 100 && windowMs >= 0) {
+        const process = typeof first?.processName === "string" ? first.processName : null;
+        const processCpu = typeof first?.cpuPercent === "number" ? first.cpuPercent : null;
+        return `CPU 已用 ${load.toFixed(1)}%${process && processCpu !== null ? ` · 最大 ${process} ${processCpu.toFixed(1)}%` : ""} · 采样 ${Math.round(windowMs)} ms`;
+      }
+    }
     return `${tool} · ${summary}`;
   }
   if (event.eventType === "rescue.diagnosis.ready") {
