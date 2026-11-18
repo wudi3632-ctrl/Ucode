@@ -714,6 +714,16 @@ describe("conversation timeline projection", () => {
     expect(screen.getByText("写入状态未完全验证", { exact: false })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "按快照安全回滚" }));
     expect(screen.getByText("回滚会再次打开 UAC。", { exact: false })).toBeInTheDocument();
+
+    const cancelled = { ...proposal, status: "uac_cancelled" };
+    view.rerender(<Conversation
+      projectId="project-1" ticket={ticket} events={[event(1, "rescue.repair.proposed", { proposal }), event(3, "rescue.repair.safe_stop", { proposalId: "repair-r3", record: { proposal: cancelled, snapshot: {}, detail: "Windows UAC 未获批准；机器 PATH 没有变化", updatedAt: "2026-11-10T00:00:03Z" } })]} effect={null} receipt={null} appliedEffect={null} busy={false}
+      onSubmit={vi.fn()} onCancel={vi.fn()} onRetry={vi.fn()} onExport={vi.fn()} onBranch={vi.fn()} onApprove={vi.fn()} onReject={vi.fn()} onRollback={vi.fn()}
+      onResolveRescueRepair={onResolve} onRollbackRescueRepair={onRollback} onExportReceipt={vi.fn()} hasProject onOpenProject={vi.fn()} error={null}
+      sidebarOpen inspectorOpen={false} onToggleSidebar={vi.fn()} onToggleInspector={vi.fn()} providerStatus="ready" modelProvider="bundled" providerModel="" modelPerformance={null}
+    />);
+    expect(screen.getByText("UAC 未批准，未修改", { exact: false })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "批准并打开 UAC" })).not.toBeInTheDocument();
   });
 
   it("shows an exact one-time R1 network boundary and records the observed result", async () => {

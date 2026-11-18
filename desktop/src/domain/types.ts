@@ -221,7 +221,7 @@ export interface AppliedEffect {
   changes: EffectChange[];
 }
 
-export type RepairStatus = "awaiting_approval" | "applying" | "repaired_unverified" | "verified" | "safe_stop" | "rolled_back" | "rollback_failed";
+export type RepairStatus = "awaiting_approval" | "elevation_requested" | "uac_cancelled" | "applying" | "repaired_unverified" | "verified" | "safe_stop" | "rolled_back" | "rollback_failed";
 
 export interface RescueRepairProposal {
   schemaVersion: number;

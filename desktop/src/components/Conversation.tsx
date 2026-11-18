@@ -750,7 +750,7 @@ function RescueRepairCard({ value, busy, onResolve, onRollback }: { value: Visib
   const elevated = proposal.risk === "r3";
   const status = proposal.status;
   const removed = Array.isArray(proposal.normalizedArguments.removedEntries) ? proposal.normalizedArguments.removedEntries : [];
-  const statusCopy = status === "awaiting_approval" ? "等待批准" : status === "verified" ? "写入已验证" : status === "rolled_back" ? "已精确回滚" : status === "repaired_unverified" ? "写入状态未完全验证" : status === "rollback_failed" ? "回滚失败" : "已安全停止";
+  const statusCopy = status === "awaiting_approval" ? "等待批准" : status === "elevation_requested" ? "等待 Windows UAC" : status === "uac_cancelled" ? "UAC 未批准，未修改" : status === "verified" ? "写入已验证" : status === "rolled_back" ? "已精确回滚" : status === "repaired_unverified" ? "写入状态未完全验证" : status === "rollback_failed" ? "回滚失败" : "已安全停止";
   return <article className={`rescue-repair-card ${status}`} aria-label="Rescue 可逆修复">
     <header><span>{elevated ? "R3" : "R2"}</span><div><b>{elevated ? "规范化机器 PATH" : "规范化当前用户 PATH"}</b><small>{statusCopy} · {elevated ? "需要 Windows UAC 管理员确认" : "不需要管理员权限"}</small></div></header>
     <p>{value.record?.detail ?? (elevated ? "检测到机器 PATH 中可以确定清理的问题。模型无权提权；批准后只启动一次短生命周期白名单 helper。" : "检测到可以确定清理的空项、重复项或不存在目录。模型无权执行；只有本地审批执行器能写入。")}</p>

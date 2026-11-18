@@ -65,6 +65,8 @@ pub fn operation_registry() -> &'static [RepairOperationDefinition] {
 #[serde(rename_all = "snake_case")]
 pub enum RepairStatus {
     AwaitingApproval,
+    ElevationRequested,
+    UacCancelled,
     Applying,
     RepairedUnverified,
     Verified,
@@ -434,7 +436,7 @@ impl<H: RepairHost, E: ElevatedRepairExecutor> RepairService<H, E> {
             return self.safe_stop(record, "R3 修复参数摘要不匹配，已拒绝提权");
         }
 
-        record.proposal.status = RepairStatus::Applying;
+        record.proposal.status = RepairStatus::ElevationRequested;
         record.detail = "等待 Windows UAC；批准后短生命周期 helper 将应用机器 PATH 修复".into();
         record.updated_at = Utc::now();
         self.save_record(&record)?;
@@ -511,10 +513,21 @@ impl<H: RepairHost, E: ElevatedRepairExecutor> RepairService<H, E> {
         helper_error: &str,
     ) -> Result<RepairRecord, String> {
         match self.elevated.read_machine_path() {
-            Ok(current) if digest_json(&current) == digest_json(before) => self.safe_stop(
-                record,
-                &format!("R3 helper 未完成修复，机器 PATH 仍为原摘要：{helper_error}"),
-            ),
+            Ok(current) if digest_json(&current) == digest_json(before) => {
+                if helper_error.starts_with("ucode_uac_cancelled:") {
+                    record.proposal.status = RepairStatus::UacCancelled;
+                    record.detail =
+                        "Windows UAC 未获批准；机器 PATH 仍为审批前摘要，没有执行修复".into();
+                    record.updated_at = Utc::now();
+                    self.save_record(&record)?;
+                    Ok(record)
+                } else {
+                    self.safe_stop(
+                        record,
+                        &format!("R3 helper 未完成修复，机器 PATH 仍为原摘要：{helper_error}"),
+                    )
+                }
+            }
             Ok(current) if digest_json(&current) == digest_json(after) => {
                 record.proposal.status = RepairStatus::RepairedUnverified;
                 record.detail = format!(
@@ -823,6 +836,7 @@ mod tests {
     struct FakeElevatedExecutor {
         state: Mutex<UserPathState>,
         calls: Mutex<Vec<ElevatedAction>>,
+        fail_before_write: Mutex<Option<String>>,
         fail_after_write: Mutex<bool>,
     }
 
@@ -835,6 +849,7 @@ mod tests {
                     expandable: true,
                 }),
                 calls: Mutex::new(Vec::new()),
+                fail_before_write: Mutex::new(None),
                 fail_after_write: Mutex::new(false),
             }
         }
@@ -857,6 +872,9 @@ mod tests {
             let mut state = self.state.lock().unwrap();
             if *state != *expected_current {
                 return Err("stale".into());
+            }
+            if let Some(error) = self.fail_before_write.lock().unwrap().take() {
+                return Err(error);
             }
             *state = desired.clone();
             self.calls.lock().unwrap().push(action);
@@ -965,6 +983,32 @@ mod tests {
             service.elevated.read_machine_path().unwrap().value,
             r"C:\Windows;C:\Windows"
         );
+    }
+
+    #[test]
+    fn cancelled_uac_is_distinct_and_proves_the_machine_path_was_not_modified() {
+        let dir = TempDir::new().unwrap();
+        let service = RepairService::with_hosts(
+            dir.path().to_path_buf(),
+            FakeHost::new(r"C:\user"),
+            FakeElevatedExecutor::new(r"C:\Windows;C:\Windows"),
+        )
+        .unwrap();
+        let proposal = service
+            .propose_machine_path_normalization("ticket-r3-cancel", vec!["evidence-r3".into()])
+            .unwrap()
+            .unwrap();
+        *service.elevated.fail_before_write.lock().unwrap() =
+            Some("ucode_uac_cancelled: test cancellation".into());
+
+        let record = service.apply(&proposal.id, "ticket-r3-cancel").unwrap();
+        assert_eq!(record.proposal.status, RepairStatus::UacCancelled);
+        assert!(record.detail.contains("没有执行修复"));
+        assert_eq!(
+            service.elevated.read_machine_path().unwrap().value,
+            r"C:\Windows;C:\Windows"
+        );
+        assert!(record.snapshot.is_some());
     }
 
     #[test]

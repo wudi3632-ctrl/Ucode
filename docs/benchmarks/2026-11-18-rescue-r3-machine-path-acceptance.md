@@ -25,6 +25,8 @@
 - 每次应用和回滚都需要独立 UAC；
 - helper 使用三分钟有效期、一次性 nonce、Windows Credential Manager secret 与 HMAC-SHA256；
 - 请求先 claim 再执行，摘要、目标、版本、当前状态和目标状态必须全部匹配；
+- helper 只接受严格的四参数入口，且请求/响应文件名必须与认证 request id 一致；
+- 响应显式绑定 request id、ticket id、proposal id、proposal digest 与 nonce；
 - helper 写入后重读，未提权宿主再独立重读；
 - 验证失败时尝试恢复原快照；
 - 响应丢失或独立重读失败时不伪装成“未修改”，而是保留 `repaired_unverified` 和可回滚快照；
@@ -78,6 +80,8 @@
 6. UI 为未完全验证状态提供“按快照安全回滚”；
 7. 一次性 secret 保存失败会清理尚未启动的请求文件。
 
+后续安全补强还增加了真实 Windows Credential Manager 生命周期测试：一次性 secret 被 helper 消费后立即删除，同一请求的第二次 claim 被拒绝；UAC 未批准与普通 helper 失败使用不同状态，且只有复核机器 PATH 仍为 before 摘要时才显示“UAC 未批准，未修改”。
+
 新增回归测试模拟“写入成功、响应丢失”，验证状态不会被误报，并能通过第二次受限 helper 恢复原始摘要。
 
 ## 自动回归矩阵
@@ -86,7 +90,7 @@
 
 - Node Agent/Harness：130 passed，0 failed；
 - React/Vitest：104 passed，0 failed；
-- Rust/Tauri：163 passed，0 failed；
+- Rust/Tauri：166 passed，0 failed；
 - Rust legacy live：1 passed，0 failed；
 - TypeScript typecheck：通过；
 - Vite production build：通过；
@@ -100,10 +104,10 @@ Vitest 仍打印 jsdom 的 `HTMLCanvasElement.getContext()` 已知提示；12 �
 最终 staging 校验：
 
 - immutable files：19,660；
-- immutable bytes：2,573,758,858；
+- immutable bytes：2,573,767,050；
 - manifest failures：0；
-- `UCode.exe`：19,587,072 bytes；
-- `UCode.exe` SHA-256：`A6506904D168CE2D5A81E05CA89D0AD0AA27FAC3B1BB820964CC20983FD46C96`。
+- `UCode.exe`：19,595,264 bytes；
+- `UCode.exe` SHA-256：`A588263175A4A18D2729E99397C57621AE39E46989E840FB94F0969288203CAE`。
 
 ## 尚未完成的验收
 

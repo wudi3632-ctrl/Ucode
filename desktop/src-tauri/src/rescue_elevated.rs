@@ -60,7 +60,9 @@ pub enum ElevatedResponseStatus {
 pub struct ElevatedResponse {
     pub schema_version: u16,
     pub request_id: String,
+    pub ticket_id: String,
     pub proposal_id: String,
+    pub proposal_digest: String,
     pub nonce: String,
     pub status: ElevatedResponseStatus,
     pub detail: String,
@@ -186,11 +188,14 @@ impl MachinePathHost for WindowsMachinePathHost {
 }
 
 pub fn maybe_run_helper(arguments: &[String]) -> Option<i32> {
-    let position = arguments
-        .iter()
-        .position(|value| value == HELPER_ARGUMENT)?;
-    let request = arguments.get(position + 1).map(PathBuf::from);
-    let response = arguments.get(position + 2).map(PathBuf::from);
+    if arguments.get(1).map(String::as_str) != Some(HELPER_ARGUMENT) {
+        return None;
+    }
+    if arguments.len() != 4 {
+        return Some(2);
+    }
+    let request = arguments.get(2).map(PathBuf::from);
+    let response = arguments.get(3).map(PathBuf::from);
     Some(match (request, response) {
         (Some(request), Some(response)) => {
             match execute_helper_files(&request, &response, &WindowsMachinePathHost) {
@@ -289,43 +294,61 @@ fn execute_helper_files(
     let claimed_path = request_path.with_extension("claimed");
     fs::rename(request_path, &claimed_path)
         .map_err(|_| "R3 helper 请求已经被领取、重放或不存在".to_string())?;
+    let result = execute_claimed_helper(&claimed_path, request_path, response_path, host);
+    let _ = fs::remove_file(&claimed_path);
+    result
+}
+
+fn execute_claimed_helper(
+    claimed_path: &Path,
+    request_path: &Path,
+    response_path: &Path,
+    host: &dyn MachinePathHost,
+) -> Result<(), String> {
     let request: ElevatedRequest = serde_json::from_slice(
-        &fs::read(&claimed_path).map_err(|error| format!("无法读取 R3 请求：{error}"))?,
+        &fs::read(claimed_path).map_err(|error| format!("无法读取 R3 请求：{error}"))?,
     )
     .map_err(|_| "R3 请求格式无效".to_string())?;
-    let secret = load_secret(&request.nonce)?;
-    let result = execute_authenticated(&request, &secret, host);
-    let mut response = match result {
-        Ok(observed) => ElevatedResponse {
-            schema_version: ELEVATED_SCHEMA_VERSION,
-            request_id: request.request_id.clone(),
-            proposal_id: request.proposal_id.clone(),
-            nonce: request.nonce.clone(),
-            status: ElevatedResponseStatus::Verified,
-            detail: "管理员 helper 已写入并重读验证机器 PATH".into(),
-            observed_digest: Some(digest_json(&observed)),
-            observed: Some(observed),
-            completed_at: Utc::now(),
-            hmac: String::new(),
-        },
-        Err(error) => ElevatedResponse {
-            schema_version: ELEVATED_SCHEMA_VERSION,
-            request_id: request.request_id.clone(),
-            proposal_id: request.proposal_id.clone(),
-            nonce: request.nonce.clone(),
-            status: ElevatedResponseStatus::SafeStop,
-            detail: error,
-            observed_digest: None,
-            observed: None,
-            completed_at: Utc::now(),
-            hmac: String::new(),
-        },
-    };
-    response.hmac = response_hmac(&response, &secret);
-    save_atomic(response_path, &response)?;
-    delete_secret(&request.nonce);
-    let _ = fs::remove_file(&claimed_path);
-    Ok(())
+    let nonce = request.nonce.clone();
+    let result = (|| {
+        validate_request_path_binding(&request, request_path, response_path)?;
+        let secret = load_secret(&nonce)?;
+        let mutation = execute_authenticated(&request, &secret, host);
+        let mut response = match mutation {
+            Ok(observed) => ElevatedResponse {
+                schema_version: ELEVATED_SCHEMA_VERSION,
+                request_id: request.request_id.clone(),
+                ticket_id: request.ticket_id.clone(),
+                proposal_id: request.proposal_id.clone(),
+                proposal_digest: request.proposal_digest.clone(),
+                nonce: nonce.clone(),
+                status: ElevatedResponseStatus::Verified,
+                detail: "管理员 helper 已写入并重读验证机器 PATH".into(),
+                observed_digest: Some(digest_json(&observed)),
+                observed: Some(observed),
+                completed_at: Utc::now(),
+                hmac: String::new(),
+            },
+            Err(error) => ElevatedResponse {
+                schema_version: ELEVATED_SCHEMA_VERSION,
+                request_id: request.request_id.clone(),
+                ticket_id: request.ticket_id.clone(),
+                proposal_id: request.proposal_id.clone(),
+                proposal_digest: request.proposal_digest.clone(),
+                nonce: nonce.clone(),
+                status: ElevatedResponseStatus::SafeStop,
+                detail: error,
+                observed_digest: None,
+                observed: None,
+                completed_at: Utc::now(),
+                hmac: String::new(),
+            },
+        };
+        response.hmac = response_hmac(&response, &secret);
+        save_atomic(response_path, &response)
+    })();
+    delete_secret(&nonce);
+    result
 }
 
 fn execute_authenticated(
@@ -387,7 +410,9 @@ fn validate_response(
 ) -> Result<(), String> {
     if response.schema_version != ELEVATED_SCHEMA_VERSION
         || response.request_id != request.request_id
+        || response.ticket_id != request.ticket_id
         || response.proposal_id != request.proposal_id
+        || response.proposal_digest != request.proposal_digest
         || response.nonce != request.nonce
         || !constant_time_equal(&response.hmac, &response_hmac(response, secret))
     {
@@ -403,6 +428,22 @@ fn validate_response(
             != Some(request.desired_digest.as_str())
     {
         return Err("R3 helper 响应中的状态与摘要不一致".into());
+    }
+    Ok(())
+}
+
+fn validate_request_path_binding(
+    request: &ElevatedRequest,
+    request_path: &Path,
+    response_path: &Path,
+) -> Result<(), String> {
+    let expected_request = format!("{}.request.json", request.request_id);
+    let expected_response = format!("{}.response.json", request.request_id);
+    if request_path.file_name().and_then(|value| value.to_str()) != Some(expected_request.as_str())
+        || response_path.file_name().and_then(|value| value.to_str())
+            != Some(expected_response.as_str())
+    {
+        return Err("R3 helper 文件名与认证请求 ID 不一致".into());
     }
     Ok(())
 }
@@ -599,9 +640,11 @@ fn launch_elevated(request: &Path, response: &Path) -> Result<(), String> {
             0,
         )
     };
-    if result <= 32 {
+    if result == 5 {
+        Err("ucode_uac_cancelled: Windows 用户未批准管理员 helper".into())
+    } else if result <= 32 {
         Err(format!(
-            "Windows 未启动 R3 helper（ShellExecuteW={result}）；UAC 可能被取消"
+            "Windows 未启动 R3 helper（ShellExecuteW={result}）"
         ))
     } else {
         Ok(())
@@ -617,6 +660,7 @@ fn launch_elevated(_request: &Path, _response: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+    use tempfile::TempDir;
 
     struct FakeMachineHost {
         state: Mutex<UserPathState>,
@@ -768,7 +812,9 @@ mod tests {
         let mut response = ElevatedResponse {
             schema_version: 1,
             request_id: request.request_id.clone(),
+            ticket_id: request.ticket_id.clone(),
             proposal_id: request.proposal_id.clone(),
+            proposal_digest: request.proposal_digest.clone(),
             nonce: request.nonce.clone(),
             status: ElevatedResponseStatus::Verified,
             detail: "ok".into(),
@@ -781,6 +827,88 @@ mod tests {
         validate_response(&request, &response, secret).unwrap();
         response.nonce = "other".into();
         assert!(validate_response(&request, &response, secret).is_err());
+        response.nonce = request.nonce.clone();
+        response.ticket_id = "other-ticket".into();
+        response.hmac = response_hmac(&response, secret);
+        assert!(validate_response(&request, &response, secret).is_err());
+        response.ticket_id = request.ticket_id.clone();
+        response.proposal_digest = "b".repeat(64);
+        response.hmac = response_hmac(&response, secret);
+        assert!(validate_response(&request, &response, secret).is_err());
+    }
+
+    #[test]
+    fn helper_files_must_bind_to_the_authenticated_request_id() {
+        let dir = TempDir::new().unwrap();
+        let before = UserPathState {
+            present: true,
+            value: r"C:\Windows;C:\Windows".into(),
+            expandable: true,
+        };
+        let after = UserPathState {
+            present: true,
+            value: r"C:\Windows".into(),
+            expandable: true,
+        };
+        let request = signed_request(&before, &after, b"path-binding-secret");
+        let valid_request = dir.path().join("request-1.request.json");
+        let valid_response = dir.path().join("request-1.response.json");
+        validate_request_path_binding(&request, &valid_request, &valid_response).unwrap();
+        assert!(validate_request_path_binding(
+            &request,
+            &dir.path().join("other.request.json"),
+            &valid_response,
+        )
+        .is_err());
+        assert!(validate_request_path_binding(
+            &request,
+            &valid_request,
+            &dir.path().join("other.response.json"),
+        )
+        .is_err());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn helper_claims_once_writes_an_authenticated_response_and_deletes_the_secret() {
+        let dir = TempDir::new().unwrap();
+        let before = UserPathState {
+            present: true,
+            value: r"C:\Windows;C:\Windows".into(),
+            expandable: true,
+        };
+        let after = UserPathState {
+            present: true,
+            value: r"C:\Windows".into(),
+            expandable: true,
+        };
+        let secret = one_time_secret();
+        let mut request = signed_request(&before, &after, &secret);
+        request.request_id = format!("request-{}", Uuid::new_v4());
+        request.nonce = format!("nonce-{}", Uuid::new_v4());
+        request.hmac = request_hmac(&request, &secret);
+        let request_path = dir
+            .path()
+            .join(format!("{}.request.json", request.request_id));
+        let response_path = dir
+            .path()
+            .join(format!("{}.response.json", request.request_id));
+        save_atomic(&request_path, &request).unwrap();
+        save_secret(&request.nonce, &secret).unwrap();
+        let host = FakeMachineHost {
+            state: Mutex::new(before),
+            corrupt_after_write: false,
+        };
+
+        execute_helper_files(&request_path, &response_path, &host).unwrap();
+        let response: ElevatedResponse =
+            serde_json::from_slice(&fs::read(&response_path).unwrap()).unwrap();
+        validate_response(&request, &response, &secret).unwrap();
+        assert_eq!(response.status, ElevatedResponseStatus::Verified);
+        assert_eq!(host.read_machine_path().unwrap(), after);
+        assert!(load_secret(&request.nonce).is_err());
+        assert!(execute_helper_files(&request_path, &response_path, &host).is_err());
+        assert!(!request_path.with_extension("claimed").exists());
     }
 
     #[test]
@@ -788,6 +916,26 @@ mod tests {
         assert_eq!(maybe_run_helper(&["UCode.exe".into()]), None);
         assert_eq!(
             maybe_run_helper(&["UCode.exe".into(), HELPER_ARGUMENT.into()]),
+            Some(2)
+        );
+        assert_eq!(
+            maybe_run_helper(&[
+                "UCode.exe".into(),
+                "--other".into(),
+                HELPER_ARGUMENT.into(),
+                "request".into(),
+                "response".into(),
+            ]),
+            None
+        );
+        assert_eq!(
+            maybe_run_helper(&[
+                "UCode.exe".into(),
+                HELPER_ARGUMENT.into(),
+                "request".into(),
+                "response".into(),
+                "unexpected".into(),
+            ]),
             Some(2)
         );
     }
