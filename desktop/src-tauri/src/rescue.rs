@@ -77,7 +77,7 @@ pub struct RescueToolDefinition {
 }
 
 pub fn tool_registry() -> &'static [RescueToolDefinition] {
-    static TOOLS: [RescueToolDefinition; 15] = [
+    static TOOLS: [RescueToolDefinition; 16] = [
         RescueToolDefinition {
             id: "system.inventory",
             version: 1,
@@ -125,6 +125,14 @@ pub fn tool_registry() -> &'static [RescueToolDefinition] {
             risk: RiskClass::R0,
             authority: "read",
             description: "Read bounded error metadata from System and Application event logs",
+        },
+        RescueToolDefinition {
+            id: "system.memory.inspect",
+            version: 1,
+            domain: "system",
+            risk: RiskClass::R0,
+            authority: "read",
+            description: "Inspect global memory pressure and bounded high-working-set processes",
         },
         RescueToolDefinition {
             id: "network.adapter.inspect",
@@ -288,6 +296,8 @@ impl ProbeRunner for WindowsProbeRunner {
             result
         } else if let Some(result) = crate::rescue_volume::run(tool_id, arguments) {
             result
+        } else if let Some(result) = crate::rescue_memory::run(tool_id, arguments) {
+            result
         } else {
             self.run(tool_id)
         }
@@ -384,6 +394,9 @@ pub struct DiagnosisReport {
 }
 
 pub fn is_rescue_request(request: &str) -> bool {
+    if crate::rescue_memory::is_memory_request(request) {
+        return true;
+    }
     let value = request.to_lowercase();
     let machine_scope = [
         "电脑",
@@ -427,6 +440,10 @@ pub fn is_rescue_request(request: &str) -> bool {
         "disk space",
         "disk full",
         "storage full",
+        "内存",
+        "memory",
+        "ram",
+        "oom",
     ];
     let symptom = [
         "不能",
@@ -476,6 +493,9 @@ pub fn diagnose_with_runner(request: &str, runner: &dyn ProbeRunner) -> Diagnosi
     let volume_probe = (domain == "storage")
         .then(|| crate::rescue_volume::requested_probe(request))
         .flatten();
+    let memory_probe = (domain == "system")
+        .then(|| crate::rescue_memory::requested_probe(request))
+        .flatten();
     let targeted_service = (domain == "system")
         .then(|| crate::rescue_service::requested_probe(request))
         .flatten();
@@ -503,7 +523,9 @@ pub fn diagnose_with_runner(request: &str, runner: &dyn ProbeRunner) -> Diagnosi
             }
         }
         _ => {
-            if let Some(probe) = targeted_service {
+            if let Some(probe) = memory_probe {
+                probes.push(probe);
+            } else if let Some(probe) = targeted_service {
                 probes.push(probe);
             } else {
                 probes.extend(
@@ -546,7 +568,11 @@ pub fn diagnose_with_runner(request: &str, runner: &dyn ProbeRunner) -> Diagnosi
             (hypotheses, edges, next_probe)
         }
         _ => {
-            if let Some((hypotheses, next_probe)) = crate::rescue_service::analyze(&evidence) {
+            if let Some((hypotheses, next_probe)) = crate::rescue_memory::analyze(&evidence) {
+                let edges = edges_from_hypotheses(&hypotheses);
+                (hypotheses, edges, next_probe)
+            } else if let Some((hypotheses, next_probe)) = crate::rescue_service::analyze(&evidence)
+            {
                 let edges = edges_from_hypotheses(&hypotheses);
                 (hypotheses, edges, next_probe)
             } else {
@@ -707,6 +733,20 @@ fn summarize(tool_id: &str, value: &Value, exit_code: i32, stderr: &str) -> Stri
                 .unwrap_or(0.0);
             format!(
                 "{drive} 可用 {:.1} GiB，已用 {used:.1}%",
+                available as f64 / 1_073_741_824.0
+            )
+        }
+        "system.memory.inspect" => {
+            let load = value
+                .get("memoryLoadPercent")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let available = value
+                .get("availablePhysicalBytes")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            format!(
+                "内存已用 {load}%，可用 {:.1} GiB",
                 available as f64 / 1_073_741_824.0
             )
         }
@@ -1213,6 +1253,7 @@ mod tests {
         for id in [
             "system.eventlog.query",
             "system.service.query",
+            "system.memory.inspect",
             "network.local_port.inspect",
             "storage.volume.inspect",
             "filesystem.hash",
@@ -1487,6 +1528,48 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("没有枚举或删除"));
+        assert!(!report.mutation_performed);
+    }
+
+    #[test]
+    fn explicit_memory_pressure_runs_only_inventory_and_memory_probe() {
+        struct MemoryFixture;
+        impl ProbeRunner for MemoryFixture {
+            fn run(&self, tool_id: &str) -> Result<ProbeOutput, String> {
+                let value = match tool_id {
+                    "system.inventory" => json!({"caption":"Windows 11","build":"26100"}),
+                    "system.memory.inspect" => json!({
+                        "memoryLoadPercent":91,
+                        "totalPhysicalBytes":16_u64 * 1024 * 1024 * 1024,
+                        "availablePhysicalBytes":500_u64 * 1024 * 1024,
+                        "totalPageFileBytes":24_u64 * 1024 * 1024 * 1024,
+                        "availablePageFileBytes":8_u64 * 1024 * 1024 * 1024,
+                        "topProcesses":[{"pid":42,"processName":"node","workingSetBytes":2_u64 * 1024 * 1024 * 1024,"ownerKind":"unknown"}],
+                        "inaccessibleProcessCount":2,
+                        "truncated":false
+                    }),
+                    _ => return Err(format!("unexpected probe: {tool_id}")),
+                };
+                Ok(ProbeOutput {
+                    exit_code: 0,
+                    stdout: value.to_string(),
+                    stderr: String::new(),
+                })
+            }
+        }
+
+        let report = diagnose_with_runner("内存占用 95%，请诊断但不要结束任何进程", &MemoryFixture);
+        assert_eq!(report.domain, "system");
+        assert_eq!(report.evidence.len(), 2);
+        assert!(report.evidence.iter().all(|item| matches!(
+            item.tool_id.as_str(),
+            "system.inventory" | "system.memory.inspect"
+        )));
+        assert!(matches!(
+            hypothesis(&report, "system.memory_pressure").state,
+            HypothesisState::Supported
+        ));
+        assert!(report.next_probe.as_deref().unwrap().contains("没有结束"));
         assert!(!report.mutation_performed);
     }
 

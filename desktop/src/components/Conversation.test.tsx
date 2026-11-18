@@ -132,6 +132,62 @@ describe("conversation timeline projection", () => {
     expect(document.body).not.toHaveTextContent("可用 0.0 MiB");
   });
 
+  it("renders bounded memory pressure evidence without command lines or paths", () => {
+    const events = [
+      event(1, "rescue.probe.completed", {
+        toolId: "system.memory.inspect",
+        summary: "内存已用 84%，可用 2.0 GiB",
+        evidenceId: "evidence-memory",
+        structured: {
+          memoryLoadPercent: 84,
+          totalPhysicalBytes: 16 * 1024 ** 3,
+          availablePhysicalBytes: 2 * 1024 ** 3,
+          totalPageFileBytes: 24 * 1024 ** 3,
+          availablePageFileBytes: 8 * 1024 ** 3,
+          topProcesses: [{ pid: 42, processName: "node", workingSetBytes: 1.25 * 1024 ** 3, ownerKind: "unknown" }],
+          inaccessibleProcessCount: 2,
+          truncated: false,
+        },
+      }),
+      event(2, "rescue.diagnosis.ready", { outcome: "diagnosed", mutationPerformed: false }),
+      event(3, "delivery.ready", { content: "内存压力已由本机证据确认；没有结束进程。", route: "rescue" }),
+    ];
+    render(<Conversation
+      projectId="project-1" ticket={{ ...ticket, state: "running" }} events={events} effect={null} receipt={null} appliedEffect={null} busy
+      onSubmit={vi.fn()} onCancel={vi.fn()} onRetry={vi.fn()} onExport={vi.fn()} onBranch={vi.fn()}
+      onApprove={vi.fn()} onReject={vi.fn()} onRollback={vi.fn()} onExportReceipt={vi.fn()} hasProject onOpenProject={vi.fn()} error={null}
+      sidebarOpen inspectorOpen={false} onToggleSidebar={vi.fn()} onToggleInspector={vi.fn()}
+      providerStatus="ready" modelProvider="bundled" providerModel="" modelPerformance={null}
+    />);
+    fireEvent.click(screen.getByRole("button", { name: /已完成 2 项操作/ }));
+    expect(screen.getByText("内存已用 84% · 可用 2.0 GiB · 最大 node 1.3 GiB")).toBeInTheDocument();
+    expect(document.body).not.toHaveTextContent("CommandLine");
+    expect(document.body).not.toHaveTextContent("C:\\Program Files");
+  });
+
+  it("does not render an unavailable memory probe as zero available memory", () => {
+    const events = [
+      event(1, "rescue.probe.completed", {
+        toolId: "system.memory.inspect",
+        summary: "Windows 无法读取内存状态",
+        evidenceId: "evidence-memory-missing",
+        structured: { error: "Windows 无法读取内存状态" },
+      }),
+      event(2, "rescue.diagnosis.ready", { outcome: "safe_stop", mutationPerformed: false }),
+      event(3, "delivery.ready", { content: "内存探针不可用；没有结束进程。", route: "rescue" }),
+    ];
+    render(<Conversation
+      projectId="project-1" ticket={{ ...ticket, state: "running" }} events={events} effect={null} receipt={null} appliedEffect={null} busy
+      onSubmit={vi.fn()} onCancel={vi.fn()} onRetry={vi.fn()} onExport={vi.fn()} onBranch={vi.fn()}
+      onApprove={vi.fn()} onReject={vi.fn()} onRollback={vi.fn()} onExportReceipt={vi.fn()} hasProject onOpenProject={vi.fn()} error={null}
+      sidebarOpen inspectorOpen={false} onToggleSidebar={vi.fn()} onToggleInspector={vi.fn()}
+      providerStatus="ready" modelProvider="bundled" providerModel="" modelPerformance={null}
+    />);
+    fireEvent.click(screen.getByRole("button", { name: /已完成 2 项操作/ }));
+    expect(screen.getByText("system.memory.inspect · Windows 无法读取内存状态")).toBeInTheDocument();
+    expect(document.body).not.toHaveTextContent("内存已用 0%");
+  });
+
   it("describes a Rescue receipt as system evidence with no system mutation", () => {
     const receipt: EvidenceReceipt = {
       ticketId: ticket.id,

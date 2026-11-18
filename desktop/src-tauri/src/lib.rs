@@ -13,6 +13,7 @@ pub mod rescue;
 pub mod rescue_elevated;
 pub mod rescue_filesystem;
 pub mod rescue_local_port;
+pub mod rescue_memory;
 pub mod rescue_probe;
 pub mod rescue_repair;
 pub mod rescue_service;

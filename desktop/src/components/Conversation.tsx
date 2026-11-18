@@ -844,6 +844,22 @@ function activityLabel(event: RuntimeEvent) {
         return `${drive} 可用 ${formatCapacityBytes(available)} · 已用 ${Math.round(usedPercent)}%`;
       }
     }
+    if (tool === "system.memory.inspect") {
+      const structured = event.payload.structured && typeof event.payload.structured === "object" && !Array.isArray(event.payload.structured)
+        ? event.payload.structured as Record<string, unknown>
+        : null;
+      const load = typeof structured?.memoryLoadPercent === "number" ? structured.memoryLoadPercent : null;
+      const available = typeof structured?.availablePhysicalBytes === "number" ? structured.availablePhysicalBytes : null;
+      const processes = Array.isArray(structured?.topProcesses) ? structured.topProcesses : [];
+      const first = processes[0] && typeof processes[0] === "object" && !Array.isArray(processes[0])
+        ? processes[0] as Record<string, unknown>
+        : null;
+      if (load !== null && available !== null && load >= 0 && available >= 0) {
+        const process = typeof first?.processName === "string" ? first.processName : null;
+        const workingSet = typeof first?.workingSetBytes === "number" ? first.workingSetBytes : null;
+        return `内存已用 ${Math.round(load)}% · 可用 ${formatCapacityBytes(available)}${process && workingSet !== null ? ` · 最大 ${process} ${formatCapacityBytes(workingSet)}` : ""}`;
+      }
+    }
     return `${tool} · ${summary}`;
   }
   if (event.eventType === "rescue.diagnosis.ready") {

@@ -5365,7 +5365,7 @@ fn run_executor_ticket(
                     "toolId": evidence.tool_id,
                     "state": evidence.state,
                     "summary": evidence.summary,
-                    "structured": if matches!(evidence.tool_id.as_str(), "network.local_port.inspect" | "storage.volume.inspect") { evidence.structured.clone() } else { json!(null) },
+                    "structured": if matches!(evidence.tool_id.as_str(), "network.local_port.inspect" | "storage.volume.inspect" | "system.memory.inspect") { evidence.structured.clone() } else { json!(null) },
                     "contentDigest": evidence.content_digest,
                     "elapsedMs": evidence.elapsed_ms,
                 }),
@@ -7096,6 +7096,21 @@ mod tests {
         assert_eq!(
             classify_desktop_route("C盘空间不足，请检查但不要删除文件", None),
             DesktopRoute::Rescue
+        );
+        assert_eq!(
+            classify_desktop_route("内存占用 95%，请检查但不要结束进程", None),
+            DesktopRoute::Rescue
+        );
+        assert_eq!(
+            classify_desktop_route(
+                "电脑提示 out of memory，请重新读取当前真实状态；不要结束任何进程。",
+                None
+            ),
+            DesktopRoute::Rescue
+        );
+        assert_eq!(
+            classify_desktop_route("how much room is available", None),
+            DesktopRoute::Chat
         );
         assert_eq!(
             classify_desktop_route("解释 network_service.py 为什么报错", None),

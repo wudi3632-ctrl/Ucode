@@ -42,7 +42,7 @@ Rust/Tauri 宿主调用 Windows 内存与进程 API，返回全局内存状态�
   - `pid`
   - `processName`：basename，移除 `.exe`
   - `workingSetBytes`
-  - `ownerKind`：`system`、`service_host`、`user_process`、`unknown`
+  - `ownerKind`：只在 basename 足以证明时标为 `system` 或 `service_host`，其他均为 `unknown`；不读取用户令牌来猜测归属
 - `inaccessibleProcessCount`
 - `truncated`
 
