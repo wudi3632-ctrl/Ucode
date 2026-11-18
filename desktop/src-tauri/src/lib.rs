@@ -35,6 +35,18 @@ use terminal::TerminalManager;
 #[cfg(any(not(debug_assertions), test))]
 const BUNDLED_FRONTEND_URL: &str = "http://tauri.localhost/";
 
+pub fn prime_integrity_cache() -> Result<(), String> {
+    let portable = PortableRoot::discover().map_err(|error| error.to_string())?;
+    let result = portable
+        .prime_integrity_cache()
+        .map_err(|error| error.to_string())?;
+    if !matches!(result.as_str(), "verified" | "cached") {
+        return Err(format!("unexpected integrity result: {result}"));
+    }
+    model_packs::verify_selected(portable.path(), model_packs::DEFAULT_MODEL_PROFILE)?;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()

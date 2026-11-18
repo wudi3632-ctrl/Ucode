@@ -145,9 +145,11 @@ impl CompatibilitySupervisor {
                     let result = supervisor.refresh_stale_runtime();
                     let ready = result.is_ok();
                     supervisor.owned.store(ready, Ordering::SeqCst);
-                    supervisor.set_last_error(result.err().map(|error| {
-                        format!("升级后本地 Agent 未能刷新到当前胶囊版本：{error}")
-                    }));
+                    supervisor.set_last_error(
+                        result.err().map(|error| {
+                            format!("升级后本地 Agent 未能刷新到当前胶囊版本：{error}")
+                        }),
+                    );
                     supervisor.starting.store(false, Ordering::SeqCst);
                 });
             } else {
@@ -399,7 +401,8 @@ impl CompatibilitySupervisor {
         let Ok(content) = fs::read(&self.runtime_state_path) else {
             return false;
         };
-        let Ok(state) = serde_json::from_slice::<RuntimeState>(json_without_utf8_bom(&content)) else {
+        let Ok(state) = serde_json::from_slice::<RuntimeState>(json_without_utf8_bom(&content))
+        else {
             return false;
         };
         runtime_state_is_adoptable(
@@ -481,7 +484,8 @@ impl CompatibilitySupervisor {
         let Ok(content) = fs::read(&self.runtime_state_path) else {
             return false;
         };
-        let Ok(state) = serde_json::from_slice::<RuntimeState>(json_without_utf8_bom(&content)) else {
+        let Ok(state) = serde_json::from_slice::<RuntimeState>(json_without_utf8_bom(&content))
+        else {
             return false;
         };
         let Some(started_at) = state.controller_started_at else {
@@ -497,7 +501,8 @@ impl CompatibilitySupervisor {
         let Ok(content) = fs::read(&self.runtime_state_path) else {
             return false;
         };
-        let Ok(state) = serde_json::from_slice::<RuntimeState>(json_without_utf8_bom(&content)) else {
+        let Ok(state) = serde_json::from_slice::<RuntimeState>(json_without_utf8_bom(&content))
+        else {
             return false;
         };
         let Some(started_at) = state.controller_started_at else {

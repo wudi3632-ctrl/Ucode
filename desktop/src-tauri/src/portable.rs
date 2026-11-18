@@ -165,6 +165,16 @@ impl PortableRoot {
         }
     }
 
+    /// Prime the release integrity cache before the portable capsule is handed
+    /// to a user. Staging already owns the cost of copying and hashing the
+    /// immutable payload; paying the verification cost there keeps the first
+    /// interactive launch responsive without weakening subsequent startup
+    /// checks. `verify_integrity_cached` still binds the cache to both the
+    /// signed manifest bytes and every immutable file's size/mtime metadata.
+    pub fn prime_integrity_cache(&self) -> Result<String, PortableError> {
+        self.verify_integrity_cached()
+    }
+
     pub fn ensure_side_effects_allowed(&self) -> Result<(), PortableError> {
         let health = self.inspect_runtime_root();
         if health.side_effects_allowed {

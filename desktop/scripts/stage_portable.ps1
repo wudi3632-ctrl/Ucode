@@ -155,6 +155,23 @@ $manifest = [ordered]@{
 }
 $manifest | ConvertTo-Json -Depth 7 | Set-Content -LiteralPath (Join-Path $destinationPath "ucode-manifest.json") -Encoding UTF8
 
+# A cold first launch must not spend tens of seconds hashing a multi-gigabyte
+# capsule behind an apparently blank native window. Prime the exact same
+# manifest + metadata-bound cache that the app validates on every startup.
+# This moves the one-time full verification into the explicit staging step;
+# changing any immutable file afterwards invalidates the cache as before.
+$primeProcess = Start-Process -FilePath (Join-Path $destinationPath "UCode.exe") -ArgumentList "--prime-integrity-cache" -WorkingDirectory $destinationPath -WindowStyle Hidden -Wait -PassThru
+if ($primeProcess.ExitCode -ne 0) { throw "Failed to prime the portable integrity cache (exit $($primeProcess.ExitCode))" }
+$integrityCachePath = Join-Path $destinationPath "data\integrity-cache.json"
+if (!(Test-Path -LiteralPath $integrityCachePath -PathType Leaf)) {
+  throw "Portable integrity cache was not created"
+}
+$primedCache = Get-Content -LiteralPath $integrityCachePath -Raw | ConvertFrom-Json
+$manifestSha256 = (Get-FileHash -LiteralPath (Join-Path $destinationPath "ucode-manifest.json") -Algorithm SHA256).Hash.ToLowerInvariant()
+if ([string]$primedCache.manifestSha256 -cne $manifestSha256) {
+  throw "Portable integrity cache does not match the staged manifest"
+}
+
 [ordered]@{
   path = $destinationPath
   files = @($integrityFiles).Count

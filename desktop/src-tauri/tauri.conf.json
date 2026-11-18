@@ -10,6 +10,13 @@
     "frontendDist": "../dist"
   },
   "app": {
+    "appDirectoriesOverride": {
+      "config": "./data/tauri/config",
+      "data": "./data/tauri/data",
+      "localData": "./data/webview",
+      "cache": "./data/webview/cache",
+      "log": "./logs/tauri"
+    },
     "windows": [
       {
         "label": "main",

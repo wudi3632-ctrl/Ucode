@@ -3,6 +3,7 @@ use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 pub const DEFAULT_MODEL_PROFILE: &str = "qwen2-5-coder-1-5b-q4-k-m";
 
@@ -22,6 +23,16 @@ struct ModelPackManifest {
     recommended_ram_bytes: u64,
     task_suitability: Vec<String>,
     release_eligible: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelIntegrityCache {
+    manifest_sha256: String,
+    model_sha256: String,
+    model_bytes: u64,
+    modified_nanos: u128,
+    verified_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -61,11 +72,14 @@ pub fn inventory(portable_root: &Path) -> Vec<ModelPackInfo> {
     packs
 }
 
-pub fn verify_selected(portable_root: &Path, profile_id: &str) -> Result<VerifiedModelPack, String> {
+pub fn verify_selected(
+    portable_root: &Path,
+    profile_id: &str,
+) -> Result<VerifiedModelPack, String> {
     validate_profile_id(profile_id)?;
     let profile_dir = portable_root.join("model-packs").join(profile_id);
-    let manifest = read_manifest(&profile_dir)?;
-    verify_manifest(portable_root, &profile_dir, manifest)
+    let (manifest, manifest_bytes) = read_manifest(&profile_dir)?;
+    verify_manifest_cached(portable_root, &profile_dir, manifest, &manifest_bytes)
 }
 
 fn inspect_manifest(portable_root: &Path, profile_dir: &Path) -> ModelPackInfo {
@@ -75,7 +89,7 @@ fn inspect_manifest(portable_root: &Path, profile_dir: &Path) -> ModelPackInfo {
         .unwrap_or("invalid-profile")
         .to_string();
     match read_manifest(profile_dir) {
-        Ok(manifest) => {
+        Ok((manifest, manifest_bytes)) => {
             let base = ModelPackInfo {
                 id: manifest.id.clone(),
                 name: manifest.name.clone(),
@@ -89,7 +103,7 @@ fn inspect_manifest(portable_root: &Path, profile_dir: &Path) -> ModelPackInfo {
                 state: "verified".into(),
                 error: None,
             };
-            match verify_manifest(portable_root, profile_dir, manifest) {
+            match verify_manifest_cached(portable_root, profile_dir, manifest, &manifest_bytes) {
                 Ok(_) => base,
                 Err(error) => ModelPackInfo {
                     state: "invalid".into(),
@@ -114,17 +128,20 @@ fn inspect_manifest(portable_root: &Path, profile_dir: &Path) -> ModelPackInfo {
     }
 }
 
-fn read_manifest(profile_dir: &Path) -> Result<ModelPackManifest, String> {
+fn read_manifest(profile_dir: &Path) -> Result<(ModelPackManifest, Vec<u8>), String> {
     let manifest_path = profile_dir.join("manifest.json");
     let bytes = fs::read(&manifest_path)
         .map_err(|_| format!("模型包清单缺失：{}", manifest_path.display()))?;
-    serde_json::from_slice(&bytes).map_err(|error| format!("模型包清单无效：{error}"))
+    let manifest =
+        serde_json::from_slice(&bytes).map_err(|error| format!("模型包清单无效：{error}"))?;
+    Ok((manifest, bytes))
 }
 
-fn verify_manifest(
+fn verify_manifest_cached(
     portable_root: &Path,
     profile_dir: &Path,
     manifest: ModelPackManifest,
+    manifest_bytes: &[u8],
 ) -> Result<VerifiedModelPack, String> {
     if manifest.format != 1 {
         return Err("不支持的模型包清单格式".into());
@@ -155,7 +172,10 @@ fn verify_manifest(
         return Err("模型包资源说明不完整".into());
     }
     if manifest.sha256.len() != 64
-        || !manifest.sha256.chars().all(|value| value.is_ascii_hexdigit())
+        || !manifest
+            .sha256
+            .chars()
+            .all(|value| value.is_ascii_hexdigit())
     {
         return Err("模型包 SHA-256 无效".into());
     }
@@ -167,28 +187,64 @@ fn verify_manifest(
     {
         return Err("模型路径必须是胶囊内的普通相对路径".into());
     }
-    let canonical_root = fs::canonicalize(portable_root)
-        .map_err(|error| format!("无法检查便携根目录：{error}"))?;
+    let canonical_root =
+        fs::canonicalize(portable_root).map_err(|error| format!("无法检查便携根目录：{error}"))?;
     let candidate = portable_root.join(relative);
     let canonical_model = fs::canonicalize(&candidate)
         .map_err(|_| format!("模型文件缺失：{}", manifest.gguf_relative_path))?;
     if !canonical_model.starts_with(&canonical_root) {
         return Err("模型路径越过便携胶囊边界".into());
     }
-    let metadata = fs::metadata(&canonical_model)
-        .map_err(|error| format!("无法读取模型文件：{error}"))?;
+    let metadata =
+        fs::metadata(&canonical_model).map_err(|error| format!("无法读取模型文件：{error}"))?;
     if !metadata.is_file() || metadata.len() != manifest.bytes {
         return Err("模型文件大小与清单不一致".into());
     }
+    let modified_nanos = metadata
+        .modified()
+        .map_err(|error| format!("无法读取模型修改时间：{error}"))?
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let manifest_sha256 = format!("{:x}", Sha256::digest(manifest_bytes));
+    let expected_model_sha256 = manifest.sha256.to_ascii_lowercase();
+    let cache_dir = portable_root.join("data").join("model-integrity");
+    let cache_path = cache_dir.join(format!("{}.json", manifest.id));
+    let verified = VerifiedModelPack {
+        id: manifest.id.clone(),
+        gguf_path: canonical_model.clone(),
+        context_size: manifest.context_size,
+    };
+    if let Ok(cache_bytes) = fs::read(&cache_path) {
+        if let Ok(cache) = serde_json::from_slice::<ModelIntegrityCache>(&cache_bytes) {
+            if cache.manifest_sha256 == manifest_sha256
+                && cache.model_sha256 == expected_model_sha256
+                && cache.model_bytes == metadata.len()
+                && cache.modified_nanos == modified_nanos
+            {
+                return Ok(verified);
+            }
+        }
+    }
     let actual = digest_file(&canonical_model)?;
-    if actual != manifest.sha256.to_ascii_lowercase() {
+    if actual != expected_model_sha256 {
         return Err("模型文件 SHA-256 与清单不一致".into());
     }
-    Ok(VerifiedModelPack {
-        id: manifest.id,
-        gguf_path: canonical_model,
-        context_size: manifest.context_size,
-    })
+    fs::create_dir_all(&cache_dir).map_err(|error| format!("无法创建模型校验缓存：{error}"))?;
+    let cache = ModelIntegrityCache {
+        manifest_sha256,
+        model_sha256: actual,
+        model_bytes: metadata.len(),
+        modified_nanos,
+        verified_at: chrono::Utc::now().to_rfc3339(),
+    };
+    fs::write(
+        cache_path,
+        serde_json::to_vec_pretty(&cache)
+            .map_err(|error| format!("无法编码模型校验缓存：{error}"))?,
+    )
+    .map_err(|error| format!("无法写入模型校验缓存：{error}"))?;
+    Ok(verified)
 }
 
 fn validate_profile_id(value: &str) -> Result<(), String> {
@@ -265,7 +321,24 @@ mod tests {
         let verified = verify_selected(root.path(), "profile").unwrap();
         assert_eq!(verified.id, "profile");
         assert_eq!(verified.context_size, 4096);
+        assert!(root
+            .path()
+            .join("data/model-integrity/profile.json")
+            .is_file());
         assert_eq!(inventory(root.path())[0].state, "verified");
+    }
+
+    #[test]
+    fn cached_model_verification_rechecks_after_model_metadata_changes() {
+        let root = fixture("model-packs/profile/model.gguf", b"gguf", None);
+        verify_selected(root.path(), "profile").unwrap();
+        let model = root.path().join("model-packs/profile/model.gguf");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        fs::write(&model, b"bad!").unwrap();
+
+        let error = verify_selected(root.path(), "profile").unwrap_err();
+
+        assert!(error.contains("SHA-256"));
     }
 
     #[test]
@@ -296,7 +369,8 @@ mod tests {
     fn rejects_directory_id_mismatch() {
         let root = fixture("model-packs/profile/model.gguf", b"gguf", None);
         let path = root.path().join("model-packs/profile/manifest.json");
-        let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         value["id"] = serde_json::json!("another-profile");
         fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
         assert!(verify_selected(root.path(), "profile")
