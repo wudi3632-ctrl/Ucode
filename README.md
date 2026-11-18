@@ -56,6 +56,8 @@ UCode 不是把聊天网页套进桌面壳。它把项目读取、变更审批�
 
 同日完成了 Rescue R1 一次性联网探测验收：审批前不访问网络；用户批准后只对明确的 `example.com:443` 建立一次 TCP 握手；选择“保持离线”时不产生 DNS/TCP 观测证据。探针不发送 HTTP、不扫描其他目标，也不保存长期授权。首次打包桌面测试发现并修复了 URL 被误判为项目路径的路由缺陷。完整记录见 [Rescue R1 联网探测验收报告](docs/benchmarks/2026-11-18-rescue-r1-network-probes-acceptance.md)。
 
+随后补齐了 Rescue R0 的有界事件日志与文件证据：可读取最近 24 小时 System/Application 严重或错误事件的元数据，对用户明确指定的单一本地文件计算 SHA-256 并检查 ACL。真实桌面复验确认否定修复意图不会生成写入卡，哈希会直接显示并与 Windows 独立计算一致，且不会读取文件内容或访问网络路径。完整记录见 [Rescue R0 事件与文件证据验收报告](docs/benchmarks/2026-11-18-rescue-r0-eventlog-filesystem-acceptance.md)。
+
 ## 能力矩阵
 
 “真实桌面”与“自动测试”分开列出，避免把入口存在或单元测试写成已经完成的用户验收。
@@ -68,7 +70,7 @@ UCode 不是把聊天网页套进桌面壳。它把项目读取、变更审批�
 | 单文件与小型多文件修改 | Fibonacci 双文件通过 | Node + Rust | 写入必须审批 |
 | pytest 定向执行 | `3 passed in 0.02s` | Node | 失败回传已自动测试，尚待桌面失败路径复核 |
 | 项目事务写入、过期检测、回滚 | 已见真实写入与回滚入口 | Node + Rust | 项目写入的中途故障恢复主要由自动测试证明 |
-| Rescue R0 只读系统诊断 | Windows 11 真实探针、报告与证据收据已验收 | Node + Rust + 桌面 | 只覆盖已注册的有界探针；不等于全能系统诊断 |
+| Rescue R0 只读系统诊断 | Windows 11 真实探针、报告与证据收据已验收；事件日志、单文件 SHA-256 与 ACL 已复验 | Node + Rust + 桌面 | 事件日志限最近 24 小时 System/Application 的 Level 1/2 元数据；文件限明确本地盘路径与 256 MiB，不读取内容或网络路径 |
 | Rescue R1 DNS/TCP 精确探测 | 真实桌面批准与拒绝路径均已验收 | Rust + React + 桌面 | 只探测用户明确给出的单一目标；不发 HTTP、不扫描、不保存授权 |
 | Rescue R2 用户 PATH 修复与回滚 | 已真实审批、写入验证、独立复核并精确回滚 | Rust + 桌面 | 当前只启用 `system.user_path.normalize@1`；机器级与高风险修复仍禁用 |
 | 持久终端与 Ctrl+C | 已验证 PowerShell 会话启动 | Rust PTY | 持久交互与 Ctrl+C 主要由自动测试证明 |
@@ -159,7 +161,7 @@ npm run tauri dev
 - 便携 staging 完整性检查；
 - 真实桌面聊天、审批、文件、测试、终端、Git 降级、Agent、主题与布局验收。
 
-最近一次正式候选验收的构建摘要、测试计数、桌面步骤与已知限制见 [2026-11-18 Rescue R1 联网探测验收报告](docs/benchmarks/2026-11-18-rescue-r1-network-probes-acceptance.md)；用户 PATH 写入、验证与回滚见 [Rescue Phase 2 / R2 验收报告](docs/benchmarks/2026-11-18-rescue-phase2-r2-acceptance.md)。
+最近一次正式候选验收的构建摘要、测试计数、桌面步骤与已知限制见 [2026-11-18 Rescue R0 事件与文件证据验收报告](docs/benchmarks/2026-11-18-rescue-r0-eventlog-filesystem-acceptance.md)；联网批准/拒绝路径见 [Rescue R1 联网探测验收报告](docs/benchmarks/2026-11-18-rescue-r1-network-probes-acceptance.md)；用户 PATH 写入、验证与回滚见 [Rescue Phase 2 / R2 验收报告](docs/benchmarks/2026-11-18-rescue-phase2-r2-acceptance.md)。
 
 自动测试不能替代第二台 Windows 电脑与真实 U 盘拔插验证。项目仍处于个人/研究产品阶段，欢迎以可复现任务、日志和截图提交 Issue。
 

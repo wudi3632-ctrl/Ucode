@@ -4961,6 +4961,7 @@ fn classify_desktop_route(request: &str, previous: Option<&str>) -> DesktopRoute
     // network target is stronger Rescue evidence than that generic heuristic.
     if is_rescue_request(&normalized)
         && (requested_probe_description(&normalized).is_some()
+            || crate::rescue_filesystem::is_filesystem_request(&normalized)
             || !mentions_project_file(&actionable))
     {
         return DesktopRoute::Rescue;
@@ -5211,6 +5212,24 @@ fn without_negated_desktop_actions(value: &str) -> String {
         .join(" ")
 }
 
+fn requests_rescue_repair(value: &str) -> bool {
+    let actionable = without_negated_desktop_actions(&value.to_lowercase());
+    [
+        "修复",
+        "解决",
+        "恢复",
+        "纠正",
+        "规范化",
+        "清理",
+        "repair",
+        "fix",
+        "restore",
+        "normalize",
+    ]
+    .iter()
+    .any(|action| actionable.contains(action))
+}
+
 fn mentions_project_file(value: &str) -> bool {
     [
         ".md", ".txt", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".py", ".rs", ".go", ".java",
@@ -5330,7 +5349,7 @@ fn run_executor_ticket(
             }),
             app,
         );
-        if report.domain == "system" {
+        if report.domain == "system" && requests_rescue_repair(request_text) {
             let evidence_ids = report
                 .evidence
                 .iter()
@@ -6943,6 +6962,13 @@ mod tests {
             DesktopRoute::Rescue
         );
         assert_eq!(
+            classify_desktop_route(
+                "检查 `C:\\Windows\\System32\\notepad.exe` 的 SHA256 和 ACL 权限",
+                None
+            ),
+            DesktopRoute::Rescue
+        );
+        assert_eq!(
             classify_desktop_route("检查系统服务为什么异常", None),
             DesktopRoute::Rescue
         );
@@ -6966,6 +6992,18 @@ mod tests {
             classify_desktop_route("继续", Some("action")),
             DesktopRoute::Action
         );
+    }
+
+    #[test]
+    fn rescue_repair_requires_positive_non_negated_user_intent() {
+        assert!(requests_rescue_repair(
+            "Windows PATH 异常，请检查并生成可回滚修复方案"
+        ));
+        assert!(requests_rescue_repair("PATH 坏了，请帮我解决"));
+        assert!(!requests_rescue_repair(
+            "检查事件日志，只读取有界元数据，不要修改系统"
+        ));
+        assert!(!requests_rescue_repair("不要修复 PATH，只检查并解释问题"));
     }
 
     #[test]

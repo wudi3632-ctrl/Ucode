@@ -29,7 +29,7 @@ pub struct RescueToolDefinition {
 }
 
 pub fn tool_registry() -> &'static [RescueToolDefinition] {
-    static TOOLS: [RescueToolDefinition; 9] = [
+    static TOOLS: [RescueToolDefinition; 12] = [
         RescueToolDefinition {
             id: "system.inventory",
             version: 1,
@@ -61,6 +61,14 @@ pub fn tool_registry() -> &'static [RescueToolDefinition] {
             risk: RiskClass::R0,
             authority: "read",
             description: "Inspect stopped automatic Windows services",
+        },
+        RescueToolDefinition {
+            id: "system.eventlog.query",
+            version: 1,
+            domain: "system",
+            risk: RiskClass::R0,
+            authority: "read",
+            description: "Read bounded error metadata from System and Application event logs",
         },
         RescueToolDefinition {
             id: "network.adapter.inspect",
@@ -102,6 +110,22 @@ pub fn tool_registry() -> &'static [RescueToolDefinition] {
             authority: "network_read",
             description: "Connect to one approved host and port without sending application data",
         },
+        RescueToolDefinition {
+            id: "filesystem.hash",
+            version: 1,
+            domain: "filesystem",
+            risk: RiskClass::R0,
+            authority: "read",
+            description: "Hash one explicitly named local file within a strict size bound",
+        },
+        RescueToolDefinition {
+            id: "filesystem.permissions.inspect",
+            version: 1,
+            domain: "filesystem",
+            risk: RiskClass::R0,
+            authority: "read",
+            description: "Inspect a bounded ACL for one explicitly named local path",
+        },
     ];
     &TOOLS
 }
@@ -116,6 +140,14 @@ pub struct ProbeOutput {
 
 pub trait ProbeRunner {
     fn run(&self, tool_id: &str) -> Result<ProbeOutput, String>;
+
+    fn run_with_arguments(&self, tool_id: &str, arguments: &Value) -> Result<ProbeOutput, String> {
+        if arguments.is_null() || arguments.as_object().is_some_and(|value| value.is_empty()) {
+            self.run(tool_id)
+        } else {
+            Err(format!("probe does not accept arguments: {tool_id}"))
+        }
+    }
 }
 
 pub struct WindowsProbeRunner;
@@ -174,6 +206,14 @@ impl ProbeRunner for WindowsProbeRunner {
             stderr: bounded_utf8(&output.stderr),
         })
     }
+
+    fn run_with_arguments(&self, tool_id: &str, arguments: &Value) -> Result<ProbeOutput, String> {
+        if let Some(result) = crate::rescue_filesystem::run(tool_id, arguments) {
+            result
+        } else {
+            self.run(tool_id)
+        }
+    }
 }
 
 fn bounded_utf8(bytes: &[u8]) -> String {
@@ -186,6 +226,7 @@ fn probe_script(tool_id: &str) -> Option<&'static str> {
         "system.environment.inspect" => Some("$parts=@($env:Path -split ';'|Where-Object{$_}|Select-Object -First 80); $userPath=(Get-ItemProperty -LiteralPath 'HKCU:\\Environment' -Name Path -ErrorAction SilentlyContinue).Path; $userParts=@($userPath -split ';'); $nonEmpty=@($userParts|Where-Object{$_.Trim()}); $keys=@{}; $duplicates=0; $missing=0; foreach($part in $nonEmpty){$value=$part.Trim().Trim('\\\"');$key=$value.Replace('/','\\').TrimEnd('\\').ToLowerInvariant();if($keys.ContainsKey($key)){$duplicates++}else{$keys[$key]=$true};if([IO.Path]::IsPathRooted($value)-and -not $value.Contains('%')-and -not (Test-Path -LiteralPath $value -PathType Container)){$missing++}}; [pscustomobject]@{pathEntries=$parts;pathEntryCount=$parts.Count;userPath=$userPath;userPathEntryCount=$nonEmpty.Count;userPathEmptyEntries=[math]::Max(0,$userParts.Count-$nonEmpty.Count);userPathDuplicateEntries=$duplicates;userPathMissingAbsoluteDirectories=$missing;temp=$env:TEMP;userProfilePresent=[bool]$env:USERPROFILE;processorArchitecture=$env:PROCESSOR_ARCHITECTURE}|ConvertTo-Json -Compress -Depth 3"),
         "system.process.list" => Some("@(Get-Process|Sort-Object CPU -Descending|Select-Object -First 25 Name,Id,CPU,WorkingSet64)|ConvertTo-Json -Compress"),
         "system.service.inspect" => Some("@(Get-CimInstance Win32_Service|Where-Object{$_.StartMode -eq 'Auto' -and $_.State -ne 'Running'}|Select-Object -First 40 Name,DisplayName,State,StartMode,ExitCode)|ConvertTo-Json -Compress"),
+        "system.eventlog.query" => Some("$start=(Get-Date).AddHours(-24); $queryErrors=@(); $events=@(Get-WinEvent -FilterHashtable @{LogName=@('System','Application');Level=1,2;StartTime=$start} -MaxEvents 30 -ErrorAction SilentlyContinue -ErrorVariable +queryErrors); $realErrors=@($queryErrors|Where-Object{$_.FullyQualifiedErrorId -notmatch 'NoMatchingEventsFound'}); if($realErrors.Count -gt 0){throw $realErrors[0]}; @($events|ForEach-Object{[pscustomobject]@{timeCreated=$_.TimeCreated.ToUniversalTime().ToString('o');logName=$_.LogName;level=$_.LevelDisplayName;eventId=$_.Id;provider=$_.ProviderName;recordId=$_.RecordId}})|ConvertTo-Json -Compress -Depth 3"),
         "network.adapter.inspect" => Some("@(Get-NetIPConfiguration|Where-Object{$_.NetAdapter.Status -eq 'Up'}|ForEach-Object{[pscustomobject]@{alias=$_.InterfaceAlias;description=$_.InterfaceDescription;ipv4=@($_.IPv4Address|ForEach-Object{$_.IPAddress});ipv6=@($_.IPv6Address|ForEach-Object{$_.IPAddress}|Select-Object -First 4);gateway=@($_.IPv4DefaultGateway|ForEach-Object{$_.NextHop});dnsServers=@($_.DNSServer.ServerAddresses)}})|ConvertTo-Json -Compress -Depth 5"),
         "network.route.inspect" => Some("@(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue|Sort-Object RouteMetric|Select-Object -First 12 InterfaceAlias,NextHop,RouteMetric,State)|ConvertTo-Json -Compress"),
         "network.proxy.inspect" => Some("$winHttp=(netsh winhttp show proxy|Out-String).Trim(); [pscustomobject]@{winHttp=$winHttp;httpProxy=$env:HTTP_PROXY;httpsProxy=$env:HTTPS_PROXY;noProxy=$env:NO_PROXY}|ConvertTo-Json -Compress"),
@@ -289,6 +330,18 @@ pub fn is_rescue_request(request: &str) -> bool {
         "http",
         "site",
         "port",
+        "文件",
+        "目录",
+        "权限",
+        "哈希",
+        "摘要",
+        "sha256",
+        "acl",
+        "permission",
+        "checksum",
+        "event log",
+        "eventlog",
+        "事件日志",
     ];
     let symptom = [
         "不能",
@@ -319,29 +372,53 @@ pub fn diagnose(request: &str) -> DiagnosisReport {
 }
 
 pub fn diagnose_with_runner(request: &str, runner: &dyn ProbeRunner) -> DiagnosisReport {
-    let domain = if is_network_request(request) {
+    let domain = if crate::rescue_filesystem::is_filesystem_request(request) {
+        "filesystem"
+    } else if is_network_request(request) {
         "network"
     } else {
         "system"
     };
-    let mut probe_ids = vec!["system.inventory", "system.environment.inspect"];
-    if domain == "network" {
-        probe_ids.extend([
-            "network.adapter.inspect",
-            "network.route.inspect",
-            "network.proxy.inspect",
-        ]);
-    } else {
-        probe_ids.extend(["system.process.list", "system.service.inspect"]);
+    let mut probes = vec![("system.inventory".to_string(), Value::Null)];
+    match domain {
+        "network" => probes.extend(
+            [
+                "system.environment.inspect",
+                "network.adapter.inspect",
+                "network.route.inspect",
+                "network.proxy.inspect",
+            ]
+            .into_iter()
+            .map(|id| (id.to_string(), Value::Null)),
+        ),
+        "filesystem" => probes.extend(crate::rescue_filesystem::requested_probes(request)),
+        _ => {
+            probes.extend(
+                [
+                    "system.environment.inspect",
+                    "system.process.list",
+                    "system.service.inspect",
+                ]
+                .into_iter()
+                .map(|id| (id.to_string(), Value::Null)),
+            );
+            if is_eventlog_request(request) {
+                probes.push(("system.eventlog.query".into(), Value::Null));
+            }
+        }
     }
-    let evidence = probe_ids
+    let evidence = probes
         .into_iter()
-        .map(|id| collect(runner, id))
+        .map(|(id, arguments)| collect_with_arguments(runner, &id, &arguments))
         .collect::<Vec<_>>();
-    let (hypotheses, edges, next_probe) = if domain == "network" {
-        analyze_network(&evidence)
-    } else {
-        analyze_system(&evidence)
+    let (hypotheses, edges, next_probe) = match domain {
+        "network" => analyze_network(&evidence),
+        "filesystem" => {
+            let (hypotheses, next_probe) = crate::rescue_filesystem::analyze(request, &evidence);
+            let edges = edges_from_hypotheses(&hypotheses);
+            (hypotheses, edges, next_probe)
+        }
+        _ => analyze_system(&evidence),
     };
     let outcome = if hypotheses
         .iter()
@@ -364,6 +441,21 @@ pub fn diagnose_with_runner(request: &str, runner: &dyn ProbeRunner) -> Diagnosi
     }
 }
 
+fn is_eventlog_request(request: &str) -> bool {
+    let value = request.to_lowercase();
+    [
+        "事件日志",
+        "系统日志",
+        "应用日志",
+        "event log",
+        "eventlog",
+        "事件 id",
+        "事件id",
+    ]
+    .iter()
+    .any(|item| value.contains(item))
+}
+
 fn is_network_request(request: &str) -> bool {
     let value = request.to_lowercase();
     [
@@ -374,13 +466,17 @@ fn is_network_request(request: &str) -> bool {
     .any(|item| value.contains(item))
 }
 
-fn collect(runner: &dyn ProbeRunner, tool_id: &str) -> EvidenceNode {
+fn collect_with_arguments(
+    runner: &dyn ProbeRunner,
+    tool_id: &str,
+    arguments: &Value,
+) -> EvidenceNode {
     let started = Instant::now();
     let definition = tool_registry()
         .iter()
         .find(|tool| tool.id == tool_id)
         .expect("registered probe");
-    match runner.run(tool_id) {
+    match runner.run_with_arguments(tool_id, arguments) {
         Ok(output) => {
             let parsed = serde_json::from_str::<Value>(output.stdout.trim())
                 .unwrap_or_else(|_| json!({ "text": output.stdout.trim() }));
@@ -451,7 +547,31 @@ fn summarize(tool_id: &str, value: &Value, exit_code: i32, stderr: &str) -> Stri
             }
         }
         "system.service.inspect" => format!("发现 {} 个未运行的自动服务", array_items(value).len()),
+        "system.eventlog.query" => format!(
+            "发现 {} 条最近 24 小时的严重或错误事件元数据",
+            array_items(value).len()
+        ),
         "system.process.list" => format!("已采集 {} 个高资源进程摘要", array_items(value).len()),
+        "filesystem.hash" => format!(
+            "已计算 {}（{} bytes）的 SHA-256：{}",
+            value
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or("指定文件"),
+            value.get("sizeBytes").and_then(Value::as_u64).unwrap_or(0),
+            value
+                .get("sha256")
+                .and_then(Value::as_str)
+                .unwrap_or("未返回摘要")
+        ),
+        "filesystem.permissions.inspect" => format!(
+            "已读取 {} 条 ACL 规则",
+            value
+                .get("entries")
+                .map(array_items)
+                .unwrap_or_default()
+                .len()
+        ),
         "system.environment.inspect" => format!(
             "PATH 包含 {} 个条目",
             value
@@ -485,6 +605,26 @@ fn find_evidence<'a>(evidence: &'a [EvidenceNode], tool_id: &str) -> Option<&'a 
 
 fn observed(item: Option<&EvidenceNode>) -> bool {
     item.is_some_and(|value| matches!(value.state, EvidenceState::Observed))
+}
+
+fn edges_from_hypotheses(hypotheses: &[Hypothesis]) -> Vec<EvidenceEdge> {
+    hypotheses
+        .iter()
+        .flat_map(|hypothesis| {
+            hypothesis
+                .evidence_ids
+                .iter()
+                .map(|evidence_id| EvidenceEdge {
+                    from: evidence_id.clone(),
+                    to: hypothesis.id.clone(),
+                    relation: if matches!(hypothesis.state, HypothesisState::Contradicted) {
+                        "contradicts".into()
+                    } else {
+                        "supports".into()
+                    },
+                })
+        })
+        .collect()
 }
 
 fn proxy_configured(value: &Value) -> bool {
@@ -646,6 +786,7 @@ fn analyze_system(
 ) -> (Vec<Hypothesis>, Vec<EvidenceEdge>, Option<String>) {
     let services = find_evidence(evidence, "system.service.inspect");
     let environment = find_evidence(evidence, "system.environment.inspect");
+    let eventlog = find_evidence(evidence, "system.eventlog.query");
     let stopped = services
         .map(|item| array_items(&item.structured).len())
         .unwrap_or(0);
@@ -742,10 +883,34 @@ fn analyze_system(
             environment,
         );
     }
+    if let Some(events) = eventlog {
+        let count = array_items(&events.structured).len();
+        add(
+            "system.recent_error_events",
+            if count > 0 {
+                "最近 24 小时存在严重或错误事件；事件元数据是线索，不等于已定位根因"
+            } else {
+                "最近 24 小时未发现 System/Application 严重或错误事件"
+            },
+            if count > 0 {
+                HypothesisState::Unresolved
+            } else if observed(Some(events)) {
+                HypothesisState::Contradicted
+            } else {
+                HypothesisState::Unresolved
+            },
+            if count > 0 { 0.55 } else { 0.25 },
+            Some(events),
+        );
+    }
     (
         hypotheses,
         edges,
-        Some("提供具体错误文本、应用或服务名后执行定向只读探针".into()),
+        Some(if eventlog.is_some() {
+            "请提供相关事件 ID、应用/服务名和发生时间，以便把日志线索与原始症状对应".into()
+        } else {
+            "提供具体错误文本、应用或服务名后执行定向只读探针".into()
+        }),
     )
 }
 
@@ -835,6 +1000,16 @@ mod tests {
             .unwrap();
         assert_eq!(tcp.risk, RiskClass::R1);
         assert!(probe_script(tcp.id).is_none());
+        for id in [
+            "system.eventlog.query",
+            "filesystem.hash",
+            "filesystem.permissions.inspect",
+        ] {
+            let tool = tool_registry().iter().find(|tool| tool.id == id).unwrap();
+            assert_eq!(tool.risk, RiskClass::R0);
+        }
+        assert!(probe_script("system.eventlog.query").is_some());
+        assert!(probe_script("filesystem.hash").is_none());
     }
 
     #[cfg(target_os = "windows")]
@@ -862,6 +1037,22 @@ mod tests {
             .get("userPathMissingAbsoluteDirectories")
             .and_then(Value::as_u64)
             .is_some());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn real_event_log_probe_returns_only_bounded_metadata() {
+        let output = WindowsProbeRunner.run("system.eventlog.query").unwrap();
+        assert_eq!(output.exit_code, 0, "{}", output.stderr);
+        assert!(output.stdout.len() <= MAX_PROBE_OUTPUT);
+        let value: Value = serde_json::from_str(output.stdout.trim()).unwrap();
+        let items = array_items(&value);
+        assert!(items.len() <= 30);
+        for item in items {
+            assert!(item.get("eventId").is_some());
+            assert!(item.get("provider").is_some());
+            assert!(item.get("message").is_none());
+        }
     }
 
     #[test]
@@ -978,6 +1169,97 @@ mod tests {
         assert!(matches!(finding.state, HypothesisState::Supported));
         assert!(finding.confidence > 0.9);
         assert!(matches!(report.outcome, DiagnosisOutcome::Diagnosed));
+        assert!(!report.mutation_performed);
+    }
+
+    #[test]
+    fn event_log_metadata_runs_only_for_an_explicit_log_request() {
+        let mut values = std::collections::BTreeMap::new();
+        for (id, value) in [
+            (
+                "system.inventory",
+                json!({"caption":"Windows 11","build":"26100"}),
+            ),
+            ("system.environment.inspect", json!({"pathEntryCount":20})),
+            ("system.process.list", json!([])),
+            ("system.service.inspect", json!([])),
+            (
+                "system.eventlog.query",
+                json!([{"timeCreated":"2026-11-18T00:00:00Z","logName":"System","level":"Error","eventId":7000,"provider":"Service Control Manager","recordId":42}]),
+            ),
+        ] {
+            values.insert(
+                id,
+                ProbeOutput {
+                    exit_code: 0,
+                    stdout: value.to_string(),
+                    stderr: String::new(),
+                },
+            );
+        }
+        let report =
+            diagnose_with_runner("检查 Windows 事件日志中的系统错误", &FixtureRunner(values));
+        let event = find_evidence(&report.evidence, "system.eventlog.query").unwrap();
+        assert_eq!(array_items(&event.structured).len(), 1);
+        assert!(event.structured.to_string().find("message").is_none());
+        assert!(matches!(
+            hypothesis(&report, "system.recent_error_events").state,
+            HypothesisState::Unresolved
+        ));
+        assert!(matches!(report.outcome, DiagnosisOutcome::SafeStop));
+    }
+
+    #[test]
+    fn explicit_file_hash_is_compared_without_reading_arbitrary_content() {
+        struct FilesystemFixture;
+        impl ProbeRunner for FilesystemFixture {
+            fn run(&self, tool_id: &str) -> Result<ProbeOutput, String> {
+                if tool_id == "system.inventory" {
+                    return Ok(ProbeOutput {
+                        exit_code: 0,
+                        stdout: json!({"caption":"Windows 11","build":"26100"}).to_string(),
+                        stderr: String::new(),
+                    });
+                }
+                Err("unexpected probe".into())
+            }
+
+            fn run_with_arguments(
+                &self,
+                tool_id: &str,
+                arguments: &Value,
+            ) -> Result<ProbeOutput, String> {
+                if tool_id == "filesystem.hash" {
+                    assert_eq!(arguments["path"], "C:\\demo.txt");
+                    return Ok(ProbeOutput {
+                        exit_code: 0,
+                        stdout:
+                            json!({"path":"C:\\demo.txt","sizeBytes":4,"sha256":"a".repeat(64)})
+                                .to_string(),
+                        stderr: String::new(),
+                    });
+                }
+                self.run(tool_id)
+            }
+        }
+        let report = diagnose_with_runner(
+            &format!("检查 `C:\\demo.txt` 的 SHA256，期望值 {}", "a".repeat(64)),
+            &FilesystemFixture,
+        );
+        assert_eq!(report.domain, "filesystem");
+        assert!(matches!(
+            hypothesis(&report, "filesystem.hash_match").state,
+            HypothesisState::Supported
+        ));
+        assert!(matches!(report.outcome, DiagnosisOutcome::Diagnosed));
+        assert!(report
+            .evidence
+            .iter()
+            .all(|item| item.structured.get("content").is_none()));
+        assert!(find_evidence(&report.evidence, "filesystem.hash")
+            .unwrap()
+            .summary
+            .contains(&"a".repeat(64)));
         assert!(!report.mutation_performed);
     }
 }
