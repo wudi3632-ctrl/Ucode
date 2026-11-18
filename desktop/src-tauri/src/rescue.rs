@@ -77,7 +77,7 @@ pub struct RescueToolDefinition {
 }
 
 pub fn tool_registry() -> &'static [RescueToolDefinition] {
-    static TOOLS: [RescueToolDefinition; 14] = [
+    static TOOLS: [RescueToolDefinition; 15] = [
         RescueToolDefinition {
             id: "system.inventory",
             version: 1,
@@ -173,6 +173,14 @@ pub fn tool_registry() -> &'static [RescueToolDefinition] {
             risk: RiskClass::R1,
             authority: "network_read",
             description: "Connect to one approved host and port without sending application data",
+        },
+        RescueToolDefinition {
+            id: "storage.volume.inspect",
+            version: 1,
+            domain: "storage",
+            risk: RiskClass::R0,
+            authority: "read",
+            description: "Inspect capacity for one explicitly named local Windows volume",
         },
         RescueToolDefinition {
             id: "filesystem.hash",
@@ -277,6 +285,8 @@ impl ProbeRunner for WindowsProbeRunner {
         } else if let Some(result) = crate::rescue_service::run(tool_id, arguments) {
             result
         } else if let Some(result) = crate::rescue_local_port::run(tool_id, arguments) {
+            result
+        } else if let Some(result) = crate::rescue_volume::run(tool_id, arguments) {
             result
         } else {
             self.run(tool_id)
@@ -410,6 +420,13 @@ pub fn is_rescue_request(request: &str) -> bool {
         "event log",
         "eventlog",
         "事件日志",
+        "磁盘",
+        "硬盘",
+        "盘满",
+        "空间不足",
+        "disk space",
+        "disk full",
+        "storage full",
     ];
     let symptom = [
         "不能",
@@ -430,6 +447,9 @@ pub fn is_rescue_request(request: &str) -> bool {
         "broken",
         "diagnose",
         "troubleshoot",
+        "满了",
+        "不足",
+        "不够",
     ];
     machine_scope.iter().any(|item| value.contains(item))
         && symptom.iter().any(|item| value.contains(item))
@@ -440,7 +460,9 @@ pub fn diagnose(request: &str) -> DiagnosisReport {
 }
 
 pub fn diagnose_with_runner(request: &str, runner: &dyn ProbeRunner) -> DiagnosisReport {
-    let domain = if crate::rescue_filesystem::is_filesystem_request(request) {
+    let domain = if crate::rescue_volume::is_volume_request(request) {
+        "storage"
+    } else if crate::rescue_filesystem::is_filesystem_request(request) {
         "filesystem"
     } else if is_network_request(request) {
         "network"
@@ -450,6 +472,9 @@ pub fn diagnose_with_runner(request: &str, runner: &dyn ProbeRunner) -> Diagnosi
     let mut probes = vec![("system.inventory".to_string(), Value::Null)];
     let local_port_probe = (domain == "network")
         .then(|| crate::rescue_local_port::requested_probe(request))
+        .flatten();
+    let volume_probe = (domain == "storage")
+        .then(|| crate::rescue_volume::requested_probe(request))
         .flatten();
     let targeted_service = (domain == "system")
         .then(|| crate::rescue_service::requested_probe(request))
@@ -472,6 +497,11 @@ pub fn diagnose_with_runner(request: &str, runner: &dyn ProbeRunner) -> Diagnosi
             }
         }
         "filesystem" => probes.extend(crate::rescue_filesystem::requested_probes(request)),
+        "storage" => {
+            if let Some(probe) = volume_probe {
+                probes.push(probe);
+            }
+        }
         _ => {
             if let Some(probe) = targeted_service {
                 probes.push(probe);
@@ -506,6 +536,12 @@ pub fn diagnose_with_runner(request: &str, runner: &dyn ProbeRunner) -> Diagnosi
         }
         "filesystem" => {
             let (hypotheses, next_probe) = crate::rescue_filesystem::analyze(request, &evidence);
+            let edges = edges_from_hypotheses(&hypotheses);
+            (hypotheses, edges, next_probe)
+        }
+        "storage" => {
+            let (hypotheses, next_probe) = crate::rescue_volume::analyze(&evidence)
+                .unwrap_or_else(|| (Vec::new(), Some("卷容量证据不可用；未执行清理".into())));
             let edges = edges_from_hypotheses(&hypotheses);
             (hypotheses, edges, next_probe)
         }
@@ -655,6 +691,24 @@ fn summarize(tool_id: &str, value: &Value, exit_code: i32, stderr: &str) -> Stri
             } else {
                 format!("本机 TCP 端口 {port} 未发现监听者")
             }
+        }
+        "storage.volume.inspect" => {
+            let drive = value
+                .get("drive")
+                .and_then(Value::as_str)
+                .unwrap_or("指定卷");
+            let available = value
+                .get("availableBytes")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let used = value
+                .get("usedPercent")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            format!(
+                "{drive} 可用 {:.1} GiB，已用 {used:.1}%",
+                available as f64 / 1_073_741_824.0
+            )
         }
         "system.service.inspect" => format!("发现 {} 个未运行的自动服务", array_items(value).len()),
         "system.service.query" => {
@@ -1160,6 +1214,7 @@ mod tests {
             "system.eventlog.query",
             "system.service.query",
             "network.local_port.inspect",
+            "storage.volume.inspect",
             "filesystem.hash",
             "filesystem.permissions.inspect",
         ] {
@@ -1373,6 +1428,66 @@ mod tests {
             serde_json::to_string(&occupied.hypotheses).unwrap(),
             serde_json::to_string(&available.hypotheses).unwrap()
         );
+    }
+
+    #[test]
+    fn explicit_volume_capacity_runs_only_inventory_and_volume_probe() {
+        struct VolumeFixture;
+        impl ProbeRunner for VolumeFixture {
+            fn run(&self, tool_id: &str) -> Result<ProbeOutput, String> {
+                if tool_id == "system.inventory" {
+                    return Ok(ProbeOutput {
+                        exit_code: 0,
+                        stdout: json!({"caption":"Windows 11","build":"26100"}).to_string(),
+                        stderr: String::new(),
+                    });
+                }
+                Err(format!("unexpected probe: {tool_id}"))
+            }
+
+            fn run_with_arguments(
+                &self,
+                tool_id: &str,
+                arguments: &Value,
+            ) -> Result<ProbeOutput, String> {
+                if tool_id != "storage.volume.inspect" {
+                    return self.run(tool_id);
+                }
+                assert_eq!(arguments, &json!({"drive":"C:"}));
+                Ok(ProbeOutput {
+                    exit_code: 0,
+                    stdout: json!({
+                        "drive":"C:",
+                        "driveType":"fixed",
+                        "totalBytes":100_u64 * 1024 * 1024 * 1024,
+                        "availableBytes":8_u64 * 1024 * 1024 * 1024,
+                        "usedBytes":92_u64 * 1024 * 1024 * 1024,
+                        "usedPercent":92.0,
+                        "readOnly":false
+                    })
+                    .to_string(),
+                    stderr: String::new(),
+                })
+            }
+        }
+
+        let report = diagnose_with_runner("C盘空间不足，请诊断但不要删除文件", &VolumeFixture);
+        assert_eq!(report.domain, "storage");
+        assert_eq!(report.evidence.len(), 2);
+        assert!(report.evidence.iter().all(|item| matches!(
+            item.tool_id.as_str(),
+            "system.inventory" | "storage.volume.inspect"
+        )));
+        assert!(matches!(
+            hypothesis(&report, "storage.volume_capacity_pressure").state,
+            HypothesisState::Supported
+        ));
+        assert!(report
+            .next_probe
+            .as_deref()
+            .unwrap()
+            .contains("没有枚举或删除"));
+        assert!(!report.mutation_performed);
     }
 
     #[test]

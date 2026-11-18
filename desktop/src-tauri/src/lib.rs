@@ -16,6 +16,7 @@ pub mod rescue_local_port;
 pub mod rescue_probe;
 pub mod rescue_repair;
 pub mod rescue_service;
+pub mod rescue_volume;
 pub mod skills;
 pub mod storage;
 pub mod superagent;

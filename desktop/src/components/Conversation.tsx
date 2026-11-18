@@ -833,6 +833,17 @@ function activityLabel(event: RuntimeEvent) {
       }
       if (structured?.occupied === false) return `本机端口 ${port} 未发现监听者`;
     }
+    if (tool === "storage.volume.inspect") {
+      const structured = event.payload.structured && typeof event.payload.structured === "object" && !Array.isArray(event.payload.structured)
+        ? event.payload.structured as Record<string, unknown>
+        : null;
+      const drive = typeof structured?.drive === "string" ? structured.drive : null;
+      const available = typeof structured?.availableBytes === "number" ? structured.availableBytes : null;
+      const usedPercent = typeof structured?.usedPercent === "number" ? structured.usedPercent : null;
+      if (drive && available !== null && available >= 0 && usedPercent !== null && Number.isFinite(usedPercent)) {
+        return `${drive} 可用 ${formatCapacityBytes(available)} · 已用 ${Math.round(usedPercent)}%`;
+      }
+    }
     return `${tool} · ${summary}`;
   }
   if (event.eventType === "rescue.diagnosis.ready") {
@@ -896,6 +907,12 @@ function attachmentSummaries(value: unknown): ContextAttachmentSummary[] {
 function formatBytes(value: number) {
   if (value < 1024) return `${value} B`;
   return value < 1024 * 1024 ? `${(value / 1024).toFixed(value >= 10 * 1024 ? 0 : 1)} KiB` : `${(value / (1024 * 1024)).toFixed(1)} MiB`;
+}
+
+function formatCapacityBytes(value: number) {
+  if (!Number.isFinite(value) || value < 0) return "未知";
+  if (value >= 1024 ** 3) return `${(value / 1024 ** 3).toFixed(1)} GiB`;
+  return `${(value / 1024 ** 2).toFixed(1)} MiB`;
 }
 
 function MessageIcon({ name }: { name: "copy" | "check" | "edit" | "branch" }) {

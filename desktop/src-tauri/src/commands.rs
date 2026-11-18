@@ -5365,7 +5365,7 @@ fn run_executor_ticket(
                     "toolId": evidence.tool_id,
                     "state": evidence.state,
                     "summary": evidence.summary,
-                    "structured": if evidence.tool_id == "network.local_port.inspect" { evidence.structured.clone() } else { json!(null) },
+                    "structured": if matches!(evidence.tool_id.as_str(), "network.local_port.inspect" | "storage.volume.inspect") { evidence.structured.clone() } else { json!(null) },
                     "contentDigest": evidence.content_digest,
                     "elapsedMs": evidence.elapsed_ms,
                 }),
@@ -7091,6 +7091,10 @@ mod tests {
         );
         assert_eq!(
             classify_desktop_route("检查系统服务为什么异常", None),
+            DesktopRoute::Rescue
+        );
+        assert_eq!(
+            classify_desktop_route("C盘空间不足，请检查但不要删除文件", None),
             DesktopRoute::Rescue
         );
         assert_eq!(

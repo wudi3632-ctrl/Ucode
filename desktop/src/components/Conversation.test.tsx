@@ -77,6 +77,61 @@ describe("conversation timeline projection", () => {
     expect(document.body).not.toHaveTextContent("C:\\Program Files");
   });
 
+  it("renders bounded volume capacity evidence without labels or file names", () => {
+    const events = [
+      event(1, "rescue.probe.completed", {
+        toolId: "storage.volume.inspect",
+        summary: "C: 可用 8.0 GiB，已用 92.0%",
+        evidenceId: "evidence-volume",
+        structured: {
+          drive: "C:",
+          driveType: "fixed",
+          totalBytes: 100 * 1024 ** 3,
+          availableBytes: 8 * 1024 ** 3,
+          usedBytes: 92 * 1024 ** 3,
+          usedPercent: 92,
+          readOnly: false,
+        },
+      }),
+      event(2, "rescue.diagnosis.ready", { outcome: "diagnosed", mutationPerformed: false }),
+      event(3, "delivery.ready", { content: "容量压力已由本机证据确认；没有删除文件。", route: "rescue" }),
+    ];
+    render(<Conversation
+      projectId="project-1" ticket={{ ...ticket, state: "running" }} events={events} effect={null} receipt={null} appliedEffect={null} busy
+      onSubmit={vi.fn()} onCancel={vi.fn()} onRetry={vi.fn()} onExport={vi.fn()} onBranch={vi.fn()}
+      onApprove={vi.fn()} onReject={vi.fn()} onRollback={vi.fn()} onExportReceipt={vi.fn()} hasProject onOpenProject={vi.fn()} error={null}
+      sidebarOpen inspectorOpen={false} onToggleSidebar={vi.fn()} onToggleInspector={vi.fn()}
+      providerStatus="ready" modelProvider="bundled" providerModel="" modelPerformance={null}
+    />);
+    fireEvent.click(screen.getByRole("button", { name: /已完成 2 项操作/ }));
+    expect(screen.getByText("C: 可用 8.0 GiB · 已用 92%")).toBeInTheDocument();
+    expect(document.body).not.toHaveTextContent("System Volume Information");
+    expect(document.body).not.toHaveTextContent("volumeLabel");
+  });
+
+  it("does not render an unavailable volume as zero free space", () => {
+    const events = [
+      event(1, "rescue.probe.completed", {
+        toolId: "storage.volume.inspect",
+        summary: "指定盘符不存在",
+        evidenceId: "evidence-volume-missing",
+        structured: { error: "指定盘符不存在" },
+      }),
+      event(2, "rescue.diagnosis.ready", { outcome: "safe_stop", mutationPerformed: false }),
+      event(3, "delivery.ready", { content: "卷容量探针不可用；没有删除任何文件。", route: "rescue" }),
+    ];
+    render(<Conversation
+      projectId="project-1" ticket={{ ...ticket, state: "running" }} events={events} effect={null} receipt={null} appliedEffect={null} busy
+      onSubmit={vi.fn()} onCancel={vi.fn()} onRetry={vi.fn()} onExport={vi.fn()} onBranch={vi.fn()}
+      onApprove={vi.fn()} onReject={vi.fn()} onRollback={vi.fn()} onExportReceipt={vi.fn()} hasProject onOpenProject={vi.fn()} error={null}
+      sidebarOpen inspectorOpen={false} onToggleSidebar={vi.fn()} onToggleInspector={vi.fn()}
+      providerStatus="ready" modelProvider="bundled" providerModel="" modelPerformance={null}
+    />);
+    fireEvent.click(screen.getByRole("button", { name: /已完成 2 项操作/ }));
+    expect(screen.getByText("storage.volume.inspect · 指定盘符不存在")).toBeInTheDocument();
+    expect(document.body).not.toHaveTextContent("可用 0.0 MiB");
+  });
+
   it("describes a Rescue receipt as system evidence with no system mutation", () => {
     const receipt: EvidenceReceipt = {
       ticketId: ticket.id,
