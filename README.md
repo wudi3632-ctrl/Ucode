@@ -58,6 +58,8 @@ UCode 不是把聊天网页套进桌面壳。它把项目读取、变更审批�
 
 随后补齐了 Rescue R0 的有界事件日志与文件证据：可读取最近 24 小时 System/Application 严重或错误事件的元数据，对用户明确指定的单一本地文件计算 SHA-256 并检查 ACL。真实桌面复验确认否定修复意图不会生成写入卡，哈希会直接显示并与 Windows 独立计算一致，且不会读取文件内容或访问网络路径。完整记录见 [Rescue R0 事件与文件证据验收报告](docs/benchmarks/2026-11-18-rescue-r0-eventlog-filesystem-acceptance.md)。
 
+最新候选又增加了首个白名单化服务修复：只有 `system.service.query` 真实证据显示 `W32Time=Stopped` 且固定依赖 `RpcSs=Running` 时，才允许生成 `system.service.start@1` R3 方案。管理员 helper 使用原生 SCM API，只能启动 `W32Time`，不接受任意服务名、命令或启动类型修改；应用和回滚分别需要一次 UAC，并要求 helper 与未提权宿主双重重读。当前机器的 `W32Time` 已在运行，因此真实桌面只验收了“无可应用修改”和越界服务安全停止；真实提权写入仍需用户本人完成 UAC。详见 [Rescue R3 W32Time 服务验收报告](docs/benchmarks/2026-11-18-rescue-r3-w32time-service-acceptance.md)。
+
 ## 能力矩阵
 
 “真实桌面”与“自动测试”分开列出，避免把入口存在或单元测试写成已经完成的用户验收。
@@ -72,7 +74,9 @@ UCode 不是把聊天网页套进桌面壳。它把项目读取、变更审批�
 | 项目事务写入、过期检测、回滚 | 已见真实写入与回滚入口 | Node + Rust | 项目写入的中途故障恢复主要由自动测试证明 |
 | Rescue R0 只读系统诊断 | Windows 11 真实探针、报告与证据收据已验收；事件日志、单文件 SHA-256 与 ACL 已复验 | Node + Rust + 桌面 | 事件日志限最近 24 小时 System/Application 的 Level 1/2 元数据；文件限明确本地盘路径与 256 MiB，不读取内容或网络路径 |
 | Rescue R1 DNS/TCP 精确探测 | 真实桌面批准与拒绝路径均已验收 | Rust + React + 桌面 | 只探测用户明确给出的单一目标；不发 HTTP、不扫描、不保存授权 |
-| Rescue R2 用户 PATH 修复与回滚 | 已真实审批、写入验证、独立复核并精确回滚 | Rust + 桌面 | 当前只启用 `system.user_path.normalize@1`；机器级与高风险修复仍禁用 |
+| Rescue R2 用户 PATH/代理修复与回滚 | 用户 PATH 已真实审批、写入验证并精确回滚；代理拒绝路径已桌面验收 | Rust + React + 桌面 | 仅修改当前用户有界目标，不删除代理地址 |
+| Rescue R3 机器 PATH | 拒绝/UAC 安全边界已桌面验收 | Rust + React + 桌面 | helper 已实现；真实管理员应用和第二次 UAC 回滚仍需用户本人验收 |
+| Rescue R3 W32Time 服务启动 | 真实桌面确认已运行时不生成修复，非允许列表服务不生成卡 | Rust 认证 helper + React + 桌面 | 只允许 `W32Time`，固定依赖 `RpcSs`；不修改启动类型；真实服务变更未自动执行 |
 | 持久终端与 Ctrl+C | 已验证 PowerShell 会话启动 | Rust PTY | 持久交互与 Ctrl+C 主要由自动测试证明 |
 | Git 状态、Diff、历史与操作 | 已验证非仓库诚实降级 | Rust | 真实 Git 仓库的完整操作流仍待人工复核 |
 | 只读 Agent | 已验收，无文件写入 | Rust + React | 只做有界项目分析 |
@@ -161,7 +165,7 @@ npm run tauri dev
 - 便携 staging 完整性检查；
 - 真实桌面聊天、审批、文件、测试、终端、Git 降级、Agent、主题与布局验收。
 
-最近一次正式候选验收的构建摘要、测试计数、桌面步骤与已知限制见 [2026-11-18 Rescue R0 事件与文件证据验收报告](docs/benchmarks/2026-11-18-rescue-r0-eventlog-filesystem-acceptance.md)；联网批准/拒绝路径见 [Rescue R1 联网探测验收报告](docs/benchmarks/2026-11-18-rescue-r1-network-probes-acceptance.md)；用户 PATH 写入、验证与回滚见 [Rescue Phase 2 / R2 验收报告](docs/benchmarks/2026-11-18-rescue-phase2-r2-acceptance.md)。
+最近一次正式候选验收的构建摘要、测试计数、桌面步骤与已知限制见 [Rescue R3 W32Time 服务验收报告](docs/benchmarks/2026-11-18-rescue-r3-w32time-service-acceptance.md)；联网批准/拒绝路径见 [Rescue R1 联网探测验收报告](docs/benchmarks/2026-11-18-rescue-r1-network-probes-acceptance.md)；用户 PATH 写入、验证与回滚见 [Rescue Phase 2 / R2 验收报告](docs/benchmarks/2026-11-18-rescue-phase2-r2-acceptance.md)。
 
 自动测试不能替代第二台 Windows 电脑与真实 U 盘拔插验证。项目仍处于个人/研究产品阶段，欢迎以可复现任务、日志和截图提交 Issue。
 

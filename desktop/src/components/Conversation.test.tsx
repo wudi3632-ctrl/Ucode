@@ -726,6 +726,30 @@ describe("conversation timeline projection", () => {
     expect(screen.queryByRole("button", { name: "批准并打开 UAC" })).not.toBeInTheDocument();
   });
 
+  it("shows the allow-listed W32Time repair boundary and second-UAC rollback contract", async () => {
+    const proposal = {
+      schemaVersion: 1, id: "repair-service", ticketId: ticket.id, operationId: "system.service.start", operationVersion: 1, risk: "r3",
+      target: "SCM\\W32Time", normalizedArguments: { after: { name: "W32Time", status: "Running", dependencyName: "RpcSs", dependencyRunning: true }, service: "W32Time", dependency: "RpcSs" }, evidenceIds: ["evidence-service"],
+      prerequisites: ["W32Time 为 Stopped", "RpcSs 为 Running"], snapshotPlan: "保存服务状态", expectedPostcondition: "W32Time 为 Running", verificationProbe: "helper 与宿主双重重读 W32Time", rollbackContract: "第二次 UAC 后恢复到 Stopped",
+      beforeDigest: "4".repeat(64), expectedAfterDigest: "5".repeat(64), nonce: "nonce-service", createdAt: "2026-11-10T00:00:00Z", expiresAt: "2026-11-10T00:10:00Z", status: "awaiting_approval", proposalDigest: "6".repeat(64),
+    };
+    const onResolve = vi.fn(async () => undefined);
+    render(<Conversation
+      projectId="project-1" ticket={ticket} events={[event(1, "rescue.repair.proposed", { proposal })]} effect={null} receipt={null} appliedEffect={null} busy={false}
+      onSubmit={vi.fn()} onCancel={vi.fn()} onRetry={vi.fn()} onExport={vi.fn()} onBranch={vi.fn()} onApprove={vi.fn()} onReject={vi.fn()} onRollback={vi.fn()}
+      onResolveRescueRepair={onResolve} onRollbackRescueRepair={vi.fn()} onExportReceipt={vi.fn()} hasProject onOpenProject={vi.fn()} error={null}
+      sidebarOpen inspectorOpen={false} onToggleSidebar={vi.fn()} onToggleInspector={vi.fn()} providerStatus="ready" modelProvider="bundled" providerModel="" modelPerformance={null}
+    />);
+    const card = screen.getByRole("article", { name: "Rescue 可逆修复" });
+    expect(card).toHaveTextContent("启动 Windows Time 服务");
+    expect(card).toHaveTextContent("W32Time");
+    expect(card).toHaveTextContent("RpcSs");
+    expect(card).toHaveTextContent("不修改启动类型");
+    expect(card).toHaveTextContent("第二次 UAC");
+    fireEvent.click(within(card).getByRole("button", { name: "批准并打开 UAC" }));
+    await waitFor(() => expect(onResolve).toHaveBeenCalledWith("repair-service", true));
+  });
+
   it("shows a bounded R2 manual-proxy repair without exposing a proxy endpoint", async () => {
     const proposal = {
       schemaVersion: 1, id: "repair-proxy", ticketId: ticket.id, operationId: "network.user_proxy.disable_manual", operationVersion: 1, risk: "r2",

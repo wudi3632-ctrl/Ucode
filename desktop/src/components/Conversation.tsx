@@ -737,7 +737,8 @@ function rescueRepairFrom(events: RuntimeEvent[]): VisibleRescueRepair | null {
   const proposal = value as unknown as RescueRepairProposal;
   const knownOperation = (proposal.risk === "r2" && proposal.operationId === "system.user_path.normalize")
     || (proposal.risk === "r2" && proposal.operationId === "network.user_proxy.disable_manual")
-    || (proposal.risk === "r3" && proposal.operationId === "system.machine_path.normalize");
+    || (proposal.risk === "r3" && proposal.operationId === "system.machine_path.normalize")
+    || (proposal.risk === "r3" && proposal.operationId === "system.service.start");
   if (proposal.schemaVersion !== 1 || !knownOperation || typeof proposal.id !== "string") return null;
   const result = [...events].reverse().find((event) => String(event.payload.proposalId ?? "") === proposal.id && event.eventType.startsWith("rescue.repair.") && event.eventType !== "rescue.repair.proposed");
   const recordValue = result?.payload.record;
@@ -750,12 +751,13 @@ function RescueRepairCard({ value, busy, onResolve, onRollback }: { value: Visib
   const proposal = value.proposal;
   const elevated = proposal.risk === "r3";
   const proxyRepair = proposal.operationId === "network.user_proxy.disable_manual";
+  const serviceRepair = proposal.operationId === "system.service.start";
   const status = proposal.status;
   const removed = Array.isArray(proposal.normalizedArguments.removedEntries) ? proposal.normalizedArguments.removedEntries : [];
   const statusCopy = status === "awaiting_approval" ? "等待批准" : status === "elevation_requested" ? "等待 Windows UAC" : status === "uac_cancelled" ? "UAC 未批准，未修改" : status === "verified" ? "写入已验证" : status === "rolled_back" ? "已精确回滚" : status === "repaired_unverified" ? "写入状态未完全验证" : status === "rollback_failed" ? "回滚失败" : "已安全停止";
   return <article className={`rescue-repair-card ${status}`} aria-label="Rescue 可逆修复">
-    <header><span>{elevated ? "R3" : "R2"}</span><div><b>{elevated ? "规范化机器 PATH" : proxyRepair ? "禁用当前用户手动代理" : "规范化当前用户 PATH"}</b><small>{statusCopy} · {elevated ? "需要 Windows UAC 管理员确认" : "不需要管理员权限"}</small></div></header>
-    <p>{value.record?.detail ?? (elevated ? "检测到机器 PATH 中可以确定清理的问题。模型无权提权；批准后只启动一次短生命周期白名单 helper。" : proxyRepair ? "真实代理探针观察到当前用户手动代理已启用。批准后只关闭 ProxyEnable，不删除代理服务器地址、绕过列表或 PAC 配置。" : "检测到可以确定清理的空项、重复项或不存在目录。模型无权执行；只有本地审批执行器能写入。")}</p>
+    <header><span>{elevated ? "R3" : "R2"}</span><div><b>{serviceRepair ? "启动 Windows Time 服务" : elevated ? "规范化机器 PATH" : proxyRepair ? "禁用当前用户手动代理" : "规范化当前用户 PATH"}</b><small>{statusCopy} · {elevated ? "需要 Windows UAC 管理员确认" : "不需要管理员权限"}</small></div></header>
+    <p>{value.record?.detail ?? (serviceRepair ? "真实服务证据显示 W32Time 已停止且固定依赖 RpcSs 正在运行。批准后白名单 helper 只启动 W32Time，不修改启动类型；回滚需要第二次 UAC。" : elevated ? "检测到机器 PATH 中可以确定清理的问题。模型无权提权；批准后只启动一次短生命周期白名单 helper。" : proxyRepair ? "真实代理探针观察到当前用户手动代理已启用。批准后只关闭 ProxyEnable，不删除代理服务器地址、绕过列表或 PAC 配置。" : "检测到可以确定清理的空项、重复项或不存在目录。模型无权执行；只有本地审批执行器能写入。")}</p>
     <dl><div><dt>目标</dt><dd><code>{proposal.target}</code></dd></div><div><dt>验证</dt><dd>{proposal.verificationProbe}</dd></div><div><dt>回滚</dt><dd>{proposal.rollbackContract}</dd></div></dl>
     {removed.length > 0 && <details><summary>查看 {removed.length} 个拟清理项</summary><ul>{removed.slice(0, 12).map((item, index) => <li key={`${item}-${index}`}><code>{item}</code></li>)}</ul></details>}
     <div className="rescue-repair-digests"><span>before <code>{proposal.beforeDigest.slice(0, 10)}</code></span><span>after <code>{proposal.expectedAfterDigest.slice(0, 10)}</code></span></div>

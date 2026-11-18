@@ -1,7 +1,8 @@
 use crate::rescue_elevated::{
     DisabledElevatedRepairExecutor, ElevatedAction, ElevatedRepairExecutor,
-    WindowsElevatedRepairExecutor, MACHINE_PATH_OPERATION, MACHINE_PATH_OPERATION_VERSION,
-    MACHINE_PATH_TARGET,
+    WindowsElevatedRepairExecutor, ALLOWED_SERVICE_DEPENDENCY, ALLOWED_SERVICE_NAME,
+    MACHINE_PATH_OPERATION, MACHINE_PATH_OPERATION_VERSION, MACHINE_PATH_TARGET,
+    SERVICE_START_OPERATION, SERVICE_START_OPERATION_VERSION, SERVICE_START_TARGET,
 };
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -32,7 +33,7 @@ pub struct RepairOperationDefinition {
 }
 
 pub fn operation_registry() -> &'static [RepairOperationDefinition] {
-    static OPERATIONS: [RepairOperationDefinition; 5] = [
+    static OPERATIONS: [RepairOperationDefinition; 6] = [
         RepairOperationDefinition {
             id: USER_PATH_OPERATION,
             version: 1,
@@ -64,6 +65,13 @@ pub fn operation_registry() -> &'static [RepairOperationDefinition] {
         RepairOperationDefinition {
             id: MACHINE_PATH_OPERATION,
             version: MACHINE_PATH_OPERATION_VERSION,
+            risk: "r3",
+            authority: "elevated_helper",
+            enabled: true,
+        },
+        RepairOperationDefinition {
+            id: SERVICE_START_OPERATION,
+            version: SERVICE_START_OPERATION_VERSION,
             risk: "r3",
             authority: "elevated_helper",
             enabled: true,
@@ -162,6 +170,15 @@ pub struct UserPathState {
 pub struct UserProxyState {
     pub proxy_enable_present: bool,
     pub proxy_enable: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceRepairState {
+    pub name: String,
+    pub status: String,
+    pub dependency_name: String,
+    pub dependency_running: bool,
 }
 
 pub struct WindowsRepairHost;
@@ -407,6 +424,87 @@ impl<H: RepairHost, E: ElevatedRepairExecutor> RepairService<H, E> {
         Ok(Some(proposal))
     }
 
+    pub fn propose_service_start(
+        &self,
+        ticket_id: &str,
+        evidence_ids: Vec<String>,
+        name: &str,
+    ) -> Result<Option<RepairProposal>, String> {
+        if name != ALLOWED_SERVICE_NAME {
+            return Err("仅允许为 Windows Time 服务 W32Time 生成 R3 启动方案".into());
+        }
+        if evidence_ids.is_empty() {
+            return Err("缺少 system.service.query 真实证据，不能生成服务修复方案".into());
+        }
+        let before = self.elevated.read_service_state(name)?;
+        if before.name != ALLOWED_SERVICE_NAME
+            || before.dependency_name != ALLOWED_SERVICE_DEPENDENCY
+        {
+            return Err("服务状态不属于固定允许列表目标".into());
+        }
+        if before.status == "Running" {
+            return Ok(None);
+        }
+        if before.status != "Stopped" {
+            return Err(format!(
+                "W32Time 当前状态为 {}，只允许从 Stopped 启动",
+                before.status
+            ));
+        }
+        if !before.dependency_running {
+            return Err("固定依赖 RpcSs 未运行，拒绝启动 W32Time".into());
+        }
+        let after = ServiceRepairState {
+            status: "Running".into(),
+            ..before.clone()
+        };
+        let now = Utc::now();
+        let mut proposal = RepairProposal {
+            schema_version: REPAIR_SCHEMA_VERSION,
+            id: format!("repair-{}", Uuid::new_v4()),
+            ticket_id: ticket_id.into(),
+            operation_id: SERVICE_START_OPERATION.into(),
+            operation_version: SERVICE_START_OPERATION_VERSION,
+            risk: "r3".into(),
+            target: SERVICE_START_TARGET.into(),
+            normalized_arguments: json!({
+                "after": after,
+                "service": ALLOWED_SERVICE_NAME,
+                "dependency": ALLOWED_SERVICE_DEPENDENCY,
+                "changeSummary": "仅将 Windows Time 服务 W32Time 从 Stopped 启动到 Running；不修改启动类型"
+            }),
+            evidence_ids,
+            prerequisites: vec![
+                "system.service.query 证据显示 W32Time 为 Stopped".into(),
+                "固定依赖 RpcSs 为 Running".into(),
+                "用户在 Windows 安全桌面明确批准本次管理员操作".into(),
+            ],
+            snapshot_plan: "保存 W32Time 与 RpcSs 的精确状态及 SHA-256；helper 变更前再次核对"
+                .into(),
+            expected_postcondition: "W32Time 为 Running；服务启动类型和其他服务不发生变化".into(),
+            verification_probe: "管理员 helper 启动后重读 W32Time，未提权宿主再独立重读并核对摘要"
+                .into(),
+            rollback_contract:
+                "回滚需要再次确认 UAC；仅当 W32Time 仍为本次 Running 摘要时停止到原始 Stopped 状态"
+                    .into(),
+            before_digest: digest_json(&before),
+            expected_after_digest: digest_json(&after),
+            nonce: Uuid::new_v4().to_string(),
+            created_at: now,
+            expires_at: now + Duration::minutes(10),
+            status: RepairStatus::AwaitingApproval,
+            proposal_digest: String::new(),
+        };
+        proposal.proposal_digest = proposal_digest(&proposal);
+        self.save_record(&RepairRecord {
+            proposal: proposal.clone(),
+            snapshot: None,
+            detail: "等待用户审批；应用时 Windows 将显示 UAC，只启动 W32Time".into(),
+            updated_at: now,
+        })?;
+        Ok(Some(proposal))
+    }
+
     pub fn propose_user_proxy_disable(
         &self,
         ticket_id: &str,
@@ -480,6 +578,9 @@ impl<H: RepairHost, E: ElevatedRepairExecutor> RepairService<H, E> {
     pub fn apply(&self, proposal_id: &str, ticket_id: &str) -> Result<RepairRecord, String> {
         let mut record = self.load_record(proposal_id)?;
         self.validate_for_apply(&record.proposal, ticket_id)?;
+        if record.proposal.operation_id == SERVICE_START_OPERATION {
+            return self.apply_service_start(record);
+        }
         if record.proposal.operation_id == MACHINE_PATH_OPERATION {
             return self.apply_machine_path(record);
         }
@@ -735,6 +836,143 @@ impl<H: RepairHost, E: ElevatedRepairExecutor> RepairService<H, E> {
         Ok(record)
     }
 
+    fn apply_service_start(&self, mut record: RepairRecord) -> Result<RepairRecord, String> {
+        let before = self.elevated.read_service_state(ALLOWED_SERVICE_NAME)?;
+        if digest_json(&before) != record.proposal.before_digest {
+            return self.safe_stop(record, "审批前 W32Time 状态已经变化，已拒绝提权启动");
+        }
+        let after: ServiceRepairState = serde_json::from_value(
+            record
+                .proposal
+                .normalized_arguments
+                .get("after")
+                .cloned()
+                .ok_or("R3 服务修复参数缺少 after")?,
+        )
+        .map_err(|_| "R3 服务修复参数格式无效".to_string())?;
+        if digest_json(&after) != record.proposal.expected_after_digest
+            || before.name != ALLOWED_SERVICE_NAME
+            || before.status != "Stopped"
+            || after.name != ALLOWED_SERVICE_NAME
+            || after.status != "Running"
+            || before.dependency_name != ALLOWED_SERVICE_DEPENDENCY
+            || after.dependency_name != ALLOWED_SERVICE_DEPENDENCY
+            || !before.dependency_running
+            || !after.dependency_running
+        {
+            return self.safe_stop(record, "R3 服务修复目标、依赖或摘要无效，已拒绝提权");
+        }
+
+        record.proposal.status = RepairStatus::ElevationRequested;
+        record.detail = "等待 Windows UAC；批准后短生命周期 helper 只会启动 W32Time".into();
+        record.updated_at = Utc::now();
+        let mut snapshot = RepairSnapshot {
+            schema_version: REPAIR_SCHEMA_VERSION,
+            proposal_id: record.proposal.id.clone(),
+            operation_id: record.proposal.operation_id.clone(),
+            operation_version: record.proposal.operation_version,
+            target: record.proposal.target.clone(),
+            before_state: serde_json::to_value(&before).map_err(|error| error.to_string())?,
+            before_digest: digest_json(&before),
+            after_state: serde_json::to_value(&after).map_err(|error| error.to_string())?,
+            after_digest: digest_json(&after),
+            snapshot_digest: String::new(),
+            applied_at: Utc::now(),
+            verified_at: None,
+        };
+        snapshot.snapshot_digest = snapshot_digest(&snapshot);
+        record.snapshot = Some(snapshot.clone());
+        self.save_record(&record)?;
+
+        let observed = match self.elevated.mutate_service_state(
+            &self.root,
+            &record.proposal,
+            &before,
+            &after,
+            ElevatedAction::Apply,
+        ) {
+            Ok(value) => value,
+            Err(error) => return self.reconcile_service_failure(record, &before, &after, &error),
+        };
+        record.proposal.status = RepairStatus::RepairedUnverified;
+        record.detail = "管理员 helper 已返回，未提权宿主正在独立重读 W32Time".into();
+        record.updated_at = Utc::now();
+        self.save_record(&record)?;
+        let independently_observed = match self.elevated.read_service_state(ALLOWED_SERVICE_NAME) {
+            Ok(value) => value,
+            Err(error) => {
+                record.detail = format!("helper 已返回目标状态，但未提权宿主无法重读 W32Time：{error}；未声明修复完成，可按快照回滚");
+                record.updated_at = Utc::now();
+                self.save_record(&record)?;
+                return Ok(record);
+            }
+        };
+        if digest_json(&observed) != snapshot.after_digest
+            || digest_json(&independently_observed) != snapshot.after_digest
+        {
+            record.detail = "W32Time 启动后双重重读摘要不一致；不能声明完成".into();
+            record.updated_at = Utc::now();
+            self.save_record(&record)?;
+            return Ok(record);
+        }
+        if let Some(value) = record.snapshot.as_mut() {
+            value.verified_at = Some(Utc::now());
+            value.snapshot_digest = snapshot_digest(value);
+        }
+        record.proposal.status = RepairStatus::Verified;
+        record.detail = "W32Time 已由允许列表 helper 启动，并通过 helper 与未提权宿主双重重读验证；启动类型未修改".into();
+        record.updated_at = Utc::now();
+        self.save_record(&record)?;
+        Ok(record)
+    }
+
+    fn reconcile_service_failure(
+        &self,
+        mut record: RepairRecord,
+        before: &ServiceRepairState,
+        after: &ServiceRepairState,
+        helper_error: &str,
+    ) -> Result<RepairRecord, String> {
+        match self.elevated.read_service_state(ALLOWED_SERVICE_NAME) {
+            Ok(current) if digest_json(&current) == digest_json(before) => {
+                if helper_error.starts_with("ucode_uac_cancelled:") {
+                    record.proposal.status = RepairStatus::UacCancelled;
+                    record.detail =
+                        "Windows UAC 未获批准；W32Time 仍为审批前状态，没有执行修复".into();
+                    record.updated_at = Utc::now();
+                    self.save_record(&record)?;
+                    Ok(record)
+                } else {
+                    self.safe_stop(
+                        record,
+                        &format!("R3 helper 未启动 W32Time，服务仍为原摘要：{helper_error}"),
+                    )
+                }
+            }
+            Ok(current) if digest_json(&current) == digest_json(after) => {
+                record.proposal.status = RepairStatus::RepairedUnverified;
+                record.detail = format!("helper 响应未完成，但未提权复核发现 W32Time 已为 Running：{helper_error}；未声明双重验证完成，可安全回滚");
+                record.updated_at = Utc::now();
+                self.save_record(&record)?;
+                Ok(record)
+            }
+            Ok(_) => {
+                record.proposal.status = RepairStatus::RepairedUnverified;
+                record.detail = format!("helper 响应未完成，且 W32Time 与审批前后摘要均不一致：{helper_error}；已停止自动操作，请人工检查");
+                record.updated_at = Utc::now();
+                self.save_record(&record)?;
+                Ok(record)
+            }
+            Err(read_error) => {
+                record.proposal.status = RepairStatus::RepairedUnverified;
+                record.detail = format!("helper 响应未完成且无法复核 W32Time：{helper_error}；复核错误：{read_error}；未声明系统未修改");
+                record.updated_at = Utc::now();
+                self.save_record(&record)?;
+                Ok(record)
+            }
+        }
+    }
+
     fn reconcile_machine_path_failure(
         &self,
         mut record: RepairRecord,
@@ -799,6 +1037,9 @@ impl<H: RepairHost, E: ElevatedRepairExecutor> RepairService<H, E> {
         }
         if record.proposal.operation_id == MACHINE_PATH_OPERATION {
             return self.rollback_machine_path(record);
+        }
+        if record.proposal.operation_id == SERVICE_START_OPERATION {
+            return self.rollback_service_start(record);
         }
         if record.proposal.operation_id == USER_PROXY_DISABLE_OPERATION {
             return self.rollback_user_proxy(record);
@@ -911,6 +1152,55 @@ impl<H: RepairHost, E: ElevatedRepairExecutor> RepairService<H, E> {
         Ok(record)
     }
 
+    fn rollback_service_start(&self, mut record: RepairRecord) -> Result<RepairRecord, String> {
+        let snapshot = record.snapshot.clone().ok_or("R3 服务修复快照不存在")?;
+        if snapshot.snapshot_digest != snapshot_digest(&snapshot) {
+            return Err("R3 服务修复快照摘要无效，已拒绝回滚".into());
+        }
+        let current = self.elevated.read_service_state(ALLOWED_SERVICE_NAME)?;
+        if digest_json(&current) != snapshot.after_digest {
+            return self.safe_stop(record, "W32Time 在修复后又发生变化，已拒绝覆盖后续更改");
+        }
+        let before: ServiceRepairState = serde_json::from_value(snapshot.before_state.clone())
+            .map_err(|_| "R3 服务快照 before state 无效".to_string())?;
+        if before.name != ALLOWED_SERVICE_NAME
+            || before.status != "Stopped"
+            || before.dependency_name != ALLOWED_SERVICE_DEPENDENCY
+            || !before.dependency_running
+        {
+            return Err("R3 服务快照不符合固定回滚契约".into());
+        }
+        let observed = match self.elevated.mutate_service_state(
+            &self.root,
+            &record.proposal,
+            &current,
+            &before,
+            ElevatedAction::Rollback,
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                record.proposal.status = RepairStatus::RollbackFailed;
+                record.detail = format!("R3 service helper 回滚失败：{error}");
+                record.updated_at = Utc::now();
+                self.save_record(&record)?;
+                return Ok(record);
+            }
+        };
+        let independently_observed = self.elevated.read_service_state(ALLOWED_SERVICE_NAME)?;
+        if digest_json(&observed) != snapshot.before_digest
+            || digest_json(&independently_observed) != snapshot.before_digest
+        {
+            record.proposal.status = RepairStatus::RollbackFailed;
+            record.detail = "W32Time 回滚后双重重读摘要与原始快照不一致".into();
+        } else {
+            record.proposal.status = RepairStatus::RolledBack;
+            record.detail = "W32Time 已通过第二次 UAC 恢复为审批前 Stopped 状态".into();
+        }
+        record.updated_at = Utc::now();
+        self.save_record(&record)?;
+        Ok(record)
+    }
+
     fn safe_stop(&self, mut record: RepairRecord, detail: &str) -> Result<RepairRecord, String> {
         record.proposal.status = RepairStatus::SafeStop;
         record.detail = detail.into();
@@ -938,6 +1228,9 @@ impl<H: RepairHost, E: ElevatedRepairExecutor> RepairService<H, E> {
             }
             MACHINE_PATH_OPERATION => {
                 proposal.risk == "r3" && proposal.target == MACHINE_PATH_TARGET
+            }
+            SERVICE_START_OPERATION => {
+                proposal.risk == "r3" && proposal.target == SERVICE_START_TARGET
             }
             _ => false,
         };
@@ -1142,7 +1435,9 @@ mod tests {
 
     struct FakeElevatedExecutor {
         state: Mutex<UserPathState>,
+        service_state: Mutex<ServiceRepairState>,
         calls: Mutex<Vec<ElevatedAction>>,
+        service_calls: Mutex<Vec<ElevatedAction>>,
         fail_before_write: Mutex<Option<String>>,
         fail_after_write: Mutex<bool>,
     }
@@ -1155,7 +1450,14 @@ mod tests {
                     value: value.into(),
                     expandable: true,
                 }),
+                service_state: Mutex::new(ServiceRepairState {
+                    name: ALLOWED_SERVICE_NAME.into(),
+                    status: "Stopped".into(),
+                    dependency_name: ALLOWED_SERVICE_DEPENDENCY.into(),
+                    dependency_running: true,
+                }),
                 calls: Mutex::new(Vec::new()),
+                service_calls: Mutex::new(Vec::new()),
                 fail_before_write: Mutex::new(None),
                 fail_after_write: Mutex::new(false),
             }
@@ -1185,6 +1487,38 @@ mod tests {
             }
             *state = desired.clone();
             self.calls.lock().unwrap().push(action);
+            if *self.fail_after_write.lock().unwrap() {
+                *self.fail_after_write.lock().unwrap() = false;
+                return Err("injected response loss".into());
+            }
+            Ok(state.clone())
+        }
+
+        fn read_service_state(&self, name: &str) -> Result<ServiceRepairState, String> {
+            if name != ALLOWED_SERVICE_NAME {
+                return Err("not allow-listed".into());
+            }
+            Ok(self.service_state.lock().unwrap().clone())
+        }
+
+        fn mutate_service_state(
+            &self,
+            _root: &Path,
+            proposal: &RepairProposal,
+            expected_current: &ServiceRepairState,
+            desired: &ServiceRepairState,
+            action: ElevatedAction,
+        ) -> Result<ServiceRepairState, String> {
+            assert_eq!(proposal.operation_id, SERVICE_START_OPERATION);
+            let mut state = self.service_state.lock().unwrap();
+            if *state != *expected_current {
+                return Err("stale".into());
+            }
+            if let Some(error) = self.fail_before_write.lock().unwrap().take() {
+                return Err(error);
+            }
+            *state = desired.clone();
+            self.service_calls.lock().unwrap().push(action);
             if *self.fail_after_write.lock().unwrap() {
                 *self.fail_after_write.lock().unwrap() = false;
                 return Err("injected response loss".into());
@@ -1355,6 +1689,128 @@ mod tests {
     }
 
     #[test]
+    fn w32time_service_repair_is_evidence_bound_verified_and_exactly_rollbackable() {
+        let dir = TempDir::new().unwrap();
+        let service = RepairService::with_hosts(
+            dir.path().to_path_buf(),
+            FakeHost::new(r"C:\user"),
+            FakeElevatedExecutor::new(r"C:\Windows"),
+        )
+        .unwrap();
+        let proposal = service
+            .propose_service_start(
+                "ticket-service",
+                vec!["evidence-service-query".into()],
+                ALLOWED_SERVICE_NAME,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(proposal.operation_id, SERVICE_START_OPERATION);
+        assert_eq!(proposal.target, SERVICE_START_TARGET);
+        assert_eq!(proposal.evidence_ids, vec!["evidence-service-query"]);
+        assert_eq!(
+            service
+                .elevated
+                .read_service_state(ALLOWED_SERVICE_NAME)
+                .unwrap()
+                .status,
+            "Stopped"
+        );
+
+        let applied = service.apply(&proposal.id, "ticket-service").unwrap();
+        assert_eq!(applied.proposal.status, RepairStatus::Verified);
+        assert_eq!(
+            service
+                .elevated
+                .read_service_state(ALLOWED_SERVICE_NAME)
+                .unwrap()
+                .status,
+            "Running"
+        );
+        assert_eq!(
+            service.elevated.service_calls.lock().unwrap().as_slice(),
+            &[ElevatedAction::Apply]
+        );
+
+        let rolled_back = service.rollback(&proposal.id, "ticket-service").unwrap();
+        assert_eq!(rolled_back.proposal.status, RepairStatus::RolledBack);
+        assert_eq!(
+            service
+                .elevated
+                .read_service_state(ALLOWED_SERVICE_NAME)
+                .unwrap()
+                .status,
+            "Stopped"
+        );
+        assert_eq!(
+            service.elevated.service_calls.lock().unwrap().as_slice(),
+            &[ElevatedAction::Apply, ElevatedAction::Rollback]
+        );
+    }
+
+    #[test]
+    fn service_proposal_rejects_unknown_missing_evidence_pending_and_dependency_faults() {
+        let dir = TempDir::new().unwrap();
+        let service = RepairService::with_hosts(
+            dir.path().to_path_buf(),
+            FakeHost::new(r"C:\user"),
+            FakeElevatedExecutor::new(r"C:\Windows"),
+        )
+        .unwrap();
+        assert!(service
+            .propose_service_start("ticket", vec!["evidence".into()], "Spooler")
+            .is_err());
+        assert!(service
+            .propose_service_start("ticket", vec![], ALLOWED_SERVICE_NAME)
+            .is_err());
+        service.elevated.service_state.lock().unwrap().status = "StartPending".into();
+        assert!(service
+            .propose_service_start("ticket", vec!["evidence".into()], ALLOWED_SERVICE_NAME)
+            .is_err());
+        {
+            let mut state = service.elevated.service_state.lock().unwrap();
+            state.status = "Stopped".into();
+            state.dependency_running = false;
+        }
+        assert!(service
+            .propose_service_start("ticket", vec!["evidence".into()], ALLOWED_SERVICE_NAME)
+            .is_err());
+    }
+
+    #[test]
+    fn cancelled_service_uac_is_distinct_and_leaves_service_stopped() {
+        let dir = TempDir::new().unwrap();
+        let service = RepairService::with_hosts(
+            dir.path().to_path_buf(),
+            FakeHost::new(r"C:\user"),
+            FakeElevatedExecutor::new(r"C:\Windows"),
+        )
+        .unwrap();
+        let proposal = service
+            .propose_service_start(
+                "ticket-service-cancel",
+                vec!["evidence".into()],
+                ALLOWED_SERVICE_NAME,
+            )
+            .unwrap()
+            .unwrap();
+        *service.elevated.fail_before_write.lock().unwrap() =
+            Some("ucode_uac_cancelled: test cancellation".into());
+        let record = service
+            .apply(&proposal.id, "ticket-service-cancel")
+            .unwrap();
+        assert_eq!(record.proposal.status, RepairStatus::UacCancelled);
+        assert_eq!(
+            service
+                .elevated
+                .read_service_state(ALLOWED_SERVICE_NAME)
+                .unwrap()
+                .status,
+            "Stopped"
+        );
+    }
+
+    #[test]
     fn replay_and_wrong_ticket_are_rejected() {
         let (_dir, service) = service(r"C:\Windows;C:\Windows");
         let proposal = service
@@ -1487,7 +1943,7 @@ mod tests {
             .iter()
             .filter(|operation| operation.enabled)
             .collect::<Vec<_>>();
-        assert_eq!(enabled.len(), 3);
+        assert_eq!(enabled.len(), 4);
         assert_eq!(
             enabled
                 .iter()
@@ -1508,6 +1964,11 @@ mod tests {
         assert!(operation_registry()
             .iter()
             .any(|operation| operation.id == MACHINE_PATH_OPERATION
+                && operation.risk == "r3"
+                && operation.enabled));
+        assert!(operation_registry()
+            .iter()
+            .any(|operation| operation.id == SERVICE_START_OPERATION
                 && operation.risk == "r3"
                 && operation.enabled));
         assert!(operation_registry()

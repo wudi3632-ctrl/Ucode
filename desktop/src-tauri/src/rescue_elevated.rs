@@ -1,4 +1,4 @@
-use crate::rescue_repair::{RepairProposal, UserPathState};
+use crate::rescue_repair::{RepairProposal, ServiceRepairState, UserPathState};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -16,7 +16,13 @@ pub const MACHINE_PATH_TARGET: &str =
     r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment\Path";
 const CREDENTIAL_SERVICE: &str = "ucode-rescue-elevated-v1";
 const HELPER_ARGUMENT: &str = "--ucode-rescue-elevated-helper";
+const SERVICE_HELPER_ARGUMENT: &str = "--ucode-rescue-service-helper";
 const RESPONSE_WAIT: StdDuration = StdDuration::from_secs(120);
+pub const SERVICE_START_OPERATION: &str = "system.service.start";
+pub const SERVICE_START_OPERATION_VERSION: u16 = 1;
+pub const ALLOWED_SERVICE_NAME: &str = "W32Time";
+pub const ALLOWED_SERVICE_DEPENDENCY: &str = "RpcSs";
+pub const SERVICE_START_TARGET: &str = r"SCM\W32Time";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -72,6 +78,45 @@ pub struct ElevatedResponse {
     pub hmac: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ElevatedServiceRequest {
+    pub schema_version: u16,
+    pub request_id: String,
+    pub ticket_id: String,
+    pub proposal_id: String,
+    pub proposal_digest: String,
+    pub operation_id: String,
+    pub operation_version: u16,
+    pub action: ElevatedAction,
+    pub target: String,
+    pub expected_current: ServiceRepairState,
+    pub expected_current_digest: String,
+    pub desired: ServiceRepairState,
+    pub desired_digest: String,
+    pub nonce: String,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub hmac: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ElevatedServiceResponse {
+    pub schema_version: u16,
+    pub request_id: String,
+    pub ticket_id: String,
+    pub proposal_id: String,
+    pub proposal_digest: String,
+    pub nonce: String,
+    pub status: ElevatedResponseStatus,
+    pub detail: String,
+    pub observed: Option<ServiceRepairState>,
+    pub observed_digest: Option<String>,
+    pub completed_at: DateTime<Utc>,
+    pub hmac: String,
+}
+
 pub trait MachinePathHost {
     fn read_machine_path(&self) -> Result<UserPathState, String>;
     fn write_machine_path(&self, state: &UserPathState) -> Result<(), String>;
@@ -87,6 +132,21 @@ pub trait ElevatedRepairExecutor: Send + Sync {
         desired: &UserPathState,
         action: ElevatedAction,
     ) -> Result<UserPathState, String>;
+
+    fn read_service_state(&self, _name: &str) -> Result<ServiceRepairState, String> {
+        Err("R3 service helper is not configured for this host".into())
+    }
+
+    fn mutate_service_state(
+        &self,
+        _root: &Path,
+        _proposal: &RepairProposal,
+        _expected_current: &ServiceRepairState,
+        _desired: &ServiceRepairState,
+        _action: ElevatedAction,
+    ) -> Result<ServiceRepairState, String> {
+        Err("R3 service helper is not configured for this host".into())
+    }
 }
 
 pub struct WindowsElevatedRepairExecutor;
@@ -105,6 +165,21 @@ impl ElevatedRepairExecutor for WindowsElevatedRepairExecutor {
         action: ElevatedAction,
     ) -> Result<UserPathState, String> {
         execute_via_uac(root, proposal, expected_current, desired, action)
+    }
+
+    fn read_service_state(&self, name: &str) -> Result<ServiceRepairState, String> {
+        WindowsServiceControlHost.read_service_state(name)
+    }
+
+    fn mutate_service_state(
+        &self,
+        root: &Path,
+        proposal: &RepairProposal,
+        expected_current: &ServiceRepairState,
+        desired: &ServiceRepairState,
+        action: ElevatedAction,
+    ) -> Result<ServiceRepairState, String> {
+        execute_service_via_uac(root, proposal, expected_current, desired, action)
     }
 }
 
@@ -176,6 +251,244 @@ impl MachinePathHost for WindowsMachinePathHost {
     }
 }
 
+pub trait ServiceControlHost {
+    fn read_service_state(&self, name: &str) -> Result<ServiceRepairState, String>;
+    fn write_service_state(&self, state: &ServiceRepairState) -> Result<(), String>;
+}
+
+pub struct WindowsServiceControlHost;
+
+#[cfg(target_os = "windows")]
+impl ServiceControlHost for WindowsServiceControlHost {
+    fn read_service_state(&self, name: &str) -> Result<ServiceRepairState, String> {
+        if name != ALLOWED_SERVICE_NAME {
+            return Err("R3 service helper 拒绝未列入允许列表的服务".into());
+        }
+        Ok(ServiceRepairState {
+            name: name.into(),
+            status: service_control::query_status(name)?,
+            dependency_name: ALLOWED_SERVICE_DEPENDENCY.into(),
+            dependency_running: service_control::query_status(ALLOWED_SERVICE_DEPENDENCY)?
+                == "Running",
+        })
+    }
+
+    fn write_service_state(&self, state: &ServiceRepairState) -> Result<(), String> {
+        if state.name != ALLOWED_SERVICE_NAME
+            || state.dependency_name != ALLOWED_SERVICE_DEPENDENCY
+            || !state.dependency_running
+        {
+            return Err("R3 service helper 的服务或依赖状态不在允许范围".into());
+        }
+        match state.status.as_str() {
+            "Running" => service_control::set_running(&state.name, true),
+            "Stopped" => service_control::set_running(&state.name, false),
+            _ => Err("R3 service helper 只允许 Running 或 Stopped 目标状态".into()),
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+impl ServiceControlHost for WindowsServiceControlHost {
+    fn read_service_state(&self, _name: &str) -> Result<ServiceRepairState, String> {
+        Err("Windows 服务控制只支持 Windows".into())
+    }
+
+    fn write_service_state(&self, _state: &ServiceRepairState) -> Result<(), String> {
+        Err("Windows 服务控制只支持 Windows".into())
+    }
+}
+
+#[cfg(target_os = "windows")]
+mod service_control {
+    use super::*;
+    use std::iter::once;
+    use std::os::windows::ffi::OsStrExt;
+
+    const SC_MANAGER_CONNECT: u32 = 0x0001;
+    const SERVICE_QUERY_STATUS: u32 = 0x0004;
+    const SERVICE_START: u32 = 0x0010;
+    const SERVICE_STOP: u32 = 0x0020;
+    const SERVICE_CONTROL_STOP: u32 = 0x0000_0001;
+    const SC_STATUS_PROCESS_INFO: u32 = 0;
+    const SERVICE_STOPPED: u32 = 0x0000_0001;
+    const SERVICE_START_PENDING: u32 = 0x0000_0002;
+    const SERVICE_STOP_PENDING: u32 = 0x0000_0003;
+    const SERVICE_RUNNING: u32 = 0x0000_0004;
+    const SERVICE_CONTINUE_PENDING: u32 = 0x0000_0005;
+    const SERVICE_PAUSE_PENDING: u32 = 0x0000_0006;
+    const SERVICE_PAUSED: u32 = 0x0000_0007;
+
+    #[repr(C)]
+    struct ServiceStatusProcess {
+        service_type: u32,
+        current_state: u32,
+        controls_accepted: u32,
+        win32_exit_code: u32,
+        service_specific_exit_code: u32,
+        check_point: u32,
+        wait_hint: u32,
+        process_id: u32,
+        service_flags: u32,
+    }
+
+    #[repr(C)]
+    struct ServiceStatus {
+        service_type: u32,
+        current_state: u32,
+        controls_accepted: u32,
+        win32_exit_code: u32,
+        service_specific_exit_code: u32,
+        check_point: u32,
+        wait_hint: u32,
+    }
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn OpenSCManagerW(machine: *const u16, database: *const u16, access: u32) -> isize;
+        fn OpenServiceW(manager: isize, name: *const u16, access: u32) -> isize;
+        fn QueryServiceStatusEx(
+            service: isize,
+            info_level: u32,
+            buffer: *mut u8,
+            buffer_size: u32,
+            bytes_needed: *mut u32,
+        ) -> i32;
+        fn StartServiceW(service: isize, argc: u32, argv: *const *const u16) -> i32;
+        fn ControlService(service: isize, control: u32, status: *mut ServiceStatus) -> i32;
+        fn CloseServiceHandle(handle: isize) -> i32;
+    }
+
+    struct Handle(isize);
+    impl Drop for Handle {
+        fn drop(&mut self) {
+            if self.0 != 0 {
+                unsafe {
+                    let _ = CloseServiceHandle(self.0);
+                }
+            }
+        }
+    }
+
+    fn wide(value: &str) -> Vec<u16> {
+        std::ffi::OsStr::new(value)
+            .encode_wide()
+            .chain(once(0))
+            .collect()
+    }
+
+    fn open(name: &str, access: u32) -> Result<(Handle, Handle), String> {
+        let manager =
+            unsafe { OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT) };
+        if manager == 0 {
+            return Err(format!(
+                "无法打开 Windows Service Control Manager：{}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let manager = Handle(manager);
+        let service = unsafe { OpenServiceW(manager.0, wide(name).as_ptr(), access) };
+        if service == 0 {
+            return Err(format!(
+                "无法打开允许列表服务 {name}：{}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok((manager, Handle(service)))
+    }
+
+    fn query_handle(service: isize) -> Result<u32, String> {
+        let mut value = ServiceStatusProcess {
+            service_type: 0,
+            current_state: 0,
+            controls_accepted: 0,
+            win32_exit_code: 0,
+            service_specific_exit_code: 0,
+            check_point: 0,
+            wait_hint: 0,
+            process_id: 0,
+            service_flags: 0,
+        };
+        let mut needed = 0;
+        let result = unsafe {
+            QueryServiceStatusEx(
+                service,
+                SC_STATUS_PROCESS_INFO,
+                (&mut value as *mut ServiceStatusProcess).cast::<u8>(),
+                std::mem::size_of::<ServiceStatusProcess>() as u32,
+                &mut needed,
+            )
+        };
+        if result == 0 {
+            Err(format!(
+                "无法读取 Windows 服务状态：{}",
+                std::io::Error::last_os_error()
+            ))
+        } else {
+            Ok(value.current_state)
+        }
+    }
+
+    fn state_name(state: u32) -> &'static str {
+        match state {
+            SERVICE_STOPPED => "Stopped",
+            SERVICE_START_PENDING => "StartPending",
+            SERVICE_STOP_PENDING => "StopPending",
+            SERVICE_RUNNING => "Running",
+            SERVICE_CONTINUE_PENDING => "ContinuePending",
+            SERVICE_PAUSE_PENDING => "PausePending",
+            SERVICE_PAUSED => "Paused",
+            _ => "Unknown",
+        }
+    }
+
+    pub fn query_status(name: &str) -> Result<String, String> {
+        let (_manager, service) = open(name, SERVICE_QUERY_STATUS)?;
+        Ok(state_name(query_handle(service.0)?).into())
+    }
+
+    pub fn set_running(name: &str, running: bool) -> Result<(), String> {
+        let access = SERVICE_QUERY_STATUS | if running { SERVICE_START } else { SERVICE_STOP };
+        let (_manager, service) = open(name, access)?;
+        let desired = if running {
+            SERVICE_RUNNING
+        } else {
+            SERVICE_STOPPED
+        };
+        if query_handle(service.0)? == desired {
+            return Ok(());
+        }
+        let result = if running {
+            unsafe { StartServiceW(service.0, 0, std::ptr::null()) }
+        } else {
+            let mut status = ServiceStatus {
+                service_type: 0,
+                current_state: 0,
+                controls_accepted: 0,
+                win32_exit_code: 0,
+                service_specific_exit_code: 0,
+                check_point: 0,
+                wait_hint: 0,
+            };
+            unsafe { ControlService(service.0, SERVICE_CONTROL_STOP, &mut status) }
+        };
+        if result == 0 {
+            return Err(format!(
+                "Windows 服务状态变更失败：{}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let deadline = Instant::now() + StdDuration::from_secs(15);
+        while Instant::now() < deadline {
+            if query_handle(service.0)? == desired {
+                return Ok(());
+            }
+            thread::sleep(StdDuration::from_millis(150));
+        }
+        Err("Windows 服务在 15 秒内未达到目标状态".into())
+    }
+}
+
 #[cfg(not(target_os = "windows"))]
 impl MachinePathHost for WindowsMachinePathHost {
     fn read_machine_path(&self) -> Result<UserPathState, String> {
@@ -188,7 +501,8 @@ impl MachinePathHost for WindowsMachinePathHost {
 }
 
 pub fn maybe_run_helper(arguments: &[String]) -> Option<i32> {
-    if arguments.get(1).map(String::as_str) != Some(HELPER_ARGUMENT) {
+    let mode = arguments.get(1).map(String::as_str);
+    if !matches!(mode, Some(HELPER_ARGUMENT) | Some(SERVICE_HELPER_ARGUMENT)) {
         return None;
     }
     if arguments.len() != 4 {
@@ -197,12 +511,22 @@ pub fn maybe_run_helper(arguments: &[String]) -> Option<i32> {
     let request = arguments.get(2).map(PathBuf::from);
     let response = arguments.get(3).map(PathBuf::from);
     Some(match (request, response) {
-        (Some(request), Some(response)) => {
-            match execute_helper_files(&request, &response, &WindowsMachinePathHost) {
-                Ok(()) => 0,
-                Err(_) => 2,
+        (Some(request), Some(response)) => match mode {
+            Some(HELPER_ARGUMENT) => {
+                match execute_helper_files(&request, &response, &WindowsMachinePathHost) {
+                    Ok(()) => 0,
+                    Err(_) => 2,
+                }
             }
-        }
+            Some(SERVICE_HELPER_ARGUMENT) => {
+                match execute_service_helper_files(&request, &response, &WindowsServiceControlHost)
+                {
+                    Ok(()) => 0,
+                    Err(_) => 2,
+                }
+            }
+            _ => 2,
+        },
         _ => 2,
     })
 }
@@ -283,6 +607,260 @@ fn execute_via_uac(
     let _ = fs::remove_file(request_path.with_extension("claimed"));
     let _ = fs::remove_file(&response_path);
     result
+}
+
+fn execute_service_via_uac(
+    root: &Path,
+    proposal: &RepairProposal,
+    expected_current: &ServiceRepairState,
+    desired: &ServiceRepairState,
+    action: ElevatedAction,
+) -> Result<ServiceRepairState, String> {
+    if proposal.operation_id != SERVICE_START_OPERATION
+        || proposal.operation_version != SERVICE_START_OPERATION_VERSION
+        || proposal.risk != "r3"
+        || proposal.target != SERVICE_START_TARGET
+        || expected_current.name != ALLOWED_SERVICE_NAME
+        || desired.name != ALLOWED_SERVICE_NAME
+    {
+        return Err("R3 service helper 拒绝未知操作、服务或目标".into());
+    }
+    let directory = root.join("elevated");
+    fs::create_dir_all(&directory).map_err(|error| format!("无法创建 R3 请求目录：{error}"))?;
+    let request_id = format!("service-elevated-{}", Uuid::new_v4());
+    let nonce = Uuid::new_v4().to_string();
+    let secret = one_time_secret();
+    let now = Utc::now();
+    let mut request = ElevatedServiceRequest {
+        schema_version: ELEVATED_SCHEMA_VERSION,
+        request_id: request_id.clone(),
+        ticket_id: proposal.ticket_id.clone(),
+        proposal_id: proposal.id.clone(),
+        proposal_digest: proposal.proposal_digest.clone(),
+        operation_id: proposal.operation_id.clone(),
+        operation_version: proposal.operation_version,
+        action,
+        target: proposal.target.clone(),
+        expected_current: expected_current.clone(),
+        expected_current_digest: digest_json(expected_current),
+        desired: desired.clone(),
+        desired_digest: digest_json(desired),
+        nonce: nonce.clone(),
+        created_at: now,
+        expires_at: now + Duration::minutes(3),
+        hmac: String::new(),
+    };
+    request.hmac = service_request_hmac(&request, &secret);
+    let request_path = directory.join(format!("{request_id}.request.json"));
+    let response_path = directory.join(format!("{request_id}.response.json"));
+    save_atomic(&request_path, &request)?;
+    if let Err(error) = save_secret(&nonce, &secret) {
+        let _ = fs::remove_file(&request_path);
+        return Err(error);
+    }
+    let result = (|| {
+        launch_elevated_mode(SERVICE_HELPER_ARGUMENT, &request_path, &response_path)?;
+        let started = Instant::now();
+        while started.elapsed() < RESPONSE_WAIT {
+            if response_path.is_file() {
+                let response: ElevatedServiceResponse = serde_json::from_slice(
+                    &fs::read(&response_path)
+                        .map_err(|error| format!("无法读取 R3 service helper 响应：{error}"))?,
+                )
+                .map_err(|_| "R3 service helper 响应格式无效".to_string())?;
+                validate_service_response(&request, &response, &secret)?;
+                return match response.status {
+                    ElevatedResponseStatus::Verified => response
+                        .observed
+                        .ok_or_else(|| "R3 service helper 未返回验证后的状态".to_string()),
+                    ElevatedResponseStatus::SafeStop | ElevatedResponseStatus::Failed => {
+                        Err(response.detail)
+                    }
+                };
+            }
+            thread::sleep(StdDuration::from_millis(100));
+        }
+        Err("未收到 R3 service helper 响应；未声明服务状态已修改".into())
+    })();
+    delete_secret(&nonce);
+    let _ = fs::remove_file(&request_path);
+    let _ = fs::remove_file(request_path.with_extension("claimed"));
+    let _ = fs::remove_file(&response_path);
+    result
+}
+
+fn execute_service_helper_files(
+    request_path: &Path,
+    response_path: &Path,
+    host: &dyn ServiceControlHost,
+) -> Result<(), String> {
+    validate_helper_paths(request_path, response_path)?;
+    let claimed_path = request_path.with_extension("claimed");
+    fs::rename(request_path, &claimed_path)
+        .map_err(|_| "R3 service helper 请求已经被领取、重放或不存在".to_string())?;
+    let result = execute_claimed_service_helper(&claimed_path, request_path, response_path, host);
+    let _ = fs::remove_file(&claimed_path);
+    result
+}
+
+fn execute_claimed_service_helper(
+    claimed_path: &Path,
+    request_path: &Path,
+    response_path: &Path,
+    host: &dyn ServiceControlHost,
+) -> Result<(), String> {
+    let request: ElevatedServiceRequest = serde_json::from_slice(
+        &fs::read(claimed_path).map_err(|error| format!("无法读取 R3 service 请求：{error}"))?,
+    )
+    .map_err(|_| "R3 service 请求格式无效".to_string())?;
+    let nonce = request.nonce.clone();
+    let result = (|| {
+        validate_service_request_path_binding(&request, request_path, response_path)?;
+        let secret = load_secret(&nonce)?;
+        let mutation = execute_authenticated_service(&request, &secret, host);
+        let mut response = match mutation {
+            Ok(observed) => ElevatedServiceResponse {
+                schema_version: ELEVATED_SCHEMA_VERSION,
+                request_id: request.request_id.clone(),
+                ticket_id: request.ticket_id.clone(),
+                proposal_id: request.proposal_id.clone(),
+                proposal_digest: request.proposal_digest.clone(),
+                nonce: nonce.clone(),
+                status: ElevatedResponseStatus::Verified,
+                detail: "管理员 helper 已变更并重读验证允许列表服务".into(),
+                observed_digest: Some(digest_json(&observed)),
+                observed: Some(observed),
+                completed_at: Utc::now(),
+                hmac: String::new(),
+            },
+            Err(error) => ElevatedServiceResponse {
+                schema_version: ELEVATED_SCHEMA_VERSION,
+                request_id: request.request_id.clone(),
+                ticket_id: request.ticket_id.clone(),
+                proposal_id: request.proposal_id.clone(),
+                proposal_digest: request.proposal_digest.clone(),
+                nonce: nonce.clone(),
+                status: ElevatedResponseStatus::SafeStop,
+                detail: error,
+                observed_digest: None,
+                observed: None,
+                completed_at: Utc::now(),
+                hmac: String::new(),
+            },
+        };
+        response.hmac = service_response_hmac(&response, &secret);
+        save_atomic(response_path, &response)
+    })();
+    delete_secret(&nonce);
+    result
+}
+
+fn execute_authenticated_service(
+    request: &ElevatedServiceRequest,
+    secret: &[u8],
+    host: &dyn ServiceControlHost,
+) -> Result<ServiceRepairState, String> {
+    validate_service_request(request, secret)?;
+    let current = host.read_service_state(ALLOWED_SERVICE_NAME)?;
+    if current != request.expected_current
+        || digest_json(&current) != request.expected_current_digest
+    {
+        return Err("允许列表服务在审批后发生变化，R3 helper 已安全停止".into());
+    }
+    if digest_json(&request.desired) != request.desired_digest {
+        return Err("R3 service helper 的目标状态摘要无效".into());
+    }
+    host.write_service_state(&request.desired)?;
+    let observed = host.read_service_state(ALLOWED_SERVICE_NAME)?;
+    if observed != request.desired || digest_json(&observed) != request.desired_digest {
+        let restored = host.write_service_state(&current).is_ok()
+            && host
+                .read_service_state(ALLOWED_SERVICE_NAME)
+                .map(|value| value == current)
+                .unwrap_or(false);
+        return Err(format!(
+            "允许列表服务变更后验证失败；快照恢复{}",
+            if restored { "成功" } else { "失败" }
+        ));
+    }
+    Ok(observed)
+}
+
+fn validate_service_request(request: &ElevatedServiceRequest, secret: &[u8]) -> Result<(), String> {
+    let valid_transition = match request.action {
+        ElevatedAction::Apply => {
+            request.expected_current.status == "Stopped" && request.desired.status == "Running"
+        }
+        ElevatedAction::Rollback => {
+            request.expected_current.status == "Running" && request.desired.status == "Stopped"
+        }
+    };
+    if request.schema_version != ELEVATED_SCHEMA_VERSION
+        || request.operation_id != SERVICE_START_OPERATION
+        || request.operation_version != SERVICE_START_OPERATION_VERSION
+        || request.target != SERVICE_START_TARGET
+        || request.expected_current.name != ALLOWED_SERVICE_NAME
+        || request.desired.name != ALLOWED_SERVICE_NAME
+        || request.expected_current.dependency_name != ALLOWED_SERVICE_DEPENDENCY
+        || request.desired.dependency_name != ALLOWED_SERVICE_DEPENDENCY
+        || !request.expected_current.dependency_running
+        || !request.desired.dependency_running
+        || !valid_transition
+        || request.request_id.is_empty()
+        || request.proposal_id.is_empty()
+        || request.ticket_id.is_empty()
+        || request.nonce.is_empty()
+    {
+        return Err("R3 service helper 请求包含未知操作、服务、状态或目标".into());
+    }
+    if Utc::now() > request.expires_at || request.expires_at <= request.created_at {
+        return Err("R3 service helper 请求已过期".into());
+    }
+    if !constant_time_equal(&request.hmac, &service_request_hmac(request, secret)) {
+        return Err("R3 service helper 请求认证失败".into());
+    }
+    Ok(())
+}
+
+fn validate_service_response(
+    request: &ElevatedServiceRequest,
+    response: &ElevatedServiceResponse,
+    secret: &[u8],
+) -> Result<(), String> {
+    if response.schema_version != ELEVATED_SCHEMA_VERSION
+        || response.request_id != request.request_id
+        || response.ticket_id != request.ticket_id
+        || response.proposal_id != request.proposal_id
+        || response.proposal_digest != request.proposal_digest
+        || response.nonce != request.nonce
+        || !constant_time_equal(&response.hmac, &service_response_hmac(response, secret))
+    {
+        return Err("R3 service helper 响应认证或绑定信息无效".into());
+    }
+    if response.status == ElevatedResponseStatus::Verified
+        && (response.observed_digest.as_deref() != Some(request.desired_digest.as_str())
+            || response.observed.as_ref().map(digest_json).as_deref()
+                != Some(request.desired_digest.as_str()))
+    {
+        return Err("R3 service helper 响应未证明目标状态".into());
+    }
+    Ok(())
+}
+
+fn validate_service_request_path_binding(
+    request: &ElevatedServiceRequest,
+    request_path: &Path,
+    response_path: &Path,
+) -> Result<(), String> {
+    let expected_request = format!("{}.request.json", request.request_id);
+    let expected_response = format!("{}.response.json", request.request_id);
+    if request_path.file_name().and_then(|value| value.to_str()) != Some(expected_request.as_str())
+        || response_path.file_name().and_then(|value| value.to_str())
+            != Some(expected_response.as_str())
+    {
+        return Err("R3 service helper 文件名与认证请求 ID 不一致".into());
+    }
+    Ok(())
 }
 
 fn execute_helper_files(
@@ -479,6 +1057,22 @@ fn response_hmac(response: &ElevatedResponse, secret: &[u8]) -> String {
     hmac_hex(secret, &serde_json::to_vec(&value).unwrap_or_default())
 }
 
+fn service_request_hmac(request: &ElevatedServiceRequest, secret: &[u8]) -> String {
+    let mut value = serde_json::to_value(request).unwrap_or(Value::Null);
+    if let Some(object) = value.as_object_mut() {
+        object.insert("hmac".into(), Value::String(String::new()));
+    }
+    hmac_hex(secret, &serde_json::to_vec(&value).unwrap_or_default())
+}
+
+fn service_response_hmac(response: &ElevatedServiceResponse, secret: &[u8]) -> String {
+    let mut value = serde_json::to_value(response).unwrap_or(Value::Null);
+    if let Some(object) = value.as_object_mut() {
+        object.insert("hmac".into(), Value::String(String::new()));
+    }
+    hmac_hex(secret, &serde_json::to_vec(&value).unwrap_or_default())
+}
+
 fn hmac_hex(secret: &[u8], message: &[u8]) -> String {
     const BLOCK: usize = 64;
     let mut key = if secret.len() > BLOCK {
@@ -600,6 +1194,11 @@ fn delete_secret(_nonce: &str) {}
 
 #[cfg(target_os = "windows")]
 fn launch_elevated(request: &Path, response: &Path) -> Result<(), String> {
+    launch_elevated_mode(HELPER_ARGUMENT, request, response)
+}
+
+#[cfg(target_os = "windows")]
+fn launch_elevated_mode(mode: &str, request: &Path, response: &Path) -> Result<(), String> {
     use std::iter::once;
     use std::os::windows::ffi::OsStrExt;
     use std::ptr::null;
@@ -625,7 +1224,7 @@ fn launch_elevated(request: &Path, response: &Path) -> Result<(), String> {
     let operation = wide(std::ffi::OsStr::new("runas"));
     let file = wide(executable.as_os_str());
     let parameters = format!(
-        "{HELPER_ARGUMENT} \"{}\" \"{}\"",
+        "{mode} \"{}\" \"{}\"",
         request.display(),
         response.display()
     );
@@ -656,6 +1255,11 @@ fn launch_elevated(_request: &Path, _response: &Path) -> Result<(), String> {
     Err("R3 elevated helper only supports Windows".into())
 }
 
+#[cfg(not(target_os = "windows"))]
+fn launch_elevated_mode(_mode: &str, _request: &Path, _response: &Path) -> Result<(), String> {
+    Err("R3 elevated helper only supports Windows".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -680,6 +1284,68 @@ mod tests {
             *self.state.lock().unwrap() = value;
             Ok(())
         }
+    }
+
+    struct FakeServiceHost {
+        state: Mutex<ServiceRepairState>,
+        corrupt_after_write: bool,
+    }
+
+    impl ServiceControlHost for FakeServiceHost {
+        fn read_service_state(&self, name: &str) -> Result<ServiceRepairState, String> {
+            if name != ALLOWED_SERVICE_NAME {
+                return Err("not allow-listed".into());
+            }
+            Ok(self.state.lock().unwrap().clone())
+        }
+
+        fn write_service_state(&self, state: &ServiceRepairState) -> Result<(), String> {
+            let mut value = state.clone();
+            if self.corrupt_after_write {
+                value.status = "Unknown".into();
+            }
+            *self.state.lock().unwrap() = value;
+            Ok(())
+        }
+    }
+
+    fn stopped_service() -> ServiceRepairState {
+        ServiceRepairState {
+            name: ALLOWED_SERVICE_NAME.into(),
+            status: "Stopped".into(),
+            dependency_name: ALLOWED_SERVICE_DEPENDENCY.into(),
+            dependency_running: true,
+        }
+    }
+
+    fn signed_service_request(secret: &[u8]) -> ElevatedServiceRequest {
+        let before = stopped_service();
+        let after = ServiceRepairState {
+            status: "Running".into(),
+            ..before.clone()
+        };
+        let now = Utc::now();
+        let mut request = ElevatedServiceRequest {
+            schema_version: ELEVATED_SCHEMA_VERSION,
+            request_id: "service-request-1".into(),
+            ticket_id: "ticket-service".into(),
+            proposal_id: "proposal-service".into(),
+            proposal_digest: "c".repeat(64),
+            operation_id: SERVICE_START_OPERATION.into(),
+            operation_version: SERVICE_START_OPERATION_VERSION,
+            action: ElevatedAction::Apply,
+            target: SERVICE_START_TARGET.into(),
+            expected_current: before.clone(),
+            expected_current_digest: digest_json(&before),
+            desired: after.clone(),
+            desired_digest: digest_json(&after),
+            nonce: "service-nonce-1".into(),
+            created_at: now,
+            expires_at: now + Duration::minutes(2),
+            hmac: String::new(),
+        };
+        request.hmac = service_request_hmac(&request, secret);
+        request
     }
 
     fn signed_request(
@@ -731,6 +1397,154 @@ mod tests {
         };
         let observed = execute_authenticated(&request, secret, &host).unwrap();
         assert_eq!(observed, after);
+    }
+
+    #[test]
+    fn authenticated_service_request_starts_only_w32time_and_rollback_stops_it() {
+        let secret = b"service-one-time-secret";
+        let request = signed_service_request(secret);
+        let host = FakeServiceHost {
+            state: Mutex::new(request.expected_current.clone()),
+            corrupt_after_write: false,
+        };
+        let observed = execute_authenticated_service(&request, secret, &host).unwrap();
+        assert_eq!(observed.status, "Running");
+
+        let mut rollback = ElevatedServiceRequest {
+            action: ElevatedAction::Rollback,
+            expected_current: request.desired.clone(),
+            expected_current_digest: request.desired_digest.clone(),
+            desired: request.expected_current.clone(),
+            desired_digest: request.expected_current_digest.clone(),
+            nonce: "service-nonce-rollback".into(),
+            ..request
+        };
+        rollback.hmac = service_request_hmac(&rollback, secret);
+        let observed = execute_authenticated_service(&rollback, secret, &host).unwrap();
+        assert_eq!(observed.status, "Stopped");
+    }
+
+    #[test]
+    fn service_helper_rejects_tampering_expiry_unknown_targets_and_bad_dependency() {
+        let secret = b"service-one-time-secret";
+        for mutation in 0..5 {
+            let mut request = signed_service_request(secret);
+            match mutation {
+                0 => request.desired.name = "Spooler".into(),
+                1 => request.target = r"SCM\Spooler".into(),
+                2 => request.expected_current.dependency_name = "DcomLaunch".into(),
+                3 => request.expires_at = Utc::now() - Duration::seconds(1),
+                _ => request.hmac = "tampered".into(),
+            }
+            let host = FakeServiceHost {
+                state: Mutex::new(stopped_service()),
+                corrupt_after_write: false,
+            };
+            assert!(execute_authenticated_service(&request, secret, &host).is_err());
+            assert_eq!(
+                host.read_service_state(ALLOWED_SERVICE_NAME)
+                    .unwrap()
+                    .status,
+                "Stopped"
+            );
+        }
+    }
+
+    #[test]
+    fn service_verification_failure_attempts_snapshot_restoration() {
+        let secret = b"service-one-time-secret";
+        let request = signed_service_request(secret);
+        let host = FakeServiceHost {
+            state: Mutex::new(stopped_service()),
+            corrupt_after_write: true,
+        };
+        let error = execute_authenticated_service(&request, secret, &host).unwrap_err();
+        assert!(error.contains("快照恢复"));
+    }
+
+    #[test]
+    fn service_response_binds_request_ticket_proposal_nonce_and_digest() {
+        let secret = b"service-one-time-secret";
+        let request = signed_service_request(secret);
+        let mut response = ElevatedServiceResponse {
+            schema_version: ELEVATED_SCHEMA_VERSION,
+            request_id: request.request_id.clone(),
+            ticket_id: request.ticket_id.clone(),
+            proposal_id: request.proposal_id.clone(),
+            proposal_digest: request.proposal_digest.clone(),
+            nonce: request.nonce.clone(),
+            status: ElevatedResponseStatus::Verified,
+            detail: "ok".into(),
+            observed: Some(request.desired.clone()),
+            observed_digest: Some(request.desired_digest.clone()),
+            completed_at: Utc::now(),
+            hmac: String::new(),
+        };
+        response.hmac = service_response_hmac(&response, secret);
+        validate_service_response(&request, &response, secret).unwrap();
+        response.proposal_id = "other".into();
+        response.hmac = service_response_hmac(&response, secret);
+        assert!(validate_service_response(&request, &response, secret).is_err());
+    }
+
+    #[test]
+    fn service_helper_paths_bind_to_request_id_and_claim_prevents_replay() {
+        let dir = TempDir::new().unwrap();
+        let request = signed_service_request(b"service-path-secret");
+        let request_path = dir.path().join("service-request-1.request.json");
+        let response_path = dir.path().join("service-request-1.response.json");
+        validate_service_request_path_binding(&request, &request_path, &response_path).unwrap();
+        assert!(validate_service_request_path_binding(
+            &request,
+            &dir.path().join("other.request.json"),
+            &response_path,
+        )
+        .is_err());
+        fs::write(&request_path, b"claimed once").unwrap();
+        fs::rename(&request_path, request_path.with_extension("claimed")).unwrap();
+        let host = FakeServiceHost {
+            state: Mutex::new(stopped_service()),
+            corrupt_after_write: false,
+        };
+        assert!(execute_service_helper_files(&request_path, &response_path, &host).is_err());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn service_helper_claims_once_returns_authenticated_response_and_deletes_secret() {
+        let dir = TempDir::new().unwrap();
+        let secret = one_time_secret();
+        let mut request = signed_service_request(&secret);
+        request.request_id = format!("service-request-{}", Uuid::new_v4());
+        request.nonce = format!("service-nonce-{}", Uuid::new_v4());
+        request.hmac = service_request_hmac(&request, &secret);
+        let request_path = dir
+            .path()
+            .join(format!("{}.request.json", request.request_id));
+        let response_path = dir
+            .path()
+            .join(format!("{}.response.json", request.request_id));
+        save_atomic(&request_path, &request).unwrap();
+        save_secret(&request.nonce, &secret).unwrap();
+        let host = FakeServiceHost {
+            state: Mutex::new(stopped_service()),
+            corrupt_after_write: false,
+        };
+
+        execute_service_helper_files(&request_path, &response_path, &host).unwrap();
+        let response: ElevatedServiceResponse =
+            serde_json::from_slice(&fs::read(&response_path).unwrap()).unwrap();
+        validate_service_response(&request, &response, &secret).unwrap();
+        assert_eq!(response.status, ElevatedResponseStatus::Verified);
+        assert_eq!(
+            host.read_service_state(ALLOWED_SERVICE_NAME)
+                .unwrap()
+                .status,
+            "Running"
+        );
+        assert!(load_secret(&request.nonce).is_err());
+        assert!(execute_service_helper_files(&request_path, &response_path, &host).is_err());
+        assert!(!request_path.with_extension("claimed").exists());
     }
 
     #[test]
@@ -919,6 +1733,10 @@ mod tests {
             Some(2)
         );
         assert_eq!(
+            maybe_run_helper(&["UCode.exe".into(), SERVICE_HELPER_ARGUMENT.into()]),
+            Some(2)
+        );
+        assert_eq!(
             maybe_run_helper(&[
                 "UCode.exe".into(),
                 "--other".into(),
@@ -938,6 +1756,27 @@ mod tests {
             ]),
             Some(2)
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn native_w32time_query_is_read_only_and_bounded() {
+        let state = WindowsServiceControlHost
+            .read_service_state(ALLOWED_SERVICE_NAME)
+            .unwrap();
+        assert_eq!(state.name, ALLOWED_SERVICE_NAME);
+        assert_eq!(state.dependency_name, ALLOWED_SERVICE_DEPENDENCY);
+        assert!(matches!(
+            state.status.as_str(),
+            "Stopped"
+                | "StartPending"
+                | "StopPending"
+                | "Running"
+                | "ContinuePending"
+                | "PausePending"
+                | "Paused"
+                | "Unknown"
+        ));
     }
 
     #[test]

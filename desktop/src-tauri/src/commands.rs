@@ -24,6 +24,7 @@ use crate::rescue_probe::{
     requested_probe_description, NetworkProbeService, ProbeStatus, R1ProbeRecord,
 };
 use crate::rescue_repair::{RepairRecord, RepairService, RepairStatus};
+use crate::rescue_service::explicit_service_name;
 use crate::skills::{SkillPreview, SkillRuntime};
 use crate::storage::{
     AppSettings, AssignmentSummary, EvidenceReceipt, OnboardingState, ProjectSummary, RuntimeEvent,
@@ -5250,6 +5251,14 @@ fn requests_user_proxy_repair(value: &str) -> bool {
         .any(|scope| actionable.contains(scope))
 }
 
+fn requests_service_start_repair(value: &str) -> bool {
+    let actionable = without_negated_desktop_actions(&value.to_lowercase());
+    requests_rescue_repair(value)
+        || ["启动", "start", "恢复运行", "无法运行"]
+            .iter()
+            .any(|action| actionable.contains(action))
+}
+
 fn mentions_project_file(value: &str) -> bool {
     [
         ".md", ".txt", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".py", ".rs", ".go", ".java",
@@ -5369,7 +5378,52 @@ fn run_executor_ticket(
             }),
             app,
         );
-        if report.domain == "system" && requests_rescue_repair(request_text) {
+        let requested_service = explicit_service_name(request_text);
+        if report.domain == "system"
+            && requested_service.is_some()
+            && requests_service_start_repair(request_text)
+        {
+            let service_name = requested_service.as_deref().unwrap_or_default();
+            let evidence_ids = report
+                .evidence
+                .iter()
+                .filter(|item| item.tool_id == "system.service.query")
+                .map(|item| item.id.clone())
+                .collect::<Vec<_>>();
+            let proposal = if service_name == "W32Time" {
+                rescue_repairs.propose_service_start(ticket_id, evidence_ids, service_name)
+            } else {
+                Err(format!(
+                    "服务 {service_name} 不在 R3 允许列表；当前仅支持 W32Time，不会改为其他服务"
+                ))
+            };
+            match proposal {
+                Ok(Some(proposal)) => append_runtime_event(
+                    storage,
+                    ticket_id,
+                    "rescue.repair.proposed",
+                    json!({ "proposal": proposal }),
+                    app,
+                ),
+                Ok(None) => append_runtime_event(
+                    storage,
+                    ticket_id,
+                    "rescue.repair.unavailable",
+                    json!({ "operationId": "system.service.start", "error": "W32Time 当前已经是 Running；没有可应用的服务修改" }),
+                    app,
+                ),
+                Err(error) => append_runtime_event(
+                    storage,
+                    ticket_id,
+                    "rescue.repair.unavailable",
+                    json!({ "operationId": "system.service.start", "error": error }),
+                    app,
+                ),
+            }
+        } else if report.domain == "system"
+            && requests_rescue_repair(request_text)
+            && requested_service.is_none()
+        {
             let evidence_ids = report
                 .evidence
                 .iter()
@@ -7074,6 +7128,21 @@ mod tests {
         assert!(requests_user_proxy_repair("fix the stale proxy"));
         assert!(!requests_user_proxy_repair("只检查代理，不要修复"));
         assert!(!requests_user_proxy_repair("请修复机器 PATH"));
+        assert!(requests_service_start_repair(
+            "Windows Time 服务 W32Time 无法启动，请生成修复方案"
+        ));
+        assert!(requests_service_start_repair("请启动服务 W32Time"));
+        assert!(!requests_service_start_repair(
+            "只检查服务 W32Time，不要修复或启动"
+        ));
+        assert_eq!(
+            explicit_service_name("服务名 W32Time 异常，请修复").as_deref(),
+            Some("W32Time")
+        );
+        assert_eq!(
+            explicit_service_name("服务 Spooler 异常，请修复").as_deref(),
+            Some("Spooler")
+        );
     }
 
     #[test]

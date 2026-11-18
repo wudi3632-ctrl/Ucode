@@ -8,8 +8,12 @@ const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_SERVICE_NAME: usize = 128;
 
 pub fn requested_probe(request: &str) -> Option<(String, Value)> {
-    extract_explicit_service_name(request)
+    explicit_service_name(request)
         .map(|name| ("system.service.query".into(), json!({ "name": name })))
+}
+
+pub fn explicit_service_name(request: &str) -> Option<String> {
+    extract_explicit_service_name(request)
 }
 
 pub fn run(tool_id: &str, arguments: &Value) -> Option<Result<ProbeOutput, String>> {
