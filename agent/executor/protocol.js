@@ -3,7 +3,8 @@ import { createHash } from "node:crypto";
 import { AppError } from "../shared/errors.js";
 
 export const EXECUTOR_PROTOCOL_V1 = "ucode.executor.v1";
-export const EXECUTOR_MODES = new Set(["chat", "project_read", "action"]);
+export const EXECUTOR_MODES = new Set(["chat", "project_read", "action", "candidate"]);
+export const CANDIDATE_STRATEGIES = new Set(["minimal_change", "compatibility_first"]);
 export const EXECUTOR_EVENT_TYPES = new Set([
   "start",
   "text_delta",
@@ -31,7 +32,7 @@ export function validateExecutorRequest(input) {
   boundedString(input.workspace.fingerprint, "workspace.fingerprint", 500);
   boundedArray(input.workspace.files, "workspace.files", 0, 20_000);
 
-  if (input.mode === "action") {
+  if (["action", "candidate"].includes(input.mode)) {
     object(input.assignment, "assignment");
     object(input.mandate, "mandate");
     boundedString(input.assignment.ticketId, "assignment.ticketId", 200);
@@ -43,8 +44,12 @@ export function validateExecutorRequest(input) {
     if (input.mandate.threadKey !== input.threadKey || input.mandate.projectFingerprint !== input.workspace.fingerprint) {
       fail("executor_authority_mismatch", "Mandate does not match the Thread or workspace");
     }
+    if (input.mode === "candidate") validateCandidateRequest(input.candidate, input.mandate);
+    else if (input.candidate != null) fail("executor_candidate_unexpected", "Action requests cannot carry candidate configuration");
   } else if (input.assignment != null || input.mandate != null) {
     fail("executor_authority_unexpected", "Chat and project-read requests cannot carry action authority");
+  } else if (input.candidate != null) {
+    fail("executor_candidate_unexpected", "Chat and project-read requests cannot carry candidate configuration");
   }
 
   for (const item of input.inputs) {
@@ -67,6 +72,24 @@ export function validateExecutorRequest(input) {
   return input;
 }
 
+function validateCandidateRequest(candidate, mandate) {
+  object(candidate, "candidate");
+  boundedString(candidate.raceId, "candidate.raceId", 200);
+  boundedString(candidate.candidateId, "candidate.candidateId", 200);
+  if (!CANDIDATE_STRATEGIES.has(candidate.strategy)) fail("executor_candidate_strategy", "Candidate strategy is invalid");
+  boundedArray(candidate.allowedPaths, "candidate.allowedPaths", 1, 20);
+  boundedArray(candidate.acceptance, "candidate.acceptance", 1, 16);
+  for (const value of candidate.allowedPaths) validateRelativePath(value, "candidate allowed path");
+  for (const value of candidate.acceptance) boundedString(value, "candidate acceptance", 2_000);
+  if (!Number.isSafeInteger(candidate.generationAttempt) || candidate.generationAttempt < 1 || candidate.generationAttempt > 2) {
+    fail("executor_candidate_budget", "Candidate generation attempt must be 1 or 2");
+  }
+  if (candidate.feedback != null) boundedString(candidate.feedback, "candidate.feedback", 8_000);
+  if (!mandate.capabilities.includes("propose_write")) {
+    fail("executor_candidate_authority", "Candidate generation requires propose_write authority");
+  }
+}
+
 export function validateExecutorEvent(event, request) {
   object(event, "Executor event");
   if (event.version !== EXECUTOR_PROTOCOL_V1 || event.requestId !== request.requestId || event.turnId !== request.turnId) {
@@ -83,12 +106,17 @@ export function validateExecutorEvent(event, request) {
 
 function validateWorkspaceFile(file) {
   object(file, "workspace file");
-  const value = boundedString(file.path, "workspace file path", 1_000).replaceAll("\\", "/");
-  if (path.isAbsolute(value) || /^[A-Za-z]:\//.test(value) || value.startsWith("/") || value.split("/").includes("..") || value.includes("\0")) {
-    fail("executor_workspace_path", "Workspace file path must stay relative to the project");
-  }
+  validateRelativePath(boundedString(file.path, "workspace file path", 1_000), "workspace file path");
   if (!Number.isSafeInteger(file.sizeBytes) || file.sizeBytes < 0) fail("executor_workspace_file", "Workspace file size is invalid");
   if (file.contentDigest != null && !/^[0-9a-f]{64}$/i.test(file.contentDigest)) fail("executor_workspace_file", "Workspace file digest is invalid");
+}
+
+function validateRelativePath(input, label) {
+  const value = boundedString(input, label, 1_000).replaceAll("\\", "/");
+  if (path.isAbsolute(value) || /^[A-Za-z]:\//.test(value) || value.startsWith("/") || value.split("/").includes("..") || value.includes("\0")) {
+    fail("executor_workspace_path", `${label} must stay relative to the project`);
+  }
+  return value;
 }
 
 function validateAttachment(attachment) {

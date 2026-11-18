@@ -21,6 +21,37 @@ test("chat cannot smuggle action authority and action must carry it", () => {
   assert.throws(() => validateExecutorRequest(action), /must be an object/);
 });
 
+test("candidate mode requires bounded strategy scope acceptance and write authority", () => {
+  const request = structuredClone(fixture);
+  request.mode = "candidate";
+  request.candidate = {
+    raceId: "race-1",
+    candidateId: "candidate-a",
+    strategy: "minimal_change",
+    allowedPaths: ["README.md"],
+    acceptance: ["README heading is UCode"],
+    generationAttempt: 1,
+    feedback: null,
+  };
+  assert.equal(validateExecutorRequest(request).candidate.strategy, "minimal_change");
+
+  const invalidStrategy = structuredClone(request);
+  invalidStrategy.candidate.strategy = "creative_guess";
+  assert.throws(() => validateExecutorRequest(invalidStrategy), /strategy is invalid/);
+
+  const escaping = structuredClone(request);
+  escaping.candidate.allowedPaths = ["../outside.txt"];
+  assert.throws(() => validateExecutorRequest(escaping), /stay relative/);
+
+  const overBudget = structuredClone(request);
+  overBudget.candidate.generationAttempt = 3;
+  assert.throws(() => validateExecutorRequest(overBudget), /attempt must be 1 or 2/);
+
+  const readOnly = structuredClone(request);
+  readOnly.mandate.capabilities = ["read", "search"];
+  assert.throws(() => validateExecutorRequest(readOnly), /requires propose_write/);
+});
+
 test("workspace and attachment paths cannot escape the project", () => {
   const request = structuredClone(fixture);
   request.workspace.files[0].path = "../outside.txt";

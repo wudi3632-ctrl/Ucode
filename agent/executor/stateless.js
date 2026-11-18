@@ -12,6 +12,11 @@ const PROJECT_PROMPT = "你是 UCode 的项目问答助手。文件已经由桌�
 const PROJECT_RETRY_PROMPT = "上一次输出错误地生成了工具调用。本次文件内容已经在用户消息中，只能直接回答问题；禁止再次读取，禁止输出 JSON、代码形式的参数或任何工具调用。";
 const READABLE = new Set([".md", ".txt", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".py", ".rs", ".go", ".java", ".kt", ".c", ".h", ".cpp", ".hpp", ".cs", ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".xml", ".html", ".css", ".sql", ".sh", ".ps1", ".bat", ".cmd", ".log", ".csv"]);
 const DIAGNOSIS_LIMITS = Object.freeze({ read_file: 10, search: 2, pytest: 1, write_batches: 1, stagnant_steps: 2 });
+const CANDIDATE_PROTOCOL_V1 = "ucode.candidate.v1";
+const CANDIDATE_PROMPTS = Object.freeze({
+  minimal_change: "你正在生成隔离候选 A（最小修改）。只改满足验收所必需的文件，保持现有公开接口，禁止顺手重构、格式化无关代码或改写测试来掩盖失败。只能返回一个 write_files 工具调用。",
+  compatibility_first: "你正在生成隔离候选 B（兼容性优先）。保持现有公开接口和调用行为；在允许范围内同步必要的实现、调用方与测试，禁止无关重构或删除测试。只能返回一个 write_files 工具调用。",
+});
 
 export class StatelessExecutor {
   constructor({ tools, coder, controller = null }) {
@@ -23,8 +28,56 @@ export class StatelessExecutor {
   async execute(rawRequest, { signal, onEvent } = {}) {
     const request = validateExecutorRequest(rawRequest);
     if (request.mode === "action") return this.action(request, { signal, onEvent });
+    if (request.mode === "candidate") return this.candidate(request, { signal, onEvent });
     if (request.mode === "chat") return this.chat(request, { signal, onEvent });
     return this.projectRead(request, { signal, onEvent });
+  }
+
+  async candidate(request, options) {
+    const coder = this.coder();
+    if (!coder) throw new AppError("coder_unavailable", "代码模型尚未启动。", 503);
+    const root = resolveProjectRoot(request.workspace.canonicalRoot);
+    const allowed = request.candidate.allowedPaths.map((value) => value.replaceAll("\\", "/"));
+    const indexed = new Set(request.workspace.files.map((file) => file.path.replaceAll("\\", "/")));
+    const actual = new Set(this.tools.listFiles(root));
+    const context = candidateWorkspace(this.tools, root, request.candidate.strategy, allowed, indexed, actual);
+    const objective = request.inputs.filter((item) => item.human).map((item) => item.text).join("\n").trim();
+    const acceptance = request.candidate.acceptance.map((item) => `- ${item}`).join("\n");
+    const feedback = request.candidate.feedback
+      ? `\n\n上一次机械验证反馈（只能据此定向修复，不得扩大范围）：\n${request.candidate.feedback}`
+      : "";
+    const system = `${CANDIDATE_PROMPTS[request.candidate.strategy]}\n候选之间彼此不可见。你不能运行验证、选择赢家、声称完成或写入原项目。允许路径只有：${allowed.join("、")}。验收条件：\n${acceptance}${feedback}`;
+    const messages = modelMessages(request, system);
+    const result = await coder.generate({
+      task_id: request.turnId,
+      messages,
+      workspace: { root, files: context },
+      tools: [TOOL_DEFINITIONS.find((item) => item.function.name === "write_files")],
+      mode: "candidate",
+      candidate: {
+        race_id: request.candidate.raceId,
+        candidate_id: request.candidate.candidateId,
+        strategy: request.candidate.strategy,
+        generation_attempt: request.candidate.generationAttempt,
+      },
+    }, { signal: options.signal });
+    const changes = candidateChanges(result, allowed, actual);
+    options.onEvent?.(activity(
+      `candidate:${request.candidate.candidateId}`,
+      "candidate_generation",
+      `已生成 ${request.candidate.strategy} 候选`,
+      "succeeded",
+      { candidateId: request.candidate.candidateId, strategy: request.candidate.strategy, changedPaths: changes.map((change) => change.path) },
+    ));
+    return JSON.stringify({
+      version: CANDIDATE_PROTOCOL_V1,
+      raceId: request.candidate.raceId,
+      candidateId: request.candidate.candidateId,
+      strategy: request.candidate.strategy,
+      generationAttempt: request.candidate.generationAttempt,
+      objective,
+      changes,
+    });
   }
 
   async chat(request, options) {
@@ -689,6 +742,80 @@ function actionWorkspace(tools, root, allowed, request) {
     if (!selected.includes(file)) return { path: file };
     try { return { path: file, content: tools.readFile(root, { path: file }).content.slice(0, 8_000) }; }
     catch { return { path: file }; }
+  });
+}
+
+function candidateWorkspace(tools, root, strategy, allowed, indexed, actual) {
+  const files = [];
+  const included = new Set();
+  const add = (file, limit = 12_000) => {
+    if (included.has(file) || !indexed.has(file) || !actual.has(file)) return null;
+    const content = tools.readFile(root, { path: file }).content.slice(0, limit);
+    included.add(file);
+    files.push({ path: file, content });
+    return content;
+  };
+  for (const file of allowed) add(file);
+  if (strategy !== "compatibility_first") return files;
+
+  const needles = allowed
+    .flatMap((file) => [path.basename(file).toLowerCase(), path.basename(file, path.extname(file)).toLowerCase()])
+    .filter((value) => value.length >= 3);
+  for (const file of [...indexed].sort(fileScore)) {
+    if (files.length >= 12 || included.has(file) || !actual.has(file)) continue;
+    let content;
+    try { content = tools.readFile(root, { path: file }).content.slice(0, 6_000); }
+    catch { continue; }
+    const lowered = content.toLowerCase();
+    if (!needles.some((needle) => lowered.includes(needle))) continue;
+    included.add(file);
+    files.push({ path: file, content });
+  }
+  return files;
+}
+
+function candidateChanges(result, allowedPaths, existingPaths = null) {
+  if (result?.type !== "tool_request" || !["write_file", "write_files"].includes(result.tool?.name)) {
+    throw new AppError("candidate_protocol_error", "候选模型没有返回结构化文件变更。", 422);
+  }
+  const raw = result.tool.name === "write_file"
+    ? [{
+        path: result.tool.arguments?.path,
+        operation: existingPaths?.has(String(result.tool.arguments?.path || "").replaceAll("\\", "/")) ? "modify" : "create",
+        content: result.tool.arguments?.content,
+      }]
+    : result.tool.arguments?.changes;
+  if (!Array.isArray(raw) || raw.length < 1 || raw.length > 20) {
+    throw new AppError("candidate_protocol_error", "候选文件批次为空或超过 20 个文件。", 422);
+  }
+  const allowed = new Set(allowedPaths);
+  const seen = new Set();
+  return raw.map((change) => {
+    const value = change && typeof change === "object" ? change : {};
+    const candidatePath = typeof value.path === "string" ? value.path.replaceAll("\\", "/") : "";
+    validateToolRequest({ name: "write_files", arguments: { changes: [{ ...value, path: candidatePath }] } }, []);
+    if (!allowed.has(candidatePath)) {
+      throw new AppError("candidate_scope_violation", `候选试图修改未授权路径：${candidatePath || "（空路径）"}`, 403);
+    }
+    if (seen.has(candidatePath)) throw new AppError("candidate_protocol_error", `候选重复修改同一路径：${candidatePath}`, 422);
+    seen.add(candidatePath);
+    if (!["create", "modify", "delete"].includes(value.operation)) {
+      throw new AppError("candidate_protocol_error", `候选操作无效：${candidatePath}`, 422);
+    }
+    if (existingPaths) {
+      if (value.operation === "create" && existingPaths.has(candidatePath)) {
+        throw new AppError("candidate_protocol_error", `候选把现有文件标记为创建：${candidatePath}`, 422);
+      }
+      if (["modify", "delete"].includes(value.operation) && !existingPaths.has(candidatePath)) {
+        throw new AppError("candidate_protocol_error", `候选试图${value.operation === "delete" ? "删除" : "修改"}不存在的文件：${candidatePath}`, 422);
+      }
+    }
+    if (["create", "modify"].includes(value.operation) && (typeof value.content !== "string" || !value.content.trim())) {
+      throw new AppError("candidate_protocol_error", `候选没有提供 ${candidatePath} 的完整内容。`, 422);
+    }
+    return value.operation === "delete"
+      ? { path: candidatePath, operation: "delete" }
+      : { path: candidatePath, operation: value.operation, content: normalizeGeneratedFileContent(value.content) };
   });
 }
 

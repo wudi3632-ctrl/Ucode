@@ -49,6 +49,104 @@ function fixture(mode, text) {
   return { root, events, calls, executor, request };
 }
 
+function enableCandidate(request, overrides = {}) {
+  request.assignment = { ticketId: "ticket", assignmentId: "assignment" };
+  request.mandate = {
+    strength: "explicit",
+    policyVersion: "policy-1",
+    projectId: "project",
+    projectFingerprint: request.workspace.fingerprint,
+    capabilities: ["read", "search", "test", "propose_write"],
+    triggerId: "trigger",
+    threadKey: request.threadKey,
+  };
+  request.candidate = {
+    raceId: "race-1",
+    candidateId: "candidate-a",
+    strategy: "minimal_change",
+    allowedPaths: ["README.md"],
+    acceptance: ["README heading is changed"],
+    generationAttempt: 1,
+    feedback: null,
+    ...overrides,
+  };
+}
+
+test("candidate mode returns a structured isolated batch without writing or proposing an Effect", async (t) => {
+  const value = fixture("candidate", "修改 README.md 的标题");
+  enableCandidate(value.request);
+  t.after(() => fs.rmSync(value.root, { recursive: true, force: true }));
+  const before = fs.readFileSync(path.join(value.root, "README.md"), "utf8");
+
+  const output = await value.executor.execute(value.request, { onEvent: (event) => value.events.push(event) });
+  const proposal = JSON.parse(output);
+
+  assert.equal(proposal.version, "ucode.candidate.v1");
+  assert.equal(proposal.candidateId, "candidate-a");
+  assert.deepEqual(proposal.changes, [{ path: "README.md", operation: "modify", content: "# Changed\n\nAwaiting approval.\n" }]);
+  assert.equal(fs.readFileSync(path.join(value.root, "README.md"), "utf8"), before);
+  assert.equal(value.events.some((event) => event.type === "effect_proposal"), false);
+  assert.equal(value.events[0].kind, "candidate_generation");
+  assert.equal(value.calls[0].mode, "candidate");
+  assert.deepEqual(value.calls[0].tools.map((item) => item.function.name), ["write_files"]);
+  assert.match(value.calls[0].messages[0].content, /最小修改/);
+  assert.match(value.calls[0].messages[0].content, /不能运行验证、选择赢家、声称完成或写入原项目/);
+});
+
+test("compatibility candidate may read a related caller but cannot modify it outside scope", async (t) => {
+  const value = fixture("candidate", "修改 src/api.js 并保持调用兼容");
+  fs.mkdirSync(path.join(value.root, "src"));
+  fs.writeFileSync(path.join(value.root, "src", "api.js"), "export function api() { return 1; }\n");
+  fs.writeFileSync(path.join(value.root, "src", "caller.js"), "import { api } from './api.js';\nconsole.log(api());\n");
+  value.request.workspace.files.push(
+    { path: "src/api.js", sizeBytes: 36, contentDigest: null },
+    { path: "src/caller.js", sizeBytes: 51, contentDigest: null },
+  );
+  enableCandidate(value.request, {
+    candidateId: "candidate-b",
+    strategy: "compatibility_first",
+    allowedPaths: ["src/api.js"],
+    acceptance: ["existing api() callers keep working"],
+    generationAttempt: 2,
+    feedback: "required test failed: expected 2",
+  });
+  const coder = value.executor.coder();
+  coder.generate = async (payload) => {
+    value.calls.push(payload);
+    return {
+      type: "tool_request",
+      content: "",
+      tool: { name: "write_files", arguments: { changes: [{ path: "src/api.js", operation: "modify", content: "export function api() { return 2; }" }] } },
+    };
+  };
+  t.after(() => fs.rmSync(value.root, { recursive: true, force: true }));
+
+  const proposal = JSON.parse(await value.executor.execute(value.request));
+  assert.equal(proposal.strategy, "compatibility_first");
+  assert.deepEqual(value.calls[0].workspace.files.map((file) => file.path), ["src/api.js", "src/caller.js"]);
+  assert.match(value.calls[0].messages[0].content, /机械验证反馈/);
+  assert.equal(proposal.changes[0].path, "src/api.js");
+
+  coder.generate = async () => ({
+    type: "tool_request",
+    content: "",
+    tool: { name: "write_files", arguments: { changes: [{ path: "src/caller.js", operation: "modify", content: "console.log('changed')" }] } },
+  });
+  await assert.rejects(() => value.executor.execute(value.request), /未授权路径/);
+});
+
+test("candidate mode rejects incomplete file content instead of claiming success", async (t) => {
+  const value = fixture("candidate", "修改 README.md");
+  enableCandidate(value.request);
+  value.executor.coder().generate = async () => ({
+    type: "tool_request",
+    content: "",
+    tool: { name: "write_files", arguments: { changes: [{ path: "README.md", operation: "modify", content: "" }] } },
+  });
+  t.after(() => fs.rmSync(value.root, { recursive: true, force: true }));
+  await assert.rejects(() => value.executor.execute(value.request), /没有提供 README\.md 的完整内容/);
+});
+
 test("stateless chat streams only text deltas and persists no Node ticket", async (t) => {
   const value = fixture("chat", "你好");
   t.after(() => fs.rmSync(value.root, { recursive: true, force: true }));
