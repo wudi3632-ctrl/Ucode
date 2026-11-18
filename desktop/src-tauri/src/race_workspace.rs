@@ -44,6 +44,14 @@ pub struct CandidateWorkspace {
     pub total_bytes: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceInventoryFile {
+    pub path: String,
+    pub size_bytes: u64,
+    pub content_digest: String,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct CopyLimits {
     pub max_files: usize,
@@ -228,6 +236,26 @@ pub fn remove_candidate_workspace(workspace: &CandidateWorkspace) -> Result<(), 
     Ok(())
 }
 
+pub fn load_candidate_workspace(
+    managed_root: &Path,
+    race_id: &str,
+    candidate_id: &str,
+) -> Result<CandidateWorkspace, WorkspaceError> {
+    validate_identifier(race_id)?;
+    validate_identifier(candidate_id)?;
+    let managed_root = fs::canonicalize(managed_root)?;
+    let race_root = fs::canonicalize(managed_root.join(race_id))?;
+    if !race_root.starts_with(&managed_root) {
+        return Err(WorkspaceError::ManagedRootEscape);
+    }
+    let bytes = fs::read(owner_marker(&race_root, candidate_id))
+        .map_err(|_| WorkspaceError::OwnershipMismatch)?;
+    let workspace: CandidateWorkspace =
+        serde_json::from_slice(&bytes).map_err(|_| WorkspaceError::OwnershipMismatch)?;
+    verify_owner_marker(&race_root, &workspace)?;
+    Ok(workspace)
+}
+
 pub fn digest_tree(root: &Path) -> Result<String, WorkspaceError> {
     let mut files = Vec::new();
     collect_files(root, root, &mut files)?;
@@ -240,6 +268,33 @@ pub fn digest_tree(root: &Path) -> Result<String, WorkspaceError> {
         digest.update([0xff]);
     }
     Ok(format!("{:x}", digest.finalize()))
+}
+
+pub fn workspace_inventory(
+    root: &Path,
+    maximum_files: usize,
+) -> Result<Vec<WorkspaceInventoryFile>, WorkspaceError> {
+    let root = fs::canonicalize(root)?;
+    let mut files = Vec::new();
+    collect_files(&root, &root, &mut files)?;
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    if files.len() > maximum_files {
+        return Err(WorkspaceError::TooManyFiles {
+            found: files.len(),
+            limit: maximum_files,
+        });
+    }
+    files
+        .into_iter()
+        .map(|(path, absolute)| {
+            let content = fs::read(&absolute)?;
+            Ok(WorkspaceInventoryFile {
+                path,
+                size_bytes: content.len() as u64,
+                content_digest: format!("{:x}", Sha256::digest(&content)),
+            })
+        })
+        .collect()
 }
 
 fn copy_bounded(

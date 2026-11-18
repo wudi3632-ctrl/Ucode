@@ -7,6 +7,7 @@ pub mod notifications;
 pub mod portable;
 pub mod provider;
 pub mod race;
+pub mod race_verifier;
 pub mod race_workspace;
 pub mod skills;
 pub mod storage;
@@ -191,6 +192,9 @@ pub fn run() {
             commands::uninstall_skill,
             commands::export_markdown,
             commands::list_events,
+            commands::list_ticket_races,
+            commands::start_candidate_race,
+            commands::cancel_candidate_race,
             commands::run_ticket,
             commands::continue_ticket,
             commands::resolve_effect,

@@ -12,6 +12,19 @@ pub enum ExecutorMode {
     Chat,
     ProjectRead,
     Action,
+    Candidate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutorCandidate {
+    pub race_id: String,
+    pub candidate_id: String,
+    pub strategy: String,
+    pub allowed_paths: Vec<String>,
+    pub acceptance: Vec<String>,
+    pub generation_attempt: u8,
+    pub feedback: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,6 +121,8 @@ pub struct ExecutorRequest {
     pub mode: ExecutorMode,
     pub assignment: Option<ExecutorAssignment>,
     pub mandate: Option<ExecutorMandate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate: Option<ExecutorCandidate>,
     pub inputs: Vec<ExecutorInput>,
     pub history: Vec<ExecutorHistoryItem>,
     pub workspace: ExecutorWorkspace,
@@ -134,12 +149,12 @@ impl ExecutorRequest {
         if self.history.len() > 24 || self.inputs.len() > 32 || self.attachments.len() > 8 {
             return Err(ProtocolError::ContextLimit);
         }
-        if self.mode == ExecutorMode::Action
+        if matches!(self.mode, ExecutorMode::Action | ExecutorMode::Candidate)
             && (self.assignment.is_none() || self.mandate.is_none())
         {
             return Err(ProtocolError::ActionAuthorityMissing);
         }
-        if self.mode != ExecutorMode::Action
+        if !matches!(self.mode, ExecutorMode::Action | ExecutorMode::Candidate)
             && (self.assignment.is_some() || self.mandate.is_some())
         {
             return Err(ProtocolError::UnexpectedAuthority);
@@ -150,6 +165,23 @@ impl ExecutorRequest {
             {
                 return Err(ProtocolError::AuthorityMismatch);
             }
+        }
+        match (&self.mode, &self.candidate) {
+            (ExecutorMode::Candidate, Some(candidate))
+                if !candidate.race_id.trim().is_empty()
+                    && !candidate.candidate_id.trim().is_empty()
+                    && matches!(
+                        candidate.strategy.as_str(),
+                        "minimal_change" | "compatibility_first"
+                    )
+                    && !candidate.allowed_paths.is_empty()
+                    && candidate.allowed_paths.len() <= 20
+                    && !candidate.acceptance.is_empty()
+                    && candidate.acceptance.len() <= 16
+                    && matches!(candidate.generation_attempt, 1 | 2) => {}
+            (ExecutorMode::Candidate, _) => return Err(ProtocolError::CandidateConfiguration),
+            (_, Some(_)) => return Err(ProtocolError::UnexpectedCandidate),
+            _ => {}
         }
         if self.attachments.is_empty() != self.attachment_token.is_none() {
             return Err(ProtocolError::AttachmentTokenMismatch);
@@ -237,6 +269,10 @@ pub enum ProtocolError {
     ActionAuthorityMissing,
     #[error("chat and project-read modes cannot carry action authority")]
     UnexpectedAuthority,
+    #[error("candidate mode requires bounded candidate configuration")]
+    CandidateConfiguration,
+    #[error("only candidate mode can carry candidate configuration")]
+    UnexpectedCandidate,
     #[error("Mandate does not match the Thread or workspace fingerprint")]
     AuthorityMismatch,
     #[error("attachment token and payload must be present together")]
@@ -271,6 +307,7 @@ mod tests {
             mode: ExecutorMode::Action,
             assignment: None,
             mandate: None,
+            candidate: None,
             inputs: vec![ExecutorInput {
                 id: "input".into(),
                 kind: TicketInputKind::Trigger,
@@ -319,5 +356,62 @@ mod tests {
         assert_eq!(value["effectKey"], "write:file:digest");
         assert_eq!(value["payloadDigest"], "digest");
         assert!(value.get("effect_key").is_none());
+    }
+
+    #[test]
+    fn candidate_mode_requires_authority_and_bounded_configuration() {
+        let mut capabilities = BTreeSet::new();
+        capabilities.insert(Capability::ProposeWrite);
+        let mut request = ExecutorRequest {
+            version: EXECUTOR_PROTOCOL_V1.into(),
+            request_id: "candidate-request".into(),
+            turn_id: "candidate-turn".into(),
+            thread_key: "desktop:race:race-1".into(),
+            mode: ExecutorMode::Candidate,
+            assignment: Some(ExecutorAssignment {
+                ticket_id: "ticket-1".into(),
+                assignment_id: "candidate-a".into(),
+            }),
+            mandate: Some(ExecutorMandate {
+                strength: Strength::Explicit,
+                policy_version: "race-v1".into(),
+                project_id: "project-1".into(),
+                project_fingerprint: "candidate-workspace".into(),
+                capabilities,
+                trigger_id: "trigger-1".into(),
+                thread_key: "desktop:race:race-1".into(),
+            }),
+            candidate: Some(ExecutorCandidate {
+                race_id: "race-1".into(),
+                candidate_id: "candidate-a".into(),
+                strategy: "minimal_change".into(),
+                allowed_paths: vec!["src/app.rs".into()],
+                acceptance: vec!["cargo test".into()],
+                generation_attempt: 1,
+                feedback: None,
+            }),
+            inputs: vec![ExecutorInput {
+                id: "input".into(),
+                kind: TicketInputKind::Trigger,
+                trigger_id: Some("trigger-1".into()),
+                text: "fix it".into(),
+                human: true,
+            }],
+            history: Vec::new(),
+            workspace: ExecutorWorkspace {
+                canonical_root: "C:/candidate".into(),
+                fingerprint: "candidate-workspace".into(),
+                files: Vec::new(),
+            },
+            attachment_token: None,
+            attachments: Vec::new(),
+            metadata: Value::Null,
+        };
+        request.validate().unwrap();
+        request.candidate.as_mut().unwrap().generation_attempt = 3;
+        assert_eq!(
+            request.validate(),
+            Err(ProtocolError::CandidateConfiguration)
+        );
     }
 }

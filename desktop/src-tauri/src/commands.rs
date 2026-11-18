@@ -7,15 +7,25 @@ use crate::notifications::{
 use crate::model_packs::ModelPackInfo;
 use crate::portable::{CapsuleHealth, PortableRoot};
 use crate::provider::{self, ProviderSecretStatus, ProviderTestResult};
+use crate::race::{
+    judge, Candidate, CandidateState, CandidateStrategy, HardFailure, Race, RaceState,
+    ValidationFact, ValidationOutcome, RACE_SCHEMA_VERSION,
+};
+use crate::race_verifier::{acceptance_is_supported, verify_candidate, CandidateProposal};
+use crate::race_workspace::{
+    create_candidate_workspace, digest_tree, load_candidate_workspace,
+    remove_candidate_workspace, workspace_inventory,
+};
 use crate::skills::{SkillPreview, SkillRuntime};
 use crate::storage::{
     AppSettings, AssignmentSummary, EvidenceReceipt, OnboardingState, ProjectSummary, RuntimeEvent,
     SkillSummary, Storage, TicketSummary, ONBOARDING_STEPS,
 };
 use crate::superagent::{
-    ExecutorAttachment, ExecutorClient, ExecutorEvent, ExecutorEventPayload, ExecutorHistoryItem,
-    ExecutorInput, ExecutorMode, ExecutorRequest, ExecutorWorkspace, HistoryRole, TicketInputKind,
-    ReportState, WorkspaceFile, EXECUTOR_PROTOCOL_V1,
+    Capability, ExecutorAssignment, ExecutorAttachment, ExecutorCandidate, ExecutorClient,
+    ExecutorEvent, ExecutorEventPayload, ExecutorHistoryItem, ExecutorInput, ExecutorMandate,
+    ExecutorMode, ExecutorRequest, ExecutorWorkspace, HistoryRole, ReportState, Strength,
+    TicketInputKind, WorkspaceFile, EXECUTOR_PROTOCOL_V1,
 };
 use crate::supervisor::{
     CompatibilitySupervisor, ProcessSupervisor, RuntimeDiagnosticSnapshot, ServiceStatus,
@@ -27,7 +37,7 @@ use crate::terminal::{
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
@@ -201,6 +211,13 @@ pub struct BootstrapSnapshot {
     capsule_health: CapsuleHealth,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RaceBundle {
+    race: Race,
+    candidates: Vec<Candidate>,
+}
+
 fn snapshot(state: &AppState) -> Result<BootstrapSnapshot, String> {
     let capsule_health = state
         .capsule_health
@@ -297,6 +314,210 @@ fn legacy_execution_context(storage: &Arc<Mutex<Storage>>, runtime: &SkillRuntim
 #[tauri::command]
 pub fn bootstrap(state: State<'_, AppState>) -> Result<BootstrapSnapshot, String> {
     snapshot(&state)
+}
+
+#[tauri::command]
+pub fn list_ticket_races(
+    ticket_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<RaceBundle>, String> {
+    let storage = state
+        .storage
+        .lock()
+        .map_err(|_| "storage lock was poisoned".to_string())?;
+    storage
+        .races_for_ticket(&ticket_id)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|race| {
+            let candidates = storage
+                .candidates_for_race(&race.id)
+                .map_err(|error| error.to_string())?;
+            Ok(RaceBundle { race, candidates })
+        })
+        .collect()
+}
+
+#[tauri::command]
+pub fn start_candidate_race(
+    ticket_id: String,
+    allowed_paths: Vec<String>,
+    acceptance: Vec<String>,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<RaceBundle, String> {
+    ensure_capsule_writable(&state)?;
+    let allowed_paths = normalize_race_paths(allowed_paths)?;
+    if acceptance.is_empty()
+        || acceptance.len() > 16
+        || acceptance.iter().any(|value| !acceptance_is_supported(value))
+    {
+        return Err("候选竞赛需要 1-16 个受支持的机械验收命令（pytest、cargo test 或受限 npm 脚本）".into());
+    }
+    let (ticket, project, settings) = {
+        let storage = state
+            .storage
+            .lock()
+            .map_err(|_| "storage lock was poisoned".to_string())?;
+        let ticket = storage
+            .ticket(&ticket_id)
+            .map_err(|error| error.to_string())?;
+        if storage
+            .races_for_ticket(&ticket_id)
+            .map_err(|error| error.to_string())?
+            .iter()
+            .any(|race| race.state.is_recoverable())
+        {
+            return Err("该任务已有尚未结束的候选竞赛".into());
+        }
+        let project = storage
+            .project(&ticket.project_id)
+            .map_err(|error| error.to_string())?;
+        let settings = storage.settings().map_err(|error| error.to_string())?;
+        (ticket, project, settings)
+    };
+    let now = Utc::now().to_rfc3339();
+    let race_id = format!("race-{}", Uuid::new_v4());
+    let project_digest = digest_tree(Path::new(&project.path)).map_err(|error| error.to_string())?;
+    let race = Race {
+        schema_version: RACE_SCHEMA_VERSION,
+        id: race_id.clone(),
+        ticket_id: ticket.id.clone(),
+        project_fingerprint: project_digest,
+        objective: ticket.request.clone(),
+        state: RaceState::Prepared,
+        allowed_paths: allowed_paths.clone(),
+        acceptance: acceptance.clone(),
+        verdict: None,
+        created_at: now.clone(),
+        updated_at: now.clone(),
+    };
+    let model = if settings.model_provider == "bundled" {
+        settings.bundled_model_profile.clone()
+    } else {
+        settings.provider_model.clone()
+    };
+    let candidates = [
+        CandidateStrategy::MinimalChange,
+        CandidateStrategy::CompatibilityFirst,
+    ]
+    .into_iter()
+    .map(|strategy| Candidate {
+        schema_version: RACE_SCHEMA_VERSION,
+        id: format!("candidate-{}", Uuid::new_v4()),
+        race_id: race.id.clone(),
+        strategy,
+        state: CandidateState::Queued,
+        provider: settings.model_provider.clone(),
+        model: model.clone(),
+        executor_request_id: None,
+        workspace_path: None,
+        diff: None,
+        base_digest: String::new(),
+        result_digest: None,
+        facts: Vec::new(),
+        metrics: Default::default(),
+        generation_attempts: 0,
+        created_at: now.clone(),
+        updated_at: now.clone(),
+    })
+    .collect::<Vec<_>>();
+    {
+        let storage = state
+            .storage
+            .lock()
+            .map_err(|_| "storage lock was poisoned".to_string())?;
+        storage.save_race(&race).map_err(|error| error.to_string())?;
+        for candidate in &candidates {
+            storage
+                .save_candidate(candidate)
+                .map_err(|error| error.to_string())?;
+        }
+        storage
+            .append_event(
+                Some(&ticket.id),
+                "race.prepared",
+                json!({ "raceId": race.id, "candidateIds": candidates.iter().map(|candidate| &candidate.id).collect::<Vec<_>>() }),
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    let storage = Arc::clone(&state.storage);
+    let executor = state.executor.clone();
+    let managed_root = state.portable.worktrees_dir().join("races");
+    let task_race_id = race.id.clone();
+    let task_project_id = project.id.clone();
+    let task_project_path = project.path.clone();
+    std::thread::spawn(move || {
+        if let Err(error) = run_candidate_race_task(
+            &storage,
+            &executor,
+            &app,
+            &task_race_id,
+            &task_project_id,
+            Path::new(&task_project_path),
+            &managed_root,
+        ) {
+            cleanup_race_workspaces(&managed_root, &task_race_id, &storage);
+            fail_race(&storage, &app, &task_race_id, &error);
+        }
+    });
+    Ok(RaceBundle { race, candidates })
+}
+
+#[tauri::command]
+pub fn cancel_candidate_race(
+    race_id: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<RaceBundle, String> {
+    let mut race = state
+        .storage
+        .lock()
+        .map_err(|_| "storage lock was poisoned".to_string())?
+        .race(&race_id)
+        .map_err(|error| error.to_string())?;
+    if !matches!(
+        race.state,
+        RaceState::Prepared | RaceState::Generating | RaceState::Validating
+    ) {
+        return Err("只有运行中的候选竞赛可以取消".into());
+    }
+    race.transition(RaceState::Cancelled, Utc::now().to_rfc3339())
+        .map_err(|error| error.to_string())?;
+    let mut candidates = {
+        let storage = state
+            .storage
+            .lock()
+            .map_err(|_| "storage lock was poisoned".to_string())?;
+        storage.save_race(&race).map_err(|error| error.to_string())?;
+        storage
+            .candidates_for_race(&race_id)
+            .map_err(|error| error.to_string())?
+    };
+    for candidate in &mut candidates {
+        if let Some(request_id) = candidate.executor_request_id.as_deref() {
+            let _ = state.executor.cancel(request_id);
+        }
+        if candidate.state.can_transition_to(CandidateState::Cancelled) {
+            candidate
+                .transition(CandidateState::Cancelled, Utc::now().to_rfc3339())
+                .map_err(|error| error.to_string())?;
+            state
+                .storage
+                .lock()
+                .map_err(|_| "storage lock was poisoned".to_string())?
+                .save_candidate(candidate)
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    append_runtime_event(
+        &state.storage,
+        &race.ticket_id,
+        "race.cancelled",
+        json!({ "raceId": race.id }),
+        &app,
+    );
+    Ok(RaceBundle { race, candidates })
 }
 
 #[tauri::command]
@@ -2463,6 +2684,7 @@ fn run_readonly_subagent_child(
         mode: ExecutorMode::ProjectRead,
         assignment: None,
         mandate: None,
+        candidate: None,
         inputs: vec![ExecutorInput {
             id: format!("input-{}", Uuid::new_v4()),
             kind: TicketInputKind::Trigger,
@@ -4340,6 +4562,7 @@ fn run_executor_ticket(
         mode: route.protocol_mode(),
         assignment: None,
         mandate: None,
+        candidate: None,
         inputs: vec![ExecutorInput {
             id: format!("input-{}", Uuid::new_v4()),
             kind: TicketInputKind::Trigger,
@@ -4421,6 +4644,541 @@ fn run_executor_ticket(
         return Err(message);
     }
     Ok(())
+}
+
+fn normalize_race_paths(values: Vec<String>) -> Result<Vec<String>, String> {
+    if values.is_empty() || values.len() > 20 {
+        return Err("候选竞赛需要 1-20 个明确的允许路径".into());
+    }
+    let mut normalized = Vec::new();
+    for value in values {
+        let value = value.trim().replace('\\', "/");
+        let path = Path::new(&value);
+        if value.is_empty()
+            || value.len() > 260
+            || path.is_absolute()
+            || value.split('/').any(|segment| segment.is_empty())
+            || path.components().any(|component| {
+                !matches!(component, Component::Normal(_))
+            })
+        {
+            return Err(format!("候选允许路径无效：{value}"));
+        }
+        if !normalized.contains(&value) {
+            normalized.push(value);
+        }
+    }
+    Ok(normalized)
+}
+
+fn run_candidate_race_task(
+    storage: &Arc<Mutex<Storage>>,
+    executor: &ExecutorClient,
+    app: &AppHandle,
+    race_id: &str,
+    project_id: &str,
+    project_path: &Path,
+    managed_root: &Path,
+) -> Result<(), String> {
+    let mut race = storage
+        .lock()
+        .map_err(|_| "storage lock was poisoned".to_string())?
+        .race(race_id)
+        .map_err(|error| error.to_string())?;
+    race.transition(RaceState::Generating, Utc::now().to_rfc3339())
+        .map_err(|error| error.to_string())?;
+    storage
+        .lock()
+        .map_err(|_| "storage lock was poisoned".to_string())?
+        .save_race(&race)
+        .map_err(|error| error.to_string())?;
+    append_runtime_event(
+        storage,
+        &race.ticket_id,
+        "race.generating",
+        json!({ "raceId": race.id }),
+        app,
+    );
+
+    let candidates = storage
+        .lock()
+        .map_err(|_| "storage lock was poisoned".to_string())?
+        .candidates_for_race(race_id)
+        .map_err(|error| error.to_string())?;
+    for mut candidate in candidates {
+        if race_cancelled(storage, race_id)? {
+            cleanup_race_workspaces(managed_root, race_id, storage);
+            return Ok(());
+        }
+        candidate
+            .transition(CandidateState::Generating, Utc::now().to_rfc3339())
+            .map_err(|error| error.to_string())?;
+        candidate.generation_attempts = 1;
+        let workspace = match create_candidate_workspace(
+            project_path,
+            managed_root,
+            race_id,
+            &candidate.id,
+        ) {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                mark_candidate_failed(&mut candidate, format!("隔离工作区创建失败：{error}"));
+                storage
+                    .lock()
+                    .map_err(|_| "storage lock was poisoned".to_string())?
+                    .save_candidate(&candidate)
+                    .map_err(|error| error.to_string())?;
+                continue;
+            }
+        };
+        candidate.workspace_path = Some(workspace.path.clone());
+        candidate.base_digest = workspace.base_digest.clone();
+        let request_id = format!("executor-race-{}", Uuid::new_v4());
+        candidate.executor_request_id = Some(request_id.clone());
+        storage
+            .lock()
+            .map_err(|_| "storage lock was poisoned".to_string())?
+            .save_candidate(&candidate)
+            .map_err(|error| error.to_string())?;
+
+        let inventory = match workspace_inventory(Path::new(&workspace.path), 2_000) {
+            Ok(inventory) => inventory,
+            Err(error) => {
+                mark_candidate_failed(&mut candidate, format!("候选索引失败：{error}"));
+                storage
+                    .lock()
+                    .map_err(|_| "storage lock was poisoned".to_string())?
+                    .save_candidate(&candidate)
+                    .map_err(|error| error.to_string())?;
+                let _ = remove_candidate_workspace(&workspace);
+                continue;
+            }
+        };
+        let thread_key = format!("desktop:race:{race_id}");
+        let trigger_id = format!("trigger-{}", Uuid::new_v4());
+        let capabilities = [
+            Capability::Read,
+            Capability::Search,
+            Capability::Test,
+            Capability::ProposeWrite,
+        ]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+        let strategy = candidate_strategy_id(candidate.strategy).to_string();
+        let request = ExecutorRequest {
+            version: EXECUTOR_PROTOCOL_V1.into(),
+            request_id: request_id.clone(),
+            turn_id: format!("turn-{}", Uuid::new_v4()),
+            thread_key: thread_key.clone(),
+            mode: ExecutorMode::Candidate,
+            assignment: Some(ExecutorAssignment {
+                ticket_id: race.ticket_id.clone(),
+                assignment_id: candidate.id.clone(),
+            }),
+            mandate: Some(ExecutorMandate {
+                strength: Strength::Explicit,
+                policy_version: "race-v1".into(),
+                project_id: project_id.into(),
+                project_fingerprint: workspace.base_digest.clone(),
+                capabilities,
+                trigger_id: trigger_id.clone(),
+                thread_key,
+            }),
+            candidate: Some(ExecutorCandidate {
+                race_id: race_id.into(),
+                candidate_id: candidate.id.clone(),
+                strategy,
+                allowed_paths: race.allowed_paths.clone(),
+                acceptance: race.acceptance.clone(),
+                generation_attempt: 1,
+                feedback: None,
+            }),
+            inputs: vec![ExecutorInput {
+                id: format!("input-{}", Uuid::new_v4()),
+                kind: TicketInputKind::Trigger,
+                trigger_id: Some(trigger_id),
+                text: race.objective.clone(),
+                human: true,
+            }],
+            history: Vec::new(),
+            workspace: ExecutorWorkspace {
+                canonical_root: workspace.path.clone(),
+                fingerprint: workspace.base_digest.clone(),
+                files: inventory
+                    .into_iter()
+                    .map(|file| WorkspaceFile {
+                        path: file.path,
+                        size_bytes: file.size_bytes,
+                        content_digest: Some(file.content_digest),
+                    })
+                    .collect(),
+            },
+            attachment_token: None,
+            attachments: Vec::new(),
+            metadata: json!({ "locale": "zh-CN", "raceId": race_id }),
+        };
+        let event_storage = Arc::clone(storage);
+        let event_app = app.clone();
+        let event_ticket_id = race.ticket_id.clone();
+        let event_candidate_id = candidate.id.clone();
+        let terminal = executor.run(&request, move |event| {
+            if let ExecutorEventPayload::Activity {
+                kind,
+                title,
+                status,
+                evidence,
+                ..
+            } = &event.payload
+            {
+                append_runtime_event(
+                    &event_storage,
+                    &event_ticket_id,
+                    "race.candidate_activity",
+                    json!({
+                        "candidateId": event_candidate_id,
+                        "kind": kind,
+                        "title": title,
+                        "status": status,
+                        "evidence": evidence,
+                    }),
+                    &event_app,
+                );
+            }
+        });
+        let current = storage
+            .lock()
+            .map_err(|_| "storage lock was poisoned".to_string())?
+            .candidates_for_race(race_id)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|value| value.id == candidate.id)
+            .ok_or_else(|| "candidate disappeared during generation".to_string())?;
+        if current.state == CandidateState::Cancelled || race_cancelled(storage, race_id)? {
+            let _ = remove_candidate_workspace(&workspace);
+            cleanup_race_workspaces(managed_root, race_id, storage);
+            return Ok(());
+        }
+        match terminal {
+            Ok(ExecutorEvent {
+                payload: ExecutorEventPayload::Complete { content, .. },
+                ..
+            }) => match serde_json::from_str::<CandidateProposal>(&content) {
+                Ok(proposal)
+                    if proposal.race_id == race.id
+                        && proposal.candidate_id == candidate.id
+                        && proposal.strategy == candidate_strategy_id(candidate.strategy) =>
+                {
+                    candidate
+                        .transition(CandidateState::Proposed, Utc::now().to_rfc3339())
+                        .map_err(|error| error.to_string())?;
+                    let proposal_path = Path::new(&workspace.path).join(".ucode-candidate.json");
+                    fs::write(&proposal_path, content).map_err(|error| error.to_string())?;
+                }
+                Ok(_) => mark_candidate_failed(
+                    &mut candidate,
+                    "候选响应身份或策略与请求不匹配".into(),
+                ),
+                Err(error) => mark_candidate_failed(
+                    &mut candidate,
+                    format!("候选响应无法解析：{error}"),
+                ),
+            },
+            Ok(ExecutorEvent {
+                payload: ExecutorEventPayload::Cancelled,
+                ..
+            }) => {
+                candidate
+                    .transition(CandidateState::Cancelled, Utc::now().to_rfc3339())
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(ExecutorEvent {
+                payload: ExecutorEventPayload::Failure { message, .. },
+                ..
+            }) => mark_candidate_failed(&mut candidate, message),
+            Ok(_) => mark_candidate_failed(&mut candidate, "候选生成没有终态结果".into()),
+            Err(error) => mark_candidate_failed(&mut candidate, error.to_string()),
+        }
+        storage
+            .lock()
+            .map_err(|_| "storage lock was poisoned".to_string())?
+            .save_candidate(&candidate)
+            .map_err(|error| error.to_string())?;
+        if candidate.state != CandidateState::Proposed {
+            let _ = remove_candidate_workspace(&workspace);
+            candidate.workspace_path = None;
+            storage
+                .lock()
+                .map_err(|_| "storage lock was poisoned".to_string())?
+                .save_candidate(&candidate)
+                .map_err(|error| error.to_string())?;
+        }
+    }
+
+    if race_cancelled(storage, race_id)? {
+        cleanup_race_workspaces(managed_root, race_id, storage);
+        return Ok(());
+    }
+    race = storage
+        .lock()
+        .map_err(|_| "storage lock was poisoned".to_string())?
+        .race(race_id)
+        .map_err(|error| error.to_string())?;
+    race.transition(RaceState::Validating, Utc::now().to_rfc3339())
+        .map_err(|error| error.to_string())?;
+    storage
+        .lock()
+        .map_err(|_| "storage lock was poisoned".to_string())?
+        .save_race(&race)
+        .map_err(|error| error.to_string())?;
+    append_runtime_event(
+        storage,
+        &race.ticket_id,
+        "race.validating",
+        json!({ "raceId": race.id }),
+        app,
+    );
+
+    let candidates = storage
+        .lock()
+        .map_err(|_| "storage lock was poisoned".to_string())?
+        .candidates_for_race(race_id)
+        .map_err(|error| error.to_string())?;
+    for mut candidate in candidates {
+        if candidate.state != CandidateState::Proposed {
+            continue;
+        }
+        candidate
+            .transition(CandidateState::Validating, Utc::now().to_rfc3339())
+            .map_err(|error| error.to_string())?;
+        let workspace = load_candidate_workspace(managed_root, race_id, &candidate.id)
+            .map_err(|error| error.to_string())?;
+        let proposal_path = Path::new(&workspace.path).join(".ucode-candidate.json");
+        let proposal: CandidateProposal = serde_json::from_slice(
+            &fs::read(&proposal_path).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        let _ = fs::remove_file(&proposal_path);
+        match verify_candidate(&workspace, &proposal, &race.allowed_paths, &race.acceptance) {
+            Ok(result) => {
+                candidate.diff = Some(result.diff);
+                candidate.facts = result.facts;
+                candidate.metrics = result.metrics;
+                candidate.result_digest = Some(result.result_digest);
+                let passed = candidate
+                    .facts
+                    .iter()
+                    .all(|fact| fact.hard_failure.is_none())
+                    && candidate.facts.iter().all(|fact| {
+                        !fact.required || fact.outcome == ValidationOutcome::Passed
+                    });
+                candidate
+                    .transition(
+                        if passed {
+                            CandidateState::Passed
+                        } else {
+                            CandidateState::Failed
+                        },
+                        Utc::now().to_rfc3339(),
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+            Err(error) => {
+                mark_candidate_failed(&mut candidate, format!("候选验证失败：{error}"));
+            }
+        }
+        storage
+            .lock()
+            .map_err(|_| "storage lock was poisoned".to_string())?
+            .save_candidate(&candidate)
+            .map_err(|error| error.to_string())?;
+        if candidate.state != CandidateState::Passed {
+            let _ = remove_candidate_workspace(&workspace);
+            candidate.workspace_path = None;
+            storage
+                .lock()
+                .map_err(|_| "storage lock was poisoned".to_string())?
+                .save_candidate(&candidate)
+                .map_err(|error| error.to_string())?;
+        }
+    }
+
+    let candidates = storage
+        .lock()
+        .map_err(|_| "storage lock was poisoned".to_string())?
+        .candidates_for_race(race_id)
+        .map_err(|error| error.to_string())?;
+    race.verdict = Some(judge(&candidates, Utc::now().to_rfc3339()));
+    if race
+        .verdict
+        .as_ref()
+        .and_then(|verdict| verdict.winner_id.as_ref())
+        .is_some()
+    {
+        race.transition(RaceState::Decided, Utc::now().to_rfc3339())
+            .map_err(|error| error.to_string())?;
+        race.transition(RaceState::AwaitingReview, Utc::now().to_rfc3339())
+            .map_err(|error| error.to_string())?;
+        let current_digest = digest_tree(project_path).map_err(|error| error.to_string())?;
+        if current_digest != race.project_fingerprint {
+            race.transition(RaceState::Stale, Utc::now().to_rfc3339())
+                .map_err(|error| error.to_string())?;
+            cleanup_race_workspaces(managed_root, race_id, storage);
+        } else if let Some(winner) = race
+            .verdict
+            .as_ref()
+            .and_then(|verdict| verdict.winner_id.as_deref())
+        {
+            for candidate in &candidates {
+                if candidate.id != winner {
+                    cleanup_candidate_workspace_record(
+                        managed_root,
+                        race_id,
+                        &candidate.id,
+                        storage,
+                    );
+                }
+            }
+        }
+    } else {
+        race.transition(RaceState::NoWinner, Utc::now().to_rfc3339())
+            .map_err(|error| error.to_string())?;
+        cleanup_race_workspaces(managed_root, race_id, storage);
+    }
+    storage
+        .lock()
+        .map_err(|_| "storage lock was poisoned".to_string())?
+        .save_race(&race)
+        .map_err(|error| error.to_string())?;
+    append_runtime_event(
+        storage,
+        &race.ticket_id,
+        "race.decided",
+        json!({ "race": race, "candidates": candidates }),
+        app,
+    );
+    Ok(())
+}
+
+fn candidate_strategy_id(strategy: CandidateStrategy) -> &'static str {
+    match strategy {
+        CandidateStrategy::MinimalChange => "minimal_change",
+        CandidateStrategy::CompatibilityFirst => "compatibility_first",
+    }
+}
+
+fn mark_candidate_failed(candidate: &mut Candidate, summary: String) {
+    candidate.facts.push(ValidationFact {
+        check_id: "candidate-generation".into(),
+        outcome: ValidationOutcome::Failed,
+        summary,
+        required: true,
+        hard_failure: Some(HardFailure::NonReplayable),
+        command: None,
+        exit_code: None,
+        evidence_digests: Vec::new(),
+    });
+    if candidate.state.can_transition_to(CandidateState::Failed) {
+        let _ = candidate.transition(CandidateState::Failed, Utc::now().to_rfc3339());
+    }
+}
+
+fn race_cancelled(storage: &Arc<Mutex<Storage>>, race_id: &str) -> Result<bool, String> {
+    Ok(storage
+        .lock()
+        .map_err(|_| "storage lock was poisoned".to_string())?
+        .race(race_id)
+        .map_err(|error| error.to_string())?
+        .state
+        == RaceState::Cancelled)
+}
+
+fn cleanup_race_workspaces(
+    managed_root: &Path,
+    race_id: &str,
+    storage: &Arc<Mutex<Storage>>,
+) {
+    let candidates = storage
+        .lock()
+        .ok()
+        .and_then(|guard| guard.candidates_for_race(race_id).ok())
+        .unwrap_or_default();
+    for candidate in candidates {
+        cleanup_candidate_workspace_record(
+            managed_root,
+            race_id,
+            &candidate.id,
+            storage,
+        );
+    }
+}
+
+fn cleanup_candidate_workspace_record(
+    managed_root: &Path,
+    race_id: &str,
+    candidate_id: &str,
+    storage: &Arc<Mutex<Storage>>,
+) {
+    let mut candidate = storage
+        .lock()
+        .ok()
+        .and_then(|guard| guard.candidates_for_race(race_id).ok())
+        .and_then(|values| values.into_iter().find(|value| value.id == candidate_id));
+    let Some(candidate) = candidate.as_mut() else {
+        return;
+    };
+    if let Ok(workspace) = load_candidate_workspace(managed_root, race_id, candidate_id) {
+        if remove_candidate_workspace(&workspace).is_ok() {
+            candidate.workspace_path = None;
+            if let Ok(guard) = storage.lock() {
+                let _ = guard.save_candidate(candidate);
+            }
+        }
+    } else if candidate.workspace_path.is_some() {
+        candidate.workspace_path = None;
+        if let Ok(guard) = storage.lock() {
+            let _ = guard.save_candidate(candidate);
+        }
+    }
+}
+
+fn fail_race(
+    storage: &Arc<Mutex<Storage>>,
+    app: &AppHandle,
+    race_id: &str,
+    error: &str,
+) {
+    let Ok(guard) = storage.lock() else {
+        return;
+    };
+    let Ok(mut race) = guard.race(race_id) else {
+        return;
+    };
+    if race.state == RaceState::Cancelled {
+        return;
+    }
+    if race.state == RaceState::Prepared {
+        let _ = race.transition(RaceState::Generating, Utc::now().to_rfc3339());
+    }
+    if race.state == RaceState::Generating {
+        let _ = race.transition(RaceState::Validating, Utc::now().to_rfc3339());
+    }
+    let candidates = guard.candidates_for_race(race_id).unwrap_or_default();
+    race.verdict = Some(judge(&candidates, Utc::now().to_rfc3339()));
+    if race.state == RaceState::Validating {
+        let _ = race.transition(RaceState::NoWinner, Utc::now().to_rfc3339());
+    }
+    let ticket_id = race.ticket_id.clone();
+    let _ = guard.save_race(&race);
+    let _ = guard.append_event(
+        Some(&ticket_id),
+        "race.failed",
+        json!({ "raceId": race_id, "message": error }),
+    );
+    drop(guard);
+    let _ = app.emit(
+        "ucode://runtime-event",
+        json!({ "ticketId": ticket_id, "eventType": "race.failed", "payload": { "raceId": race_id, "message": error } }),
+    );
 }
 
 fn automatic_scout_requests(
@@ -5320,5 +6078,17 @@ mod tests {
         .unwrap_err()
         .contains("基准提交"));
         assert!(validate_patch_paths("diff --git a/../escape b/../escape\n").is_err());
+    }
+
+    #[test]
+    fn candidate_race_scope_requires_explicit_project_relative_paths() {
+        assert_eq!(
+            normalize_race_paths(vec!["src/app.py".into(), "src/app.py".into()]).unwrap(),
+            vec!["src/app.py"]
+        );
+        for value in ["../secret.txt", "C:/secret.txt", "/root/secret.txt", "src//app.py"] {
+            assert!(normalize_race_paths(vec![value.into()]).is_err(), "accepted {value}");
+        }
+        assert!(normalize_race_paths(Vec::new()).is_err());
     }
 }

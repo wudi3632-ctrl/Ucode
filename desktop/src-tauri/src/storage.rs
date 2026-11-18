@@ -3058,6 +3058,7 @@ mod tests {
             state: CandidateState::Passed,
             provider: "bundled".into(),
             model: "qwen".into(),
+            executor_request_id: None,
             workspace_path: Some("private/worktree".into()),
             diff: Some("diff --git a/src/a.rs b/src/a.rs".into()),
             base_digest: "before".into(),

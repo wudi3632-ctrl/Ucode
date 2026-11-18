@@ -160,6 +160,7 @@ mod tests {
             mode: ExecutorMode::Chat,
             assignment: None,
             mandate: None,
+            candidate: None,
             inputs: vec![ExecutorInput {
                 id: "input".into(),
                 kind: TicketInputKind::Trigger,

@@ -194,6 +194,8 @@ pub struct Candidate {
     pub state: CandidateState,
     pub provider: String,
     pub model: String,
+    #[serde(default)]
+    pub executor_request_id: Option<String>,
     pub workspace_path: Option<String>,
     pub diff: Option<String>,
     pub base_digest: String,
@@ -409,6 +411,7 @@ mod tests {
             state,
             provider: "bundled".into(),
             model: "qwen".into(),
+            executor_request_id: None,
             workspace_path: Some(format!("private/{id}")),
             diff: Some("diff --git a/a b/a\n+fixed".into()),
             base_digest: "base".into(),
