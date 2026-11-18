@@ -5240,6 +5240,16 @@ fn requests_machine_path_repair(value: &str) -> bool {
         .any(|scope| actionable.contains(scope))
 }
 
+fn requests_user_proxy_repair(value: &str) -> bool {
+    if !requests_rescue_repair(value) {
+        return false;
+    }
+    let actionable = without_negated_desktop_actions(&value.to_lowercase());
+    ["代理", "proxy"]
+        .iter()
+        .any(|scope| actionable.contains(scope))
+}
+
 fn mentions_project_file(value: &str) -> bool {
     [
         ".md", ".txt", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".py", ".rs", ".go", ".java",
@@ -5386,6 +5396,36 @@ fn run_executor_ticket(
                     ticket_id,
                     "rescue.repair.unavailable",
                     json!({ "operationId": if machine_scope { "system.machine_path.normalize" } else { "system.user_path.normalize" }, "error": error }),
+                    app,
+                ),
+            }
+        } else if report.domain == "network" && requests_user_proxy_repair(request_text) {
+            let evidence_ids = report
+                .evidence
+                .iter()
+                .filter(|item| item.tool_id == "network.proxy.inspect")
+                .map(|item| item.id.clone())
+                .collect::<Vec<_>>();
+            match rescue_repairs.propose_user_proxy_disable(ticket_id, evidence_ids) {
+                Ok(Some(proposal)) => append_runtime_event(
+                    storage,
+                    ticket_id,
+                    "rescue.repair.proposed",
+                    json!({ "proposal": proposal }),
+                    app,
+                ),
+                Ok(None) => append_runtime_event(
+                    storage,
+                    ticket_id,
+                    "rescue.repair.unavailable",
+                    json!({ "operationId": "network.user_proxy.disable_manual", "error": "当前用户手动代理未启用；没有可应用的 R2 修改" }),
+                    app,
+                ),
+                Err(error) => append_runtime_event(
+                    storage,
+                    ticket_id,
+                    "rescue.repair.unavailable",
+                    json!({ "operationId": "network.user_proxy.disable_manual", "error": error }),
                     app,
                 ),
             }
@@ -7030,6 +7070,10 @@ mod tests {
         assert!(!requests_machine_path_repair(
             "只检查机器 PATH，不要修复系统"
         ));
+        assert!(requests_user_proxy_repair("请修复当前用户代理设置"));
+        assert!(requests_user_proxy_repair("fix the stale proxy"));
+        assert!(!requests_user_proxy_repair("只检查代理，不要修复"));
+        assert!(!requests_user_proxy_repair("请修复机器 PATH"));
     }
 
     #[test]

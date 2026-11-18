@@ -16,6 +16,10 @@ pub const REPAIR_SCHEMA_VERSION: u16 = 1;
 pub const USER_PATH_OPERATION: &str = "system.user_path.normalize";
 const USER_PATH_OPERATION_VERSION: u16 = 1;
 const USER_ENVIRONMENT_TARGET: &str = r"HKCU\Environment\Path";
+pub const USER_PROXY_DISABLE_OPERATION: &str = "network.user_proxy.disable_manual";
+const USER_PROXY_DISABLE_OPERATION_VERSION: u16 = 1;
+const USER_PROXY_ENABLE_TARGET: &str =
+    r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings\ProxyEnable";
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -28,10 +32,17 @@ pub struct RepairOperationDefinition {
 }
 
 pub fn operation_registry() -> &'static [RepairOperationDefinition] {
-    static OPERATIONS: [RepairOperationDefinition; 4] = [
+    static OPERATIONS: [RepairOperationDefinition; 5] = [
         RepairOperationDefinition {
             id: USER_PATH_OPERATION,
             version: 1,
+            risk: "r2",
+            authority: "current_user_registry",
+            enabled: true,
+        },
+        RepairOperationDefinition {
+            id: USER_PROXY_DISABLE_OPERATION,
+            version: USER_PROXY_DISABLE_OPERATION_VERSION,
             risk: "r2",
             authority: "current_user_registry",
             enabled: true,
@@ -130,6 +141,12 @@ pub struct RepairRecord {
 pub trait RepairHost: Send + Sync {
     fn read_user_path(&self) -> Result<UserPathState, String>;
     fn write_user_path(&self, state: &UserPathState) -> Result<(), String>;
+    fn read_user_proxy(&self) -> Result<UserProxyState, String> {
+        Err("当前宿主不支持用户代理修复".into())
+    }
+    fn write_user_proxy(&self, _state: &UserProxyState) -> Result<(), String> {
+        Err("当前宿主不支持用户代理修复".into())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,6 +155,13 @@ pub struct UserPathState {
     pub present: bool,
     pub value: String,
     pub expandable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserProxyState {
+    pub proxy_enable_present: bool,
+    pub proxy_enable: u32,
 }
 
 pub struct WindowsRepairHost;
@@ -187,7 +211,63 @@ impl RepairHost for WindowsRepairHost {
         }
         .map_err(|error| format!("无法写入当前用户 PATH：{error}"))
     }
+
+    fn read_user_proxy(&self) -> Result<UserProxyState, String> {
+        use windows_registry::CURRENT_USER;
+        let key = CURRENT_USER
+            .open(r"Software\Microsoft\Windows\CurrentVersion\Internet Settings")
+            .map_err(|error| format!("无法打开当前用户代理设置：{error}"))?;
+        match key.get_u32("ProxyEnable") {
+            Ok(value) => Ok(UserProxyState {
+                proxy_enable_present: true,
+                proxy_enable: value,
+            }),
+            Err(error) if error.code().0 == -2147024894 => Ok(UserProxyState {
+                proxy_enable_present: false,
+                proxy_enable: 0,
+            }),
+            Err(error) => Err(format!("无法读取当前用户代理开关：{error}")),
+        }
+    }
+
+    fn write_user_proxy(&self, state: &UserProxyState) -> Result<(), String> {
+        use windows_registry::CURRENT_USER;
+        let key = CURRENT_USER
+            .create(r"Software\Microsoft\Windows\CurrentVersion\Internet Settings")
+            .map_err(|error| format!("无法打开当前用户代理设置：{error}"))?;
+        if state.proxy_enable_present {
+            key.set_u32("ProxyEnable", state.proxy_enable)
+                .map_err(|error| format!("无法写入当前用户代理开关：{error}"))?;
+        } else {
+            key.remove_value("ProxyEnable")
+                .map_err(|error| format!("无法恢复当前用户代理开关：{error}"))?;
+        }
+        notify_wininet_settings_changed();
+        Ok(())
+    }
 }
+
+#[cfg(target_os = "windows")]
+fn notify_wininet_settings_changed() {
+    #[link(name = "wininet")]
+    extern "system" {
+        fn InternetSetOptionW(
+            internet: isize,
+            option: u32,
+            buffer: *mut std::ffi::c_void,
+            buffer_length: u32,
+        ) -> i32;
+    }
+    const INTERNET_OPTION_REFRESH: u32 = 37;
+    const INTERNET_OPTION_SETTINGS_CHANGED: u32 = 39;
+    unsafe {
+        let _ = InternetSetOptionW(0, INTERNET_OPTION_SETTINGS_CHANGED, std::ptr::null_mut(), 0);
+        let _ = InternetSetOptionW(0, INTERNET_OPTION_REFRESH, std::ptr::null_mut(), 0);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn notify_wininet_settings_changed() {}
 
 #[cfg(not(target_os = "windows"))]
 impl RepairHost for WindowsRepairHost {
@@ -327,6 +407,63 @@ impl<H: RepairHost, E: ElevatedRepairExecutor> RepairService<H, E> {
         Ok(Some(proposal))
     }
 
+    pub fn propose_user_proxy_disable(
+        &self,
+        ticket_id: &str,
+        evidence_ids: Vec<String>,
+    ) -> Result<Option<RepairProposal>, String> {
+        let before = self.host.read_user_proxy()?;
+        if before.proxy_enable != 1 {
+            return Ok(None);
+        }
+        let after = UserProxyState {
+            proxy_enable_present: true,
+            proxy_enable: 0,
+        };
+        let now = Utc::now();
+        let mut proposal = RepairProposal {
+            schema_version: REPAIR_SCHEMA_VERSION,
+            id: format!("repair-{}", Uuid::new_v4()),
+            ticket_id: ticket_id.into(),
+            operation_id: USER_PROXY_DISABLE_OPERATION.into(),
+            operation_version: USER_PROXY_DISABLE_OPERATION_VERSION,
+            risk: "r2".into(),
+            target: USER_PROXY_ENABLE_TARGET.into(),
+            normalized_arguments: json!({
+                "after": after,
+                "changeSummary": "将当前用户手动代理开关从启用设为禁用；不删除代理服务器或绕过列表"
+            }),
+            evidence_ids,
+            prerequisites: vec![
+                "R0 代理探针观察到当前用户手动代理已启用".into(),
+                "ProxyEnable 与审批时摘要一致".into(),
+                "不需要管理员权限".into(),
+            ],
+            snapshot_plan:
+                "保存 ProxyEnable 是否存在、DWORD 原值和 SHA-256；不读取或修改代理服务器地址".into(),
+            expected_postcondition: "当前用户手动代理开关为禁用".into(),
+            verification_probe: "重新读取 HKCU Internet Settings\\ProxyEnable 并核对精确摘要"
+                .into(),
+            rollback_contract:
+                "仅当 ProxyEnable 仍等于应用后摘要时恢复审批前的存在状态和 DWORD 原值".into(),
+            before_digest: digest_json(&before),
+            expected_after_digest: digest_json(&after),
+            nonce: Uuid::new_v4().to_string(),
+            created_at: now,
+            expires_at: now + Duration::minutes(10),
+            status: RepairStatus::AwaitingApproval,
+            proposal_digest: String::new(),
+        };
+        proposal.proposal_digest = proposal_digest(&proposal);
+        self.save_record(&RepairRecord {
+            proposal: proposal.clone(),
+            snapshot: None,
+            detail: "等待用户审批；只禁用当前用户手动代理开关".into(),
+            updated_at: now,
+        })?;
+        Ok(Some(proposal))
+    }
+
     pub fn reject(&self, proposal_id: &str, ticket_id: &str) -> Result<RepairRecord, String> {
         let mut record = self.load_record(proposal_id)?;
         self.validate_identity(&record.proposal, ticket_id)?;
@@ -345,6 +482,9 @@ impl<H: RepairHost, E: ElevatedRepairExecutor> RepairService<H, E> {
         self.validate_for_apply(&record.proposal, ticket_id)?;
         if record.proposal.operation_id == MACHINE_PATH_OPERATION {
             return self.apply_machine_path(record);
+        }
+        if record.proposal.operation_id == USER_PROXY_DISABLE_OPERATION {
+            return self.apply_user_proxy(record);
         }
         let before = self.host.read_user_path()?;
         if digest_json(&before) != record.proposal.before_digest {
@@ -413,6 +553,96 @@ impl<H: RepairHost, E: ElevatedRepairExecutor> RepairService<H, E> {
         }
         record.proposal.status = RepairStatus::Verified;
         record.detail = "修复已通过目标重读验证，可安全回滚".into();
+        record.updated_at = Utc::now();
+        self.save_record(&record)?;
+        Ok(record)
+    }
+
+    fn apply_user_proxy(&self, mut record: RepairRecord) -> Result<RepairRecord, String> {
+        let before = self.host.read_user_proxy()?;
+        if digest_json(&before) != record.proposal.before_digest {
+            return self.safe_stop(record, "审批前当前用户代理开关已经变化，已拒绝应用");
+        }
+        let after: UserProxyState = serde_json::from_value(
+            record
+                .proposal
+                .normalized_arguments
+                .get("after")
+                .cloned()
+                .ok_or("代理修复参数缺少 after")?,
+        )
+        .map_err(|_| "代理修复参数格式无效".to_string())?;
+        if digest_json(&after) != record.proposal.expected_after_digest
+            || !after.proxy_enable_present
+            || after.proxy_enable != 0
+        {
+            return self.safe_stop(record, "代理修复目标或摘要无效，已拒绝应用");
+        }
+
+        record.proposal.status = RepairStatus::Applying;
+        record.detail = "正在禁用已批准的当前用户手动代理开关".into();
+        record.updated_at = Utc::now();
+        self.save_record(&record)?;
+        let mut snapshot = RepairSnapshot {
+            schema_version: REPAIR_SCHEMA_VERSION,
+            proposal_id: record.proposal.id.clone(),
+            operation_id: record.proposal.operation_id.clone(),
+            operation_version: record.proposal.operation_version,
+            target: record.proposal.target.clone(),
+            before_state: serde_json::to_value(&before).map_err(|error| error.to_string())?,
+            before_digest: digest_json(&before),
+            after_state: serde_json::to_value(&after).map_err(|error| error.to_string())?,
+            after_digest: digest_json(&after),
+            snapshot_digest: String::new(),
+            applied_at: Utc::now(),
+            verified_at: None,
+        };
+        snapshot.snapshot_digest = snapshot_digest(&snapshot);
+        record.snapshot = Some(snapshot.clone());
+        self.save_record(&record)?;
+
+        if let Err(error) = self.host.write_user_proxy(&after) {
+            let restored = self.host.write_user_proxy(&before).is_ok()
+                && self
+                    .host
+                    .read_user_proxy()
+                    .map(|value| digest_json(&value) == snapshot.before_digest)
+                    .unwrap_or(false);
+            return self.safe_stop(
+                record,
+                &format!(
+                    "代理修复写入失败：{error}；快照恢复{}",
+                    if restored { "成功" } else { "失败" }
+                ),
+            );
+        }
+        record.proposal.status = RepairStatus::RepairedUnverified;
+        record.detail = "代理开关已写入，正在独立重读验证".into();
+        record.updated_at = Utc::now();
+        self.save_record(&record)?;
+        let observed = match self.host.read_user_proxy() {
+            Ok(value) => value,
+            Err(error) => {
+                record.detail = format!(
+                    "代理开关已写入，但无法完成独立重读：{error}；未声明修复完成，可按快照回滚"
+                );
+                record.updated_at = Utc::now();
+                self.save_record(&record)?;
+                return Ok(record);
+            }
+        };
+        if digest_json(&observed) != snapshot.after_digest {
+            record.detail = "代理开关写入后摘要不匹配；不能声明完成，可按快照回滚".into();
+            record.updated_at = Utc::now();
+            self.save_record(&record)?;
+            return Ok(record);
+        }
+        if let Some(value) = record.snapshot.as_mut() {
+            value.verified_at = Some(Utc::now());
+            value.snapshot_digest = snapshot_digest(value);
+        }
+        record.proposal.status = RepairStatus::Verified;
+        record.detail = "当前用户手动代理已禁用并通过注册表重读验证；代理服务器地址未删除".into();
         record.updated_at = Utc::now();
         self.save_record(&record)?;
         Ok(record)
@@ -570,6 +800,9 @@ impl<H: RepairHost, E: ElevatedRepairExecutor> RepairService<H, E> {
         if record.proposal.operation_id == MACHINE_PATH_OPERATION {
             return self.rollback_machine_path(record);
         }
+        if record.proposal.operation_id == USER_PROXY_DISABLE_OPERATION {
+            return self.rollback_user_proxy(record);
+        }
         let snapshot = record.snapshot.clone().ok_or("修复快照不存在")?;
         if snapshot.snapshot_digest != snapshot_digest(&snapshot) {
             return Err("修复快照摘要无效，已拒绝回滚".into());
@@ -593,6 +826,43 @@ impl<H: RepairHost, E: ElevatedRepairExecutor> RepairService<H, E> {
         } else {
             record.proposal.status = RepairStatus::RolledBack;
             record.detail = "已恢复审批前的精确用户 PATH".into();
+        }
+        record.updated_at = Utc::now();
+        self.save_record(&record)?;
+        Ok(record)
+    }
+
+    fn rollback_user_proxy(&self, mut record: RepairRecord) -> Result<RepairRecord, String> {
+        let snapshot = record.snapshot.clone().ok_or("代理修复快照不存在")?;
+        if snapshot.snapshot_digest != snapshot_digest(&snapshot) {
+            return Err("代理修复快照摘要无效，已拒绝回滚".into());
+        }
+        let current = self.host.read_user_proxy()?;
+        if digest_json(&current) != snapshot.after_digest {
+            return self.safe_stop(record, "代理开关在修复后又被修改，已拒绝覆盖后续更改");
+        }
+        let before: UserProxyState = serde_json::from_value(snapshot.before_state)
+            .map_err(|_| "代理快照 before state 无效".to_string())?;
+        if let Err(error) = self.host.write_user_proxy(&before) {
+            record.proposal.status = RepairStatus::RollbackFailed;
+            record.detail = format!("代理开关回滚失败：{error}");
+            record.updated_at = Utc::now();
+            self.save_record(&record)?;
+            return Ok(record);
+        }
+        match self.host.read_user_proxy() {
+            Ok(observed) if digest_json(&observed) == snapshot.before_digest => {
+                record.proposal.status = RepairStatus::RolledBack;
+                record.detail = "已恢复审批前的当前用户代理开关存在状态和 DWORD 原值".into();
+            }
+            Ok(_) => {
+                record.proposal.status = RepairStatus::RollbackFailed;
+                record.detail = "代理开关回滚后摘要与原始快照不一致".into();
+            }
+            Err(error) => {
+                record.proposal.status = RepairStatus::RollbackFailed;
+                record.detail = format!("代理开关回滚后无法重读验证：{error}");
+            }
         }
         record.updated_at = Utc::now();
         self.save_record(&record)?;
@@ -662,6 +932,9 @@ impl<H: RepairHost, E: ElevatedRepairExecutor> RepairService<H, E> {
         let known_target = match proposal.operation_id.as_str() {
             USER_PATH_OPERATION => {
                 proposal.risk == "r2" && proposal.target == USER_ENVIRONMENT_TARGET
+            }
+            USER_PROXY_DISABLE_OPERATION => {
+                proposal.risk == "r2" && proposal.target == USER_PROXY_ENABLE_TARGET
             }
             MACHINE_PATH_OPERATION => {
                 proposal.risk == "r3" && proposal.target == MACHINE_PATH_TARGET
@@ -833,6 +1106,40 @@ mod tests {
         }
     }
 
+    struct FakeProxyHost {
+        state: Mutex<UserProxyState>,
+    }
+
+    impl FakeProxyHost {
+        fn enabled() -> Self {
+            Self {
+                state: Mutex::new(UserProxyState {
+                    proxy_enable_present: true,
+                    proxy_enable: 1,
+                }),
+            }
+        }
+    }
+
+    impl RepairHost for FakeProxyHost {
+        fn read_user_path(&self) -> Result<UserPathState, String> {
+            Err("not used".into())
+        }
+
+        fn write_user_path(&self, _state: &UserPathState) -> Result<(), String> {
+            Err("not used".into())
+        }
+
+        fn read_user_proxy(&self) -> Result<UserProxyState, String> {
+            Ok(self.state.lock().unwrap().clone())
+        }
+
+        fn write_user_proxy(&self, state: &UserProxyState) -> Result<(), String> {
+            *self.state.lock().unwrap() = state.clone();
+            Ok(())
+        }
+    }
+
     struct FakeElevatedExecutor {
         state: Mutex<UserPathState>,
         calls: Mutex<Vec<ElevatedAction>>,
@@ -915,6 +1222,42 @@ mod tests {
         assert_eq!(
             service.host.read_user_path().unwrap().value,
             r"C:\Windows;%USERPROFILE%\bin"
+        );
+    }
+
+    #[test]
+    fn user_proxy_disable_is_evidence_bound_verified_and_exactly_rollbackable() {
+        let dir = TempDir::new().unwrap();
+        let service =
+            RepairService::with_host(dir.path().to_path_buf(), FakeProxyHost::enabled()).unwrap();
+        let proposal = service
+            .propose_user_proxy_disable("ticket-proxy", vec!["evidence-proxy".into()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(proposal.operation_id, USER_PROXY_DISABLE_OPERATION);
+        assert_eq!(proposal.risk, "r2");
+        assert_eq!(proposal.evidence_ids, vec!["evidence-proxy"]);
+        assert_eq!(
+            service.host.read_user_proxy().unwrap().proxy_enable,
+            1,
+            "proposal creation must not mutate the registry state"
+        );
+        let serialized = serde_json::to_string(&proposal).unwrap();
+        assert!(!serialized.contains("ProxyServer"));
+        assert!(!serialized.contains("proxy.example"));
+
+        let applied = service.apply(&proposal.id, "ticket-proxy").unwrap();
+        assert_eq!(applied.proposal.status, RepairStatus::Verified);
+        assert_eq!(service.host.read_user_proxy().unwrap().proxy_enable, 0);
+
+        let rolled_back = service.rollback(&proposal.id, "ticket-proxy").unwrap();
+        assert_eq!(rolled_back.proposal.status, RepairStatus::RolledBack);
+        assert_eq!(
+            service.host.read_user_proxy().unwrap(),
+            UserProxyState {
+                proxy_enable_present: true,
+                proxy_enable: 1,
+            }
         );
     }
 
@@ -1144,14 +1487,19 @@ mod tests {
             .iter()
             .filter(|operation| operation.enabled)
             .collect::<Vec<_>>();
-        assert_eq!(enabled.len(), 2);
+        assert_eq!(enabled.len(), 3);
         assert_eq!(
             enabled
                 .iter()
                 .filter(|operation| operation.risk == "r2")
                 .count(),
-            1
+            2
         );
+        assert!(operation_registry().iter().any(|operation| {
+            operation.id == USER_PROXY_DISABLE_OPERATION
+                && operation.risk == "r2"
+                && operation.enabled
+        }));
         assert!(operation_registry()
             .iter()
             .any(|operation| operation.id == "network.winhttp.reset"

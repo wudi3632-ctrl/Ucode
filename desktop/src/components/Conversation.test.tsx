@@ -726,6 +726,29 @@ describe("conversation timeline projection", () => {
     expect(screen.queryByRole("button", { name: "批准并打开 UAC" })).not.toBeInTheDocument();
   });
 
+  it("shows a bounded R2 manual-proxy repair without exposing a proxy endpoint", async () => {
+    const proposal = {
+      schemaVersion: 1, id: "repair-proxy", ticketId: ticket.id, operationId: "network.user_proxy.disable_manual", operationVersion: 1, risk: "r2",
+      target: "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings\\ProxyEnable", normalizedArguments: { after: { proxyEnablePresent: true, proxyEnable: 0 }, changeSummary: "仅禁用手动代理开关" }, evidenceIds: ["evidence-proxy"],
+      prerequisites: ["代理探针已观察"], snapshotPlan: "保存 DWORD 原值", expectedPostcondition: "手动代理开关为禁用", verificationProbe: "重读 ProxyEnable", rollbackContract: "摘要一致时恢复原值",
+      beforeDigest: "1".repeat(64), expectedAfterDigest: "2".repeat(64), nonce: "nonce-proxy", createdAt: "2026-11-10T00:00:00Z", expiresAt: "2026-11-10T00:10:00Z", status: "awaiting_approval", proposalDigest: "3".repeat(64),
+    };
+    const onResolve = vi.fn(async () => undefined);
+    render(<Conversation
+      projectId="project-1" ticket={ticket} events={[event(1, "rescue.repair.proposed", { proposal })]} effect={null} receipt={null} appliedEffect={null} busy={false}
+      onSubmit={vi.fn()} onCancel={vi.fn()} onRetry={vi.fn()} onExport={vi.fn()} onBranch={vi.fn()} onApprove={vi.fn()} onReject={vi.fn()} onRollback={vi.fn()}
+      onResolveRescueRepair={onResolve} onRollbackRescueRepair={vi.fn()} onExportReceipt={vi.fn()} hasProject onOpenProject={vi.fn()} error={null}
+      sidebarOpen inspectorOpen={false} onToggleSidebar={vi.fn()} onToggleInspector={vi.fn()} providerStatus="ready" modelProvider="bundled" providerModel="" modelPerformance={null}
+    />);
+    const card = screen.getByRole("article", { name: "Rescue 可逆修复" });
+    expect(card).toHaveTextContent("禁用当前用户手动代理");
+    expect(card).toHaveTextContent("不删除代理服务器地址、绕过列表或 PAC 配置");
+    expect(card).toHaveTextContent("ProxyEnable");
+    expect(card).not.toHaveTextContent("proxy.example");
+    fireEvent.click(within(card).getByRole("button", { name: "批准、应用并验证" }));
+    await waitFor(() => expect(onResolve).toHaveBeenCalledWith("repair-proxy", true));
+  });
+
   it("shows an exact one-time R1 network boundary and records the observed result", async () => {
     const proposal = {
       schemaVersion: 1, id: "probe-1", ticketId: ticket.id, toolId: "network.tcp.probe", toolVersion: 1, risk: "r1",

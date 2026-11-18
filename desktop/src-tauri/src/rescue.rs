@@ -42,6 +42,18 @@ $machineStats=Get-UCodePathStats $machinePath
   processorArchitecture=$env:PROCESSOR_ARCHITECTURE
 }|ConvertTo-Json -Compress -Depth 3
 "#;
+const NETWORK_PROXY_INSPECT_SCRIPT: &str = r#"
+$winHttpText=(netsh winhttp show proxy|Out-String).Trim()
+$winHttpConfigured=($LASTEXITCODE -eq 0) -and [bool]$winHttpText -and -not ($winHttpText -match 'Direct access|直接访问')
+$internet=Get-ItemProperty -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -ErrorAction SilentlyContinue
+[pscustomobject]@{
+  winHttpConfigured=$winHttpConfigured
+  environmentProxyConfigured=[bool]($env:HTTP_PROXY -or $env:HTTPS_PROXY)
+  winInetManualProxyEnabled=([int]$internet.ProxyEnable -eq 1)
+  winInetProxyServerPresent=[bool]$internet.ProxyServer
+  winInetAutoConfigPresent=[bool]$internet.AutoConfigURL
+}|ConvertTo-Json -Compress
+"#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -265,7 +277,7 @@ fn probe_script(tool_id: &str) -> Option<&'static str> {
         "system.eventlog.query" => Some("$start=(Get-Date).AddHours(-24); $queryErrors=@(); $events=@(Get-WinEvent -FilterHashtable @{LogName=@('System','Application');Level=1,2;StartTime=$start} -MaxEvents 30 -ErrorAction SilentlyContinue -ErrorVariable +queryErrors); $realErrors=@($queryErrors|Where-Object{$_.FullyQualifiedErrorId -notmatch 'NoMatchingEventsFound'}); if($realErrors.Count -gt 0){throw $realErrors[0]}; @($events|ForEach-Object{[pscustomobject]@{timeCreated=$_.TimeCreated.ToUniversalTime().ToString('o');logName=$_.LogName;level=$_.LevelDisplayName;eventId=$_.Id;provider=$_.ProviderName;recordId=$_.RecordId}})|ConvertTo-Json -Compress -Depth 3"),
         "network.adapter.inspect" => Some("@(Get-NetIPConfiguration|Where-Object{$_.NetAdapter.Status -eq 'Up'}|ForEach-Object{[pscustomobject]@{alias=$_.InterfaceAlias;description=$_.InterfaceDescription;ipv4=@($_.IPv4Address|ForEach-Object{$_.IPAddress});ipv6=@($_.IPv6Address|ForEach-Object{$_.IPAddress}|Select-Object -First 4);gateway=@($_.IPv4DefaultGateway|ForEach-Object{$_.NextHop});dnsServers=@($_.DNSServer.ServerAddresses)}})|ConvertTo-Json -Compress -Depth 5"),
         "network.route.inspect" => Some("@(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue|Sort-Object RouteMetric|Select-Object -First 12 InterfaceAlias,NextHop,RouteMetric,State)|ConvertTo-Json -Compress"),
-        "network.proxy.inspect" => Some("$winHttp=(netsh winhttp show proxy|Out-String).Trim(); [pscustomobject]@{winHttp=$winHttp;httpProxy=$env:HTTP_PROXY;httpsProxy=$env:HTTPS_PROXY;noProxy=$env:NO_PROXY}|ConvertTo-Json -Compress"),
+        "network.proxy.inspect" => Some(NETWORK_PROXY_INSPECT_SCRIPT),
         // R1 probes are deliberately absent from the automatic runner. A future
         // consent envelope supplies a validated hostname to a dedicated adapter.
         "network.dns.resolve" | "network.tcp.probe" => None,
@@ -664,6 +676,14 @@ fn edges_from_hypotheses(hypotheses: &[Hypothesis]) -> Vec<EvidenceEdge> {
 }
 
 fn proxy_configured(value: &Value) -> bool {
+    let bounded_flags = [
+        "winHttpConfigured",
+        "environmentProxyConfigured",
+        "winInetManualProxyEnabled",
+        "winInetAutoConfigPresent",
+    ]
+    .iter()
+    .any(|key| value.get(key).and_then(Value::as_bool).unwrap_or(false));
     let env_proxy = ["httpProxy", "httpsProxy"].iter().any(|key| {
         value
             .get(key)
@@ -675,7 +695,8 @@ fn proxy_configured(value: &Value) -> bool {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_lowercase();
-    env_proxy
+    bounded_flags
+        || env_proxy
         || !(win_http.is_empty()
             || win_http.contains("direct access")
             || win_http.contains("直接访问"))
@@ -1109,6 +1130,32 @@ mod tests {
             .is_some());
         assert!(value.get("userPath").is_none());
         assert!(value.get("machinePath").is_none());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn real_proxy_probe_returns_only_bounded_presence_flags() {
+        let output = WindowsProbeRunner.run("network.proxy.inspect").unwrap();
+        assert_eq!(output.exit_code, 0, "{}", output.stderr);
+        let value: Value = serde_json::from_str(output.stdout.trim()).unwrap();
+        for key in [
+            "winHttpConfigured",
+            "environmentProxyConfigured",
+            "winInetManualProxyEnabled",
+            "winInetProxyServerPresent",
+            "winInetAutoConfigPresent",
+        ] {
+            assert!(value.get(key).and_then(Value::as_bool).is_some(), "{key}");
+        }
+        for raw in [
+            "winHttp",
+            "httpProxy",
+            "httpsProxy",
+            "noProxy",
+            "proxyServer",
+        ] {
+            assert!(value.get(raw).is_none(), "raw proxy field leaked: {raw}");
+        }
     }
 
     #[cfg(target_os = "windows")]

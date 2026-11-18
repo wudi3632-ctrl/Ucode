@@ -231,7 +231,7 @@ export interface RescueRepairProposal {
   operationVersion: number;
   risk: "r2" | "r3";
   target: string;
-  normalizedArguments: { after?: { value?: string }; removedEntries?: string[] };
+  normalizedArguments: { after?: { value?: string; proxyEnablePresent?: boolean; proxyEnable?: number }; removedEntries?: string[]; changeSummary?: string };
   evidenceIds: string[];
   prerequisites: string[];
   snapshotPlan: string;
