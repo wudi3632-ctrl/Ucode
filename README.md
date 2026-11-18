@@ -81,7 +81,7 @@ UCode 不是把聊天网页套进桌面壳。它把项目读取、变更审批�
 | Rescue R0 只读系统诊断 | Windows 11 真实探针、报告与证据收据已验收；事件日志、单文件 SHA-256 与 ACL 已复验 | Node + Rust + 桌面 | 事件日志限最近 24 小时 System/Application 的 Level 1/2 元数据；文件限明确本地盘路径与 256 MiB，不读取内容或网络路径 |
 | Rescue R0 本机 TCP 端口诊断 | 临时真实 listener 的占用与释放前后状态已验收 | Rust 原生 API + React + 桌面 | 每次只检查一个明确端口，最多 16 个 listener；不扫描、不联网、不结束进程，不显示命令行或完整路径 |
 | Rescue R0 单卷容量诊断 | 真实 `C:` 容量与不存在 `Z:` 的失败路径均已验收 | Rust 原生 API + React + 桌面 | 每次只检查一个明确本地盘符；不枚举文件、不扫描所有卷、不清理或删除内容 |
-| Rescue R0 内存压力诊断 | 原生全局内存状态与高工作集进程已通过自动化；真实桌面值见正式报告 | Rust 原生 API + React + 桌面 | 单次快照、最多 10 个进程；不读命令行/完整路径/用户名，不判定泄漏，不结束进程 |
+| Rescue R0 内存压力诊断 | 两轮真实桌面重新采样与原生探针已验收 | Rust 原生 API + React + 桌面 | 单次快照、最多 10 个进程；不读命令行/完整路径/用户名，不判定泄漏，不结束进程 |
 | Rescue R1 DNS/TCP 精确探测 | 真实桌面批准与拒绝路径均已验收 | Rust + React + 桌面 | 只探测用户明确给出的单一目标；不发 HTTP、不扫描、不保存授权 |
 | Rescue R2 用户 PATH/代理修复与回滚 | 用户 PATH 已真实审批、写入验证并精确回滚；代理拒绝路径已桌面验收 | Rust + React + 桌面 | 仅修改当前用户有界目标，不删除代理地址 |
 | Rescue R3 机器 PATH | 拒绝/UAC 安全边界已桌面验收 | Rust + React + 桌面 | helper 已实现；真实管理员应用和第二次 UAC 回滚仍需用户本人验收 |
@@ -174,7 +174,7 @@ npm run tauri dev
 - 便携 staging 完整性检查；
 - 真实桌面聊天、审批、文件、测试、终端、Git 降级、Agent、主题与布局验收。
 
-最近一次正式候选验收的构建摘要、测试计数、桌面步骤与已知限制见 [Rescue R3 W32Time 服务验收报告](docs/benchmarks/2026-11-18-rescue-r3-w32time-service-acceptance.md)；联网批准/拒绝路径见 [Rescue R1 联网探测验收报告](docs/benchmarks/2026-11-18-rescue-r1-network-probes-acceptance.md)；用户 PATH 写入、验证与回滚见 [Rescue Phase 2 / R2 验收报告](docs/benchmarks/2026-11-18-rescue-phase2-r2-acceptance.md)。
+最近一次正式候选验收的构建摘要、测试计数、桌面步骤与已知限制见 [Rescue R0 内存压力诊断验收报告](docs/benchmarks/2026-11-18-rescue-r0-memory-pressure-acceptance.md)；真实 R3 服务边界见 [Rescue R3 W32Time 服务验收报告](docs/benchmarks/2026-11-18-rescue-r3-w32time-service-acceptance.md)；联网批准/拒绝路径见 [Rescue R1 联网探测验收报告](docs/benchmarks/2026-11-18-rescue-r1-network-probes-acceptance.md)；用户 PATH 写入、验证与回滚见 [Rescue Phase 2 / R2 验收报告](docs/benchmarks/2026-11-18-rescue-phase2-r2-acceptance.md)。
 
 自动测试不能替代第二台 Windows 电脑与真实 U 盘拔插验证。项目仍处于个人/研究产品阶段，欢迎以可复现任务、日志和截图提交 Issue。
 
