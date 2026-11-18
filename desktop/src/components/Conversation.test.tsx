@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { chooseContextAttachments } from "../bridge/desktop";
 import type { ContextAttachmentSelection, EvidenceReceipt, RuntimeEvent, TicketSummary } from "../domain/types";
@@ -107,7 +107,7 @@ describe("conversation timeline projection", () => {
     const evidence = screen.getByRole("article", { name: "结果证据" });
     expect(evidence).toHaveTextContent("本轮请求15");
     expect(evidence).toHaveTextContent("本轮不需要项目证据");
-    expect(evidence).toHaveTextContent("回答由本地模型生成，未读取项目文件");
+    expect(evidence).toHaveTextContent("未读取项目文件；本回答不构成项目证据");
   });
 
   it("shows the observed pytest result instead of counting it as a generic source", () => {
@@ -505,5 +505,30 @@ describe("conversation timeline projection", () => {
     expect(row).toHaveTextContent("−1");
     expect(row).not.toHaveTextContent("+4");
     expect(row).not.toHaveTextContent("−4");
+  });
+
+  it("shows a compact verified candidate comparison without private workspace data", () => {
+    render(<Conversation
+      projectId="project-1" ticket={ticket} events={[]} effect={null} receipt={null} appliedEffect={null} busy={false}
+      races={[{
+        race: { schemaVersion: 1, id: "race-1", ticketId: ticket.id, projectFingerprint: "digest", objective: "修复两处实现", state: "awaiting_review", targets: [{ path: "src/a.ts", operation: "modify" }, { path: "tests/a.test.ts", operation: "modify" }], allowedPaths: ["src/a.ts", "tests/a.test.ts"], acceptance: ["npm test"], verdict: { schemaVersion: 1, kind: "winner", winnerId: "candidate-a", rankedCandidateIds: ["candidate-a"], decisions: [], summary: "passed", decidedAt: "2026-11-10T00:00:01Z" }, createdAt: "2026-11-10T00:00:00Z", updatedAt: "2026-11-10T00:00:01Z" },
+        candidates: [{ id: "candidate-a", strategy: "minimal_change", state: "passed", provider: "bundled", model: "qwen", diff: "--- a/src/a.ts\n+++ b/src/a.ts\n+fixed", resultDigest: "result", metrics: { modifiedFiles: 2, unrelatedFiles: 0, deletedFiles: 0, changedLines: 3 }, facts: [{ checkId: "required-tests", outcome: "passed", summary: "3 tests passed", required: true, hardFailure: null, command: "npm test", exitCode: 0, evidenceDigests: ["evidence"] }] }],
+      }]}
+      onCancelRace={vi.fn()} onSubmit={vi.fn()} onCancel={vi.fn()} onRetry={vi.fn()} onExport={vi.fn()} onBranch={vi.fn()}
+      onApprove={vi.fn()} onReject={vi.fn()} onRollback={vi.fn()} onExportReceipt={vi.fn()} hasProject onOpenProject={vi.fn()} error={null}
+      sidebarOpen inspectorOpen={false} onToggleSidebar={vi.fn()} onToggleInspector={vi.fn()}
+      providerStatus="ready" modelProvider="bundled" providerModel="" modelPerformance={null}
+    />);
+
+    const card = screen.getByRole("article", { name: "候选验证" });
+    expect(card).toHaveTextContent("本地验证已选出推荐方案");
+    expect(card).toHaveTextContent("最小改动");
+    expect(card).toHaveTextContent("2 文件");
+    expect(card).toHaveTextContent("npm test");
+    expect(card).not.toHaveTextContent("workspace");
+    fireEvent.click(within(card).getByText("最小改动"));
+    expect(card).toHaveTextContent("3 tests passed");
+    fireEvent.click(within(card).getByText("查看候选 Diff"));
+    expect(card).toHaveTextContent("+fixed");
   });
 });

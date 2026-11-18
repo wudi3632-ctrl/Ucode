@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { bootstrap } from "../bridge/desktop";
 import * as desktopBridge from "../bridge/desktop";
 import { Inspector } from "../components/Inspector";
-import { App, detectStartingProviderStatus, effectFrom, friendlyError, mergeRuntimeEvents, modelPerformanceFrom, providerStatusFromRuntime, resolveTheme, runtimeCoreReady, shouldPollProviderStatus } from "./App";
+import { App, detectStartingProviderStatus, effectFrom, eventRequiresBootstrapRefresh, friendlyError, mergeBootstrapSnapshot, mergeRuntimeEvents, modelPerformanceFrom, providerStatusFromRuntime, resolveTheme, runtimeCoreReady, shouldPollProviderStatus } from "./App";
 
 afterEach(() => {
   cleanup();
@@ -114,6 +114,16 @@ describe("UCode desktop", () => {
     expect(next.events).toHaveLength(1);
     expect(next.events[0].eventType).toBe("delivery.ready");
   });
+
+  it("refreshes durable ticket state after a race reaches its verdict", async () => {
+    const snapshot = await bootstrap();
+    const current = { ...snapshot, tickets: snapshot.tickets.map((ticket) => ({ ...ticket, state: "running" as const })), lastSequence: 10 };
+    const fresh = { ...snapshot, tickets: snapshot.tickets.map((ticket) => ({ ...ticket, state: "completed" as const })), lastSequence: 11 };
+    expect(eventRequiresBootstrapRefresh({ sequence: 11, ticketId: "ticket-demo", eventType: "race.decided", payload: {}, createdAt: new Date().toISOString() })).toBe(true);
+    expect(eventRequiresBootstrapRefresh({ sequence: 10, ticketId: "ticket-demo", eventType: "race.validating", payload: {}, createdAt: new Date().toISOString() })).toBe(false);
+    expect(mergeBootstrapSnapshot(fresh, current).tickets[0].state).toBe("completed");
+  });
+
   it("renders the portable conversation workspace", async () => {
     render(<App />);
     expect(await screen.findByLabelText("UCode Portable")).toBeInTheDocument();
@@ -229,6 +239,28 @@ describe("UCode desktop", () => {
     await waitFor(() => expect(screen.queryByLabelText("已添加上下文")).not.toBeInTheDocument());
     expect(screen.getByText("解释这个文件")).toBeInTheDocument();
     expect(screen.queryByText(/本轮本地上下文/)).not.toBeInTheDocument();
+  });
+
+  it("automatically uses isolated candidates only for a new verifiable multi-file task", async () => {
+    const startRace = vi.spyOn(desktopBridge, "startCandidateRace");
+    const normalRun = vi.spyOn(desktopBridge, "runTicket");
+    render(<App />);
+    await screen.findByRole("heading", { name: "修复加法函数" });
+    fireEvent.click(screen.getByRole("button", { name: "＋ 新任务" }));
+    const input = screen.getByLabelText("任务输入");
+    fireEvent.change(input, { target: { value: "修改 `src/cart.ts` 和 `tests/cart.test.ts`，然后运行 npm test" } });
+    fireEvent.submit(input.closest("form")!);
+
+    expect(await screen.findByRole("article", { name: "候选验证" })).toHaveTextContent("正在比较两个隔离方案");
+    expect(startRace).toHaveBeenCalledWith(
+      expect.any(String),
+      [
+        { path: "src/cart.ts", operation: "modify" },
+        { path: "tests/cart.test.ts", operation: "modify" },
+      ],
+      ["npm test"],
+    );
+    expect(normalRun).not.toHaveBeenCalled();
   });
 
   it("renames a conversation through its action menu", async () => {

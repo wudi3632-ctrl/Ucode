@@ -154,7 +154,10 @@ impl AppSettings {
         self.code_font_size = self.code_font_size.clamp(12, 28);
         self.sidebar_width = self.sidebar_width.clamp(210, 420);
         self.inspector_width = self.inspector_width.clamp(320, 760);
-        if !matches!(self.model_provider.as_str(), "bundled" | "openai-compatible") {
+        if !matches!(
+            self.model_provider.as_str(),
+            "bundled" | "openai-compatible"
+        ) {
             self.model_provider = defaults.model_provider;
         }
         let shell_name = std::path::Path::new(self.terminal_shell.trim())
@@ -162,7 +165,10 @@ impl AppSettings {
             .and_then(|value| value.to_str())
             .unwrap_or("")
             .to_ascii_lowercase();
-        if !matches!(shell_name.as_str(), "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe" | "cmd" | "cmd.exe") {
+        if !matches!(
+            shell_name.as_str(),
+            "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe" | "cmd" | "cmd.exe"
+        ) {
             self.terminal_shell = defaults.terminal_shell;
         }
         self
@@ -233,7 +239,17 @@ impl TaskContext {
         let paths = extract_context_paths(value);
         let correction = contains_context_marker(
             value,
-            &["改为", "改成", "不是", "而是", "只修改", "仅修改", "目标是", "instead", "only edit"],
+            &[
+                "改为",
+                "改成",
+                "不是",
+                "而是",
+                "只修改",
+                "仅修改",
+                "目标是",
+                "instead",
+                "only edit",
+            ],
         );
         let constraints = extract_context_clauses(value, ContextClause::Constraint);
         let verification = extract_context_clauses(value, ContextClause::Verification);
@@ -255,13 +271,18 @@ impl TaskContext {
     fn refresh_questions(&mut self, latest: &str) {
         self.unresolved_questions.clear();
         if looks_like_mutation(&self.objective) && self.target_files.is_empty() {
-            self.unresolved_questions.push("需要明确目标文件或允许的项目范围".into());
+            self.unresolved_questions
+                .push("需要明确目标文件或允许的项目范围".into());
         }
         if looks_like_mutation(&self.objective)
             && self.verification.is_empty()
-            && !contains_context_marker(latest, &["不用测试", "无需测试", "不运行测试", "without tests"])
+            && !contains_context_marker(
+                latest,
+                &["不用测试", "无需测试", "不运行测试", "without tests"],
+            )
         {
-            self.unresolved_questions.push("需要明确验证方式或确认无需运行测试".into());
+            self.unresolved_questions
+                .push("需要明确验证方式或确认无需运行测试".into());
         }
     }
 }
@@ -779,11 +800,14 @@ impl Storage {
     }
 
     pub fn task_context(&self, ticket_id: &str) -> Result<TaskContext, StorageError> {
-        let raw: Option<String> = self.connection.query_row(
-            "SELECT context_json FROM ticket_contexts WHERE ticket_id=?1",
-            [ticket_id],
-            |row| row.get(0),
-        ).optional()?;
+        let raw: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT context_json FROM ticket_contexts WHERE ticket_id=?1",
+                [ticket_id],
+                |row| row.get(0),
+            )
+            .optional()?;
         if let Some(raw) = raw {
             return serde_json::from_str(&raw).map_err(Into::into);
         }
@@ -791,7 +815,11 @@ impl Storage {
         Ok(TaskContext::from_request(&ticket.request))
     }
 
-    pub fn update_task_context(&mut self, ticket_id: &str, message: &str) -> Result<TaskContext, StorageError> {
+    pub fn update_task_context(
+        &mut self,
+        ticket_id: &str,
+        message: &str,
+    ) -> Result<TaskContext, StorageError> {
         let mut context = self.task_context(ticket_id)?;
         context.merge_message(message);
         let transaction = self.connection.transaction()?;
@@ -1025,8 +1053,12 @@ impl Storage {
             Some(value) => serde_json::from_str(&value).unwrap_or_default(),
             None => OnboardingState::default(),
         };
-        onboarding.completed_steps.retain(|step| ONBOARDING_STEPS.contains(&step.as_str()));
-        onboarding.skipped_steps.retain(|step| ONBOARDING_STEPS.contains(&step.as_str()));
+        onboarding
+            .completed_steps
+            .retain(|step| ONBOARDING_STEPS.contains(&step.as_str()));
+        onboarding
+            .skipped_steps
+            .retain(|step| ONBOARDING_STEPS.contains(&step.as_str()));
         onboarding.completed_steps.sort();
         onboarding.completed_steps.dedup();
         onboarding.skipped_steps.sort();
@@ -1188,11 +1220,9 @@ impl Storage {
     pub fn race(&self, id: &str) -> Result<Race, StorageError> {
         let payload: Option<String> = self
             .connection
-            .query_row(
-                "SELECT payload_json FROM races WHERE id=?1",
-                [id],
-                |row| row.get(0),
-            )
+            .query_row("SELECT payload_json FROM races WHERE id=?1", [id], |row| {
+                row.get(0)
+            })
             .optional()?;
         payload
             .ok_or_else(|| StorageError::RaceNotFound(id.into()))
@@ -1200,9 +1230,9 @@ impl Storage {
     }
 
     pub fn races_for_ticket(&self, ticket_id: &str) -> Result<Vec<Race>, StorageError> {
-        let mut statement = self.connection.prepare(
-            "SELECT payload_json FROM races WHERE ticket_id=?1 ORDER BY created_at",
-        )?;
+        let mut statement = self
+            .connection
+            .prepare("SELECT payload_json FROM races WHERE ticket_id=?1 ORDER BY created_at")?;
         let rows = statement.query_map([ticket_id], |row| row.get::<_, String>(0))?;
         rows.collect::<Result<Vec<_>, _>>()?
             .into_iter()
@@ -1388,6 +1418,24 @@ impl Storage {
         .collect()
     }
 
+    pub fn effect_proposal(
+        &self,
+        ticket_id: &str,
+        effect_id: &str,
+    ) -> Result<Option<Value>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT payload_json FROM events WHERE ticket_id=?1 AND event_type='effect.proposed' ORDER BY sequence DESC",
+        )?;
+        let rows = statement.query_map([ticket_id], |row| row.get::<_, String>(0))?;
+        for row in rows {
+            let payload: Value = serde_json::from_str(&row?)?;
+            if payload.get("id").and_then(Value::as_str) == Some(effect_id) {
+                return Ok(Some(payload));
+            }
+        }
+        Ok(None)
+    }
+
     pub fn last_sequence(&self) -> Result<i64, StorageError> {
         Ok(self.connection.query_row(
             "SELECT COALESCE(MAX(sequence),0) FROM events",
@@ -1439,6 +1487,7 @@ fn race_state_str(state: RaceState) -> &'static str {
         RaceState::AwaitingReview => "awaiting_review",
         RaceState::NoWinner => "no_winner",
         RaceState::Applied => "applied",
+        RaceState::RolledBack => "rolled_back",
         RaceState::Rejected => "rejected",
         RaceState::Stale => "stale",
         RaceState::Cancelled => "cancelled",
@@ -1688,7 +1737,10 @@ fn upsert_task_context_tx(
 
 fn extend_unique(target: &mut Vec<String>, values: Vec<String>) {
     for value in values {
-        if !target.iter().any(|existing| existing.eq_ignore_ascii_case(&value)) {
+        if !target
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(&value))
+        {
             target.push(value);
         }
     }
@@ -1696,28 +1748,55 @@ fn extend_unique(target: &mut Vec<String>, values: Vec<String>) {
 
 fn extract_context_paths(value: &str) -> Vec<String> {
     const EXTENSIONS: &[&str] = &[
-        "md", "txt", "js", "mjs", "cjs", "ts", "tsx", "jsx", "py", "rs", "go", "java",
-        "kt", "c", "h", "cpp", "hpp", "cs", "json", "yaml", "yml", "toml", "xml", "html",
-        "css", "sql", "sh", "ps1", "bat", "cmd",
+        "md", "txt", "js", "mjs", "cjs", "ts", "tsx", "jsx", "py", "rs", "go", "java", "kt", "c",
+        "h", "cpp", "hpp", "cs", "json", "yaml", "yml", "toml", "xml", "html", "css", "sql", "sh",
+        "ps1", "bat", "cmd",
     ];
     let mut paths = Vec::new();
     for token in value.split(|character: char| {
         character.is_whitespace()
-            || matches!(character, '`' | '\'' | '"' | '“' | '”' | '‘' | '’' | '，' | ',' | '。' | '；' | ';' | '：' | ':' | '（' | '(' | '）' | ')' | '、')
+            || matches!(
+                character,
+                '`' | '\''
+                    | '"'
+                    | '“'
+                    | '”'
+                    | '‘'
+                    | '’'
+                    | '，'
+                    | ','
+                    | '。'
+                    | '；'
+                    | ';'
+                    | '：'
+                    | ':'
+                    | '（'
+                    | '('
+                    | '）'
+                    | ')'
+                    | '、'
+            )
     }) {
-        let candidate = token.trim_end_matches(|character: char| matches!(character, '.' | '!' | '?' | '！' | '？'));
+        let candidate = token
+            .trim_end_matches(|character: char| matches!(character, '.' | '!' | '?' | '！' | '？'));
         let candidate = ["的内容", "的源码", "内容", "源码"]
             .iter()
             .find_map(|suffix| candidate.strip_suffix(suffix))
             .unwrap_or(candidate);
         let normalized = candidate.replace('\\', "/");
-        let extension = candidate.rsplit_once('.').map(|(_, extension)| extension.to_ascii_lowercase());
+        let extension = candidate
+            .rsplit_once('.')
+            .map(|(_, extension)| extension.to_ascii_lowercase());
         if candidate.len() <= 260
             && !candidate.starts_with('.')
             && !normalized.starts_with('/')
             && !normalized.split('/').any(|segment| segment == "..")
-            && extension.as_deref().is_some_and(|extension| EXTENSIONS.contains(&extension))
-            && !paths.iter().any(|path: &String| path.eq_ignore_ascii_case(&normalized))
+            && extension
+                .as_deref()
+                .is_some_and(|extension| EXTENSIONS.contains(&extension))
+            && !paths
+                .iter()
+                .any(|path: &String| path.eq_ignore_ascii_case(&normalized))
         {
             paths.push(normalized);
         }
@@ -1734,11 +1813,23 @@ fn extract_context_clauses(value: &str, kind: ContextClause) -> Vec<String> {
         .filter(|clause| match kind {
             ContextClause::Constraint => contains_context_marker(
                 clause,
-                &["只", "仅", "不要", "不得", "不能", "必须", "保持", "限制", "only", "must", "do not", "without"],
+                &[
+                    "只", "仅", "不要", "不得", "不能", "必须", "保持", "限制", "only", "must",
+                    "do not", "without",
+                ],
             ),
             ContextClause::Verification => contains_context_marker(
                 clause,
-                &["测试", "验证", "pytest", "npm test", "cargo test", "check", "build", "test"],
+                &[
+                    "测试",
+                    "验证",
+                    "pytest",
+                    "npm test",
+                    "cargo test",
+                    "check",
+                    "build",
+                    "test",
+                ],
             ),
         })
         .map(|clause| clause.chars().take(240).collect())
@@ -1748,8 +1839,23 @@ fn extract_context_clauses(value: &str, kind: ContextClause) -> Vec<String> {
 fn looks_like_context_follow_up(value: &str) -> bool {
     let normalized = value.trim().to_lowercase();
     [
-        "继续", "接着", "然后", "再", "另外", "同时", "为什么", "详细", "展开", "它", "这个",
-        "刚才", "continue", "then", "also", "why", "more",
+        "继续",
+        "接着",
+        "然后",
+        "再",
+        "另外",
+        "同时",
+        "为什么",
+        "详细",
+        "展开",
+        "它",
+        "这个",
+        "刚才",
+        "continue",
+        "then",
+        "also",
+        "why",
+        "more",
     ]
     .iter()
     .any(|prefix| normalized.starts_with(prefix))
@@ -1773,7 +1879,26 @@ fn contains_context_marker(value: &str, markers: &[&str]) -> bool {
 fn looks_like_mutation(value: &str) -> bool {
     contains_context_marker(
         value,
-        &["修改", "修复", "新增", "添加", "删除", "重构", "实现", "创建", "写入", "fix", "modify", "edit", "add", "delete", "refactor", "implement", "create", "write"],
+        &[
+            "修改",
+            "修复",
+            "新增",
+            "添加",
+            "删除",
+            "重构",
+            "实现",
+            "创建",
+            "写入",
+            "fix",
+            "modify",
+            "edit",
+            "add",
+            "delete",
+            "refactor",
+            "implement",
+            "create",
+            "write",
+        ],
     )
 }
 
@@ -2253,7 +2378,9 @@ mod tests {
         let events = storage.events(0).unwrap();
 
         assert_eq!(events.len(), 3);
-        assert!(events.windows(2).all(|pair| pair[0].sequence < pair[1].sequence));
+        assert!(events
+            .windows(2)
+            .all(|pair| pair[0].sequence < pair[1].sequence));
         assert_eq!(events[2].ticket_id.as_deref(), Some(ticket.id.as_str()));
         assert_eq!(events[2].event_type, "context.updated");
         assert_eq!(storage.tickets().unwrap()[0].state, TicketState::Open);
@@ -2449,7 +2576,9 @@ mod tests {
         assert_eq!(legacy.sound_volume, 55);
         assert_eq!(legacy.ui_font_size, 18);
         assert_eq!(legacy.code_font_size, 14);
-        let legacy_presets: AppSettings = serde_json::from_str(r#"{"uiFontScale":"large","codeFontScale":"comfortable"}"#).unwrap();
+        let legacy_presets: AppSettings =
+            serde_json::from_str(r#"{"uiFontScale":"large","codeFontScale":"comfortable"}"#)
+                .unwrap();
         assert_eq!(legacy_presets.ui_font_size, 18);
         assert_eq!(legacy_presets.code_font_size, 14);
     }
@@ -2481,11 +2610,17 @@ mod tests {
         drop(storage);
 
         let reopened = Storage::open(&database).unwrap();
-        assert_eq!(reopened.onboarding().unwrap().completed_steps, vec!["project"]);
-        reopened.connection.execute(
-            "UPDATE settings SET value_json='{broken' WHERE key='onboarding'",
-            [],
-        ).unwrap();
+        assert_eq!(
+            reopened.onboarding().unwrap().completed_steps,
+            vec!["project"]
+        );
+        reopened
+            .connection
+            .execute(
+                "UPDATE settings SET value_json='{broken' WHERE key='onboarding'",
+                [],
+            )
+            .unwrap();
         assert_eq!(reopened.onboarding().unwrap().welcome_state, "new");
     }
 
@@ -2546,7 +2681,9 @@ mod tests {
             fingerprint: "delivery-pytest-receipt".into(),
         };
         let project = storage.upsert_project(&locator, true).unwrap();
-        let ticket = storage.create_ticket(&project.id, "Run focused tests").unwrap();
+        let ticket = storage
+            .create_ticket(&project.id, "Run focused tests")
+            .unwrap();
         storage
             .append_event(
                 Some(&ticket.id),
@@ -2614,19 +2751,45 @@ mod tests {
             fingerprint: "turn-scoped-receipt".into(),
         };
         let project = storage.upsert_project(&locator, true).unwrap();
-        let ticket = storage.create_ticket(&project.id, "Inspect README").unwrap();
-        storage.append_event(Some(&ticket.id), "tool.completed", json!({
-            "tool": "read_file", "evidence": { "path": "README.md" }
-        })).unwrap();
-        storage.append_event(Some(&ticket.id), "delivery.ready", json!({
-            "content": "README summary", "route": "project_read", "evidence": []
-        })).unwrap();
-        storage.append_event(Some(&ticket.id), "user.message", json!({
-            "content": "15"
-        })).unwrap();
-        storage.append_event(Some(&ticket.id), "delivery.ready", json!({
-            "content": "你希望我用 15 做什么？", "route": "chat", "evidence": []
-        })).unwrap();
+        let ticket = storage
+            .create_ticket(&project.id, "Inspect README")
+            .unwrap();
+        storage
+            .append_event(
+                Some(&ticket.id),
+                "tool.completed",
+                json!({
+                    "tool": "read_file", "evidence": { "path": "README.md" }
+                }),
+            )
+            .unwrap();
+        storage
+            .append_event(
+                Some(&ticket.id),
+                "delivery.ready",
+                json!({
+                    "content": "README summary", "route": "project_read", "evidence": []
+                }),
+            )
+            .unwrap();
+        storage
+            .append_event(
+                Some(&ticket.id),
+                "user.message",
+                json!({
+                    "content": "15"
+                }),
+            )
+            .unwrap();
+        storage
+            .append_event(
+                Some(&ticket.id),
+                "delivery.ready",
+                json!({
+                    "content": "你希望我用 15 做什么？", "route": "chat", "evidence": []
+                }),
+            )
+            .unwrap();
 
         let receipt = storage.evidence_receipts().unwrap().pop().unwrap();
         assert_eq!(receipt.request, "15");
@@ -2647,20 +2810,60 @@ mod tests {
             fingerprint: "waiting-receipt".into(),
         };
         let project = storage.upsert_project(&locator, true).unwrap();
-        let ticket = storage.create_ticket(&project.id, "Diagnose project").unwrap();
-        storage.set_ticket_state(&ticket.id, TicketState::Waiting).unwrap();
-        storage.append_event(Some(&ticket.id), "assignment.report", json!({ "state": "waiting", "summary": "need a path" })).unwrap();
+        let ticket = storage
+            .create_ticket(&project.id, "Diagnose project")
+            .unwrap();
+        storage
+            .set_ticket_state(&ticket.id, TicketState::Waiting)
+            .unwrap();
+        storage
+            .append_event(
+                Some(&ticket.id),
+                "assignment.report",
+                json!({ "state": "waiting", "summary": "need a path" }),
+            )
+            .unwrap();
         let receipt = storage.evidence_receipts().unwrap().pop().unwrap();
         assert_eq!(receipt.outcome, "waiting_input");
 
-        storage.append_event(Some(&ticket.id), "effect.proposed", json!({ "id": "effect", "path": "main.py" })).unwrap();
+        storage
+            .append_event(
+                Some(&ticket.id),
+                "effect.proposed",
+                json!({ "id": "effect", "path": "main.py" }),
+            )
+            .unwrap();
         let receipt = storage.evidence_receipts().unwrap().pop().unwrap();
         assert_eq!(receipt.outcome, "waiting_approval");
 
-        storage.append_event(Some(&ticket.id), "effect.approved", json!({ "effectId": "effect", "selectedPaths": ["main.py"] })).unwrap();
-        storage.append_event(Some(&ticket.id), "effect.applied", json!({ "effectId": "effect", "paths": ["main.py"] })).unwrap();
-        storage.append_event(Some(&ticket.id), "tool.completed", json!({ "tool": "pytest", "evidence": { "exitCode": 1, "preview": "1 failed" } })).unwrap();
-        storage.append_event(Some(&ticket.id), "assignment.report", json!({ "state": "waiting", "summary": "tests failed" })).unwrap();
+        storage
+            .append_event(
+                Some(&ticket.id),
+                "effect.approved",
+                json!({ "effectId": "effect", "selectedPaths": ["main.py"] }),
+            )
+            .unwrap();
+        storage
+            .append_event(
+                Some(&ticket.id),
+                "effect.applied",
+                json!({ "effectId": "effect", "paths": ["main.py"] }),
+            )
+            .unwrap();
+        storage
+            .append_event(
+                Some(&ticket.id),
+                "tool.completed",
+                json!({ "tool": "pytest", "evidence": { "exitCode": 1, "preview": "1 failed" } }),
+            )
+            .unwrap();
+        storage
+            .append_event(
+                Some(&ticket.id),
+                "assignment.report",
+                json!({ "state": "waiting", "summary": "tests failed" }),
+            )
+            .unwrap();
         let receipt = storage.evidence_receipts().unwrap().pop().unwrap();
         assert_eq!(receipt.outcome, "waiting_input");
     }
@@ -2990,7 +3193,10 @@ mod tests {
         let corrected = storage.task_context(&ticket.id).unwrap();
         assert_eq!(corrected.target_files, vec!["src/b.py"]);
         assert!(corrected.objective.contains("src/b.py"));
-        assert!(corrected.constraints.iter().any(|value| value.contains("公开 API")));
+        assert!(corrected
+            .constraints
+            .iter()
+            .any(|value| value.contains("公开 API")));
         assert_eq!(corrected.revision, 2);
     }
 
@@ -3019,8 +3225,8 @@ mod tests {
     #[test]
     fn race_schema_persists_recovers_and_cascades_with_ticket() {
         use crate::race::{
-            CandidateStrategy, ChangeMetrics, RACE_SCHEMA_VERSION, ValidationFact,
-            ValidationOutcome,
+            CandidateStrategy, ChangeMetrics, ValidationFact, ValidationOutcome,
+            RACE_SCHEMA_VERSION,
         };
 
         let directory = tempdir().unwrap();
@@ -3043,6 +3249,7 @@ mod tests {
             project_fingerprint: "race-storage".into(),
             objective: ticket.request.clone(),
             state: RaceState::Generating,
+            targets: vec![],
             allowed_paths: vec!["src/a.rs".into()],
             acceptance: vec!["cargo test".into()],
             verdict: None,
@@ -3085,7 +3292,10 @@ mod tests {
         storage.save_candidate(&candidate).unwrap();
 
         assert_eq!(storage.race(&race.id).unwrap(), race);
-        assert_eq!(storage.races_for_ticket(&ticket.id).unwrap(), vec![race.clone()]);
+        assert_eq!(
+            storage.races_for_ticket(&ticket.id).unwrap(),
+            vec![race.clone()]
+        );
         assert_eq!(storage.recoverable_races().unwrap(), vec![race.clone()]);
         assert_eq!(
             storage.candidates_for_race(&race.id).unwrap(),

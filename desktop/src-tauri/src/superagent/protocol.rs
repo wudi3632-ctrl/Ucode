@@ -17,11 +17,19 @@ pub enum ExecutorMode {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ExecutorCandidateTarget {
+    pub path: String,
+    pub operation: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ExecutorCandidate {
     pub race_id: String,
     pub candidate_id: String,
     pub strategy: String,
     pub allowed_paths: Vec<String>,
+    pub targets: Vec<ExecutorCandidateTarget>,
     pub acceptance: Vec<String>,
     pub generation_attempt: u8,
     pub feedback: Option<String>,
@@ -176,6 +184,11 @@ impl ExecutorRequest {
                     )
                     && !candidate.allowed_paths.is_empty()
                     && candidate.allowed_paths.len() <= 20
+                    && candidate.targets.len() == candidate.allowed_paths.len()
+                    && candidate.targets.iter().all(|target| {
+                        candidate.allowed_paths.contains(&target.path)
+                            && matches!(target.operation.as_str(), "create" | "modify" | "delete")
+                    })
                     && !candidate.acceptance.is_empty()
                     && candidate.acceptance.len() <= 16
                     && matches!(candidate.generation_attempt, 1 | 2) => {}
@@ -386,6 +399,10 @@ mod tests {
                 candidate_id: "candidate-a".into(),
                 strategy: "minimal_change".into(),
                 allowed_paths: vec!["src/app.rs".into()],
+                targets: vec![ExecutorCandidateTarget {
+                    path: "src/app.rs".into(),
+                    operation: "modify".into(),
+                }],
                 acceptance: vec!["cargo test".into()],
                 generation_attempt: 1,
                 feedback: None,

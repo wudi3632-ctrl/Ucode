@@ -7,7 +7,7 @@ import { resolveProjectRoot } from "../local_source/workspace.js";
 import { TOOL_DEFINITIONS } from "../tools/definitions.js";
 import { enforceOneSentence, exactReplyConstraint, oneSentenceConstraint } from "./chat_quality.js";
 
-const CHAT_PROMPT = "你是 UCode 桌面应用中的本地编码助手。禁止读写项目文件只是本轮权限约束，不是取消回答。直接针对用户当前问题自然、简洁地使用中文回答，不套用固定开头，不复述权限说明，不输出工具调用或 JSON。只有用户明确要求代码时才给完整可运行代码；只有用户询问复杂度或复杂度确实有助于理解时才说明。用户要求一句话时，只输出一个句号结尾的完整句子。";
+const CHAT_PROMPT = "你是 UCode 桌面应用中的本地编码助手，不是代码、脚本，也不是由 UCode 生成的内容。你的产品身份是：在用户本机运行，以真实项目证据、机械验证和用户审批为操作边界。禁止读写项目文件只是本轮权限约束，不是取消回答。直接针对用户当前问题自然、简洁地使用中文回答，不套用固定开头，不复述权限说明，不输出工具调用或 JSON。只有用户明确要求代码时才给完整可运行代码；只有用户询问复杂度或复杂度确实有助于理解时才说明。用户要求一句话时，只输出一个句号结尾的完整句子。";
 const PROJECT_PROMPT = "你是 UCode 的项目问答助手。文件已经由桌面宿主读取完毕，你只做文本信息提取和解释，不再执行读取。只依据本轮真实文件内容，用完整、简洁的中文句子回答；先说明文件用途，再列出能够确认的关键内容。展示代码时必须使用带语言名的 Markdown 围栏，禁止把换行写成字面量 \\n。不猜测，不声称修改，不输出列表字面量、JSON、XML、函数调用、工具名称或任何虚构文件路径。来源路径由桌面宿主统一追加，你不需要重复。";
 const PROJECT_RETRY_PROMPT = "上一次输出错误地生成了工具调用。本次文件内容已经在用户消息中，只能直接回答问题；禁止再次读取，禁止输出 JSON、代码形式的参数或任何工具调用。";
 const READABLE = new Set([".md", ".txt", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".py", ".rs", ".go", ".java", ".kt", ".c", ".h", ".cpp", ".hpp", ".cs", ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".xml", ".html", ".css", ".sql", ".sh", ".ps1", ".bat", ".cmd", ".log", ".csv"]);
@@ -43,10 +43,11 @@ export class StatelessExecutor {
     const context = candidateWorkspace(this.tools, root, request.candidate.strategy, allowed, indexed, actual);
     const objective = request.inputs.filter((item) => item.human).map((item) => item.text).join("\n").trim();
     const acceptance = request.candidate.acceptance.map((item) => `- ${item}`).join("\n");
+    const targets = request.candidate.targets.map((target) => `- ${target.operation} ${target.path}`).join("\n");
     const feedback = request.candidate.feedback
       ? `\n\n上一次机械验证反馈（只能据此定向修复，不得扩大范围）：\n${request.candidate.feedback}`
       : "";
-    const system = `${CANDIDATE_PROMPTS[request.candidate.strategy]}\n候选之间彼此不可见。你不能运行验证、选择赢家、声称完成或写入原项目。允许路径只有：${allowed.join("、")}。验收条件：\n${acceptance}${feedback}`;
+    const system = `${CANDIDATE_PROMPTS[request.candidate.strategy]}\n候选之间彼此不可见。你不能运行验证、选择赢家、声称完成或写入原项目。必须完整执行以下目标，路径和操作类型都不可省略或替换：\n${targets}\n验收条件：\n${acceptance}${feedback}`;
     const messages = modelMessages(request, system);
     const result = await coder.generate({
       task_id: request.turnId,
@@ -61,7 +62,7 @@ export class StatelessExecutor {
         generation_attempt: request.candidate.generationAttempt,
       },
     }, { signal: options.signal });
-    const changes = candidateChanges(result, allowed, actual);
+    const changes = candidateChanges(result, allowed, actual, request.candidate.targets);
     options.onEvent?.(activity(
       `candidate:${request.candidate.candidateId}`,
       "candidate_generation",
@@ -86,6 +87,11 @@ export class StatelessExecutor {
     if (historyAnswer) {
       options.onEvent?.({ type: "text_delta", delta: historyAnswer });
       return historyAnswer;
+    }
+    const identity = identityIntroduction(query);
+    if (identity) {
+      options.onEvent?.({ type: "text_delta", delta: identity });
+      return identity;
     }
     const exact = exactReplyConstraint(query);
     if (exact) {
@@ -517,6 +523,12 @@ function safeIdentityAnswer(request, content) {
     .replace(/由阿里云开发的(?:超大规模语言模型|UCode)/g, "UCode 本地编码助手");
 }
 
+function identityIntroduction(query) {
+  const normalized = String(query || "").trim();
+  if (normalized.length > 64 || !/(你是谁|介绍你自己|你的身份|who are you)/i.test(normalized)) return null;
+  return "我是 UCode，一个在本机运行、以真实证据、机械验证和用户审批为操作边界的编码助手。";
+}
+
 function attachmentFiles(request) {
   return request.attachments.map((item) => ({
     path: item.source === "project" ? `attachment://project/${item.relativePath}` : `attachment://external/${item.id}/${item.displayName}`,
@@ -774,7 +786,7 @@ function candidateWorkspace(tools, root, strategy, allowed, indexed, actual) {
   return files;
 }
 
-function candidateChanges(result, allowedPaths, existingPaths = null) {
+function candidateChanges(result, allowedPaths, existingPaths = null, targets = []) {
   if (result?.type !== "tool_request" || !["write_file", "write_files"].includes(result.tool?.name)) {
     throw new AppError("candidate_protocol_error", "候选模型没有返回结构化文件变更。", 422);
   }
@@ -789,8 +801,9 @@ function candidateChanges(result, allowedPaths, existingPaths = null) {
     throw new AppError("candidate_protocol_error", "候选文件批次为空或超过 20 个文件。", 422);
   }
   const allowed = new Set(allowedPaths);
+  const expected = new Map(targets.map((target) => [target.path.replaceAll("\\", "/"), target.operation]));
   const seen = new Set();
-  return raw.map((change) => {
+  const normalized = raw.map((change) => {
     const value = change && typeof change === "object" ? change : {};
     const candidatePath = typeof value.path === "string" ? value.path.replaceAll("\\", "/") : "";
     validateToolRequest({ name: "write_files", arguments: { changes: [{ ...value, path: candidatePath }] } }, []);
@@ -801,6 +814,9 @@ function candidateChanges(result, allowedPaths, existingPaths = null) {
     seen.add(candidatePath);
     if (!["create", "modify", "delete"].includes(value.operation)) {
       throw new AppError("candidate_protocol_error", `候选操作无效：${candidatePath}`, 422);
+    }
+    if (expected.has(candidatePath) && expected.get(candidatePath) !== value.operation) {
+      throw new AppError("candidate_protocol_error", `候选对 ${candidatePath} 的操作必须是 ${expected.get(candidatePath)}。`, 422);
     }
     if (existingPaths) {
       if (value.operation === "create" && existingPaths.has(candidatePath)) {
@@ -817,6 +833,11 @@ function candidateChanges(result, allowedPaths, existingPaths = null) {
       ? { path: candidatePath, operation: "delete" }
       : { path: candidatePath, operation: value.operation, content: normalizeGeneratedFileContent(value.content) };
   });
+  const missing = [...allowed].filter((candidatePath) => !seen.has(candidatePath));
+  if (missing.length) {
+    throw new AppError("candidate_protocol_error", `候选遗漏了必须完成的目标：${missing.join("、")}`, 422);
+  }
+  return normalized;
 }
 
 function requireCapability(toolName, capabilities) {

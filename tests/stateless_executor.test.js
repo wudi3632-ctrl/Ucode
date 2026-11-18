@@ -65,6 +65,7 @@ function enableCandidate(request, overrides = {}) {
     candidateId: "candidate-a",
     strategy: "minimal_change",
     allowedPaths: ["README.md"],
+    targets: [{ path: "README.md", operation: "modify" }],
     acceptance: ["README heading is changed"],
     generationAttempt: 1,
     feedback: null,
@@ -106,6 +107,7 @@ test("compatibility candidate may read a related caller but cannot modify it out
     candidateId: "candidate-b",
     strategy: "compatibility_first",
     allowedPaths: ["src/api.js"],
+    targets: [{ path: "src/api.js", operation: "modify" }],
     acceptance: ["existing api() callers keep working"],
     generationAttempt: 2,
     feedback: "required test failed: expected 2",
@@ -147,6 +149,25 @@ test("candidate mode rejects incomplete file content instead of claiming success
   await assert.rejects(() => value.executor.execute(value.request), /没有提供 README\.md 的完整内容/);
 });
 
+test("candidate mode rejects a batch that omits a required target", async (t) => {
+  const value = fixture("candidate", "修改两个文件");
+  fs.writeFileSync(path.join(value.root, "SECOND.md"), "# Second\n");
+  value.request.workspace.files.push({ path: "SECOND.md", sizeBytes: 9, contentDigest: null });
+  enableCandidate(value.request, {
+    allowedPaths: ["README.md", "SECOND.md"],
+    targets: [
+      { path: "README.md", operation: "modify" },
+      { path: "SECOND.md", operation: "modify" },
+    ],
+  });
+  t.after(() => fs.rmSync(value.root, { recursive: true, force: true }));
+
+  await assert.rejects(
+    value.executor.execute(value.request),
+    /候选遗漏了必须完成的目标：SECOND\.md/,
+  );
+});
+
 test("stateless chat streams only text deltas and persists no Node ticket", async (t) => {
   const value = fixture("chat", "你好");
   t.after(() => fs.rmSync(value.root, { recursive: true, force: true }));
@@ -154,6 +175,20 @@ test("stateless chat streams only text deltas and persists no Node ticket", asyn
   assert.equal(content, "真实回答");
   assert.deepEqual(value.events, [{ type: "text_delta", delta: "真实" }, { type: "text_delta", delta: "回答" }]);
   assert.equal(value.calls[0].messages.at(-1).content, "你好");
+});
+
+test("a direct identity question receives the truthful product identity without model drift", async (t) => {
+  const value = fixture("chat", "你好，请只用一句话介绍你自己。");
+  t.after(() => fs.rmSync(value.root, { recursive: true, force: true }));
+  value.executor.coder().generate = async () => {
+    throw new Error("the model must not redefine the product identity");
+  };
+
+  const content = await value.executor.execute(value.request, { onEvent: (event) => value.events.push(event) });
+
+  assert.equal(content, "我是 UCode，一个在本机运行、以真实证据、机械验证和用户审批为操作边界的编码助手。");
+  assert.deepEqual(value.events, [{ type: "text_delta", delta: content }]);
+  assert.equal(value.calls.length, 0);
 });
 
 test("exact-reply chat is fulfilled deterministically without calling the model", async (t) => {

@@ -1,14 +1,15 @@
 import { CSSProperties, KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent, useEffect, useMemo, useRef, useState } from "react";
-import { archiveTicket, bootstrap, branchTicket, cancelTicket, chooseProject, clearNotificationIdentity, completeOnboardingStep, continueTicket, createOnboardingDemo, createTicket, deleteTicket, dismissOnboardingTip, exportEvidenceReceipt, exportMarkdown, getRuntimeDiagnostics, listEvents, mainWindowActivity, markFrontendReady, pinTicket, recheckCapsule, recoverLocalRuntime, renameTicket, resetOnboarding, resolveEffect, rollbackEffect, runTicket, saveSettings, selectProject, setOnboardingWelcome, showCompletionNotification, skipOnboardingStep, subscribeRuntimeEvents, syncNativeTheme } from "../bridge/desktop";
+import { archiveTicket, bootstrap, branchTicket, cancelCandidateRace, cancelTicket, chooseProject, clearNotificationIdentity, completeOnboardingStep, continueTicket, createOnboardingDemo, createTicket, deleteTicket, dismissOnboardingTip, exportEvidenceReceipt, exportMarkdown, getRuntimeDiagnostics, listEvents, listTicketRaces, mainWindowActivity, markFrontendReady, pinTicket, recheckCapsule, recoverLocalRuntime, renameTicket, resetOnboarding, resolveEffect, rollbackEffect, runTicket, saveSettings, selectProject, setOnboardingWelcome, showCompletionNotification, skipOnboardingStep, startCandidateRace, subscribeRuntimeEvents, syncNativeTheme } from "../bridge/desktop";
 import { Conversation } from "../components/Conversation";
 import { Inspector } from "../components/Inspector";
 import { Sidebar } from "../components/Sidebar";
 import { Settings } from "../components/Settings";
-import type { AppliedEffect, BootstrapSnapshot, ContextAttachmentSelection, EvidenceReceipt, OnboardingStepId, ProjectSummary, ProposedEffect, RuntimeDiagnosticSnapshot } from "../domain/types";
+import type { AppliedEffect, BootstrapSnapshot, ContextAttachmentSelection, EvidenceReceipt, OnboardingStepId, ProjectSummary, ProposedEffect, RaceBundle, RuntimeDiagnosticSnapshot, RuntimeEvent } from "../domain/types";
 import { deriveObservedModelPerformance, type ObservedModelPerformance } from "../domain/modelPerformance";
 import { audioFeedback, unlockAudioFeedback } from "../domain/audioFeedback";
 import { CompletionNotificationController } from "../domain/completionNotifications";
 import { codeFontScale, uiFontScale } from "../domain/typography";
+import { candidateRaceRequestFromPrompt } from "../domain/candidateRace";
 
 const completionNotifications = new CompletionNotificationController(mainWindowActivity, showCompletionNotification);
 
@@ -30,6 +31,7 @@ export function App() {
   const [runtimeRecovering, setRuntimeRecovering] = useState(false);
   const [onboardingBusy, setOnboardingBusy] = useState(false);
   const [onboardingOpen, setOnboardingOpen] = useState(false);
+  const [races, setRaces] = useState<RaceBundle[]>([]);
   const cancellingRef = useRef(false);
   const submitInFlightRef = useRef(false);
 
@@ -140,33 +142,64 @@ export function App() {
     () => modelPerformanceFrom(snapshot, activeTicketId),
     [snapshot?.events, activeTicketId],
   );
+  const raceEventSequence = useMemo(
+    () => snapshot?.events.reduce((latest, event) => event.ticketId === activeTicketId && event.eventType.startsWith("race.") ? Math.max(latest, event.sequence) : latest, 0) ?? 0,
+    [snapshot?.events, activeTicketId],
+  );
+  const runningRace = races.find(({ race }) => ["prepared", "generating", "validating", "decided"].includes(race.state)) ?? null;
+  const taskBusy = busy || Boolean(runningRace);
+
+  useEffect(() => {
+    let disposed = false;
+    setRaces([]);
+    if (!activeTicketId) return;
+    listTicketRaces(activeTicketId)
+      .then((value) => { if (!disposed) setRaces(value); })
+      .catch(() => { if (!disposed) setRaces([]); });
+    return () => { disposed = true; };
+  }, [activeTicketId, raceEventSequence]);
 
   useEffect(() => {
     if (effect) setInspectorOpen(true);
   }, [effect?.id]);
 
   useEffect(() => {
+    if (!snapshot) return;
+    setEffect(effectFrom(snapshot, activeTicketId));
+  }, [snapshot?.events, activeTicketId]);
+
+  useEffect(() => {
     let disposed = false;
     let unsubscribe: (() => void) | undefined;
     subscribeRuntimeEvents((event) => {
       setSnapshot((current) => current ? mergeRuntimeEvents(current, [event]) : current);
+      if (eventRequiresBootstrapRefresh(event)) {
+        void bootstrap().then((next) => {
+          if (!disposed) setSnapshot((current) => current ? mergeBootstrapSnapshot(next, current) : next);
+        }).catch(() => undefined);
+      }
     }).then((value) => { if (disposed) value(); else unsubscribe = value; });
     return () => { disposed = true; unsubscribe?.(); };
   }, []);
 
   useEffect(() => {
-    if (!busy || !snapshot) return;
+    if (!taskBusy || !snapshot) return;
     const timer = window.setInterval(async () => {
       try {
         const incoming = await listEvents(snapshot.lastSequence);
         if (!incoming.length) return;
-        setSnapshot((current) => current ? mergeRuntimeEvents(current, incoming) : current);
+        if (incoming.some(eventRequiresBootstrapRefresh)) {
+          const next = await bootstrap();
+          setSnapshot((current) => current ? mergeBootstrapSnapshot(next, current) : next);
+        } else {
+          setSnapshot((current) => current ? mergeRuntimeEvents(current, incoming) : current);
+        }
       } catch {
         // The running command reports actionable errors through the normal task flow.
       }
     }, 1000);
     return () => window.clearInterval(timer);
-  }, [busy, snapshot?.lastSequence]);
+  }, [taskBusy, snapshot?.lastSequence]);
 
   async function submit(request: string, selection?: ContextAttachmentSelection | null, suppliedRequestId?: string): Promise<boolean> {
     if (!snapshot || !activeProject || submitInFlightRef.current) return false;
@@ -197,7 +230,17 @@ export function App() {
         setSnapshot(pending);
         setActiveTicketId(ticket.id);
         setEffect(null);
-        next = await runTicket(ticket.id, selection?.selectionId, clientRequestId);
+        const raceRequest = selection ? null : candidateRaceRequestFromPrompt(request);
+        if (raceRequest) {
+          const race = await startCandidateRace(ticket.id, raceRequest.targets, raceRequest.acceptance);
+          setRaces([race]);
+          const refreshed = await bootstrap();
+          next = refreshed.tickets.some((item) => item.id === ticket.id)
+            ? refreshed
+            : { ...refreshed, tickets: [ticket, ...refreshed.tickets] };
+        } else {
+          next = await runTicket(ticket.id, selection?.selectionId, clientRequestId);
+        }
       }
       if (!snapshot.onboarding.completedSteps.includes("conversation") && next.events.some((event) => event.ticketId === targetTicketId && event.eventType === "delivery.ready")) {
         try { next = await completeOnboardingStep("conversation"); } catch { /* The final delivery remains authoritative even if onboarding is unavailable. */ }
@@ -221,7 +264,14 @@ export function App() {
     if (!activeTicket) return;
     cancellingRef.current = true;
     setError(null);
-    try { setSnapshot(await cancelTicket(activeTicket.id)); }
+    try {
+      if (runningRace) {
+        const cancelled = await cancelCandidateRace(runningRace.race.id);
+        setRaces((current) => current.map((bundle) => bundle.race.id === cancelled.race.id ? cancelled : bundle));
+      } else {
+        setSnapshot(await cancelTicket(activeTicket.id));
+      }
+    }
     catch (cause) { setError(friendlyError(cause)); }
     finally { setBusy(false); }
   }
@@ -482,7 +532,12 @@ export function App() {
         effect={effect}
         receipt={activeReceipt}
         appliedEffect={appliedEffect}
-        busy={busy}
+        busy={taskBusy}
+        races={races}
+        onCancelRace={async (raceId) => {
+          const cancelled = await cancelCandidateRace(raceId);
+          setRaces((current) => current.map((bundle) => bundle.race.id === raceId ? cancelled : bundle));
+        }}
         onSubmit={submit}
         onCancel={stopActive}
         onRetry={async () => { await submit(lastFailedRequest ?? activeTicket?.request ?? ""); }}
@@ -587,6 +642,14 @@ export function mergeRuntimeEvents(snapshot: BootstrapSnapshot, incoming: Bootst
   };
 }
 
+export function eventRequiresBootstrapRefresh(event: RuntimeEvent): boolean {
+  return event.eventType === "race.decided";
+}
+
+export function mergeBootstrapSnapshot(fresh: BootstrapSnapshot, current: BootstrapSnapshot): BootstrapSnapshot {
+  return mergeRuntimeEvents(fresh, current.events.filter((event) => event.sequence > fresh.lastSequence));
+}
+
 export function resolveTheme(theme: BootstrapSnapshot["settings"]["theme"], prefersLight: boolean): "dark" | "light" {
   return theme === "system" ? (prefersLight ? "light" : "dark") : theme;
 }
@@ -685,6 +748,7 @@ export function effectFrom(snapshot: BootstrapSnapshot, ticketId: string | null)
   return {
     id: String(payload.id ?? ""), changes,
     risk: (payload.risk === "command" || payload.risk === "network") ? payload.risk : "write",
+    atomic: payload.atomic === true,
   };
 }
 

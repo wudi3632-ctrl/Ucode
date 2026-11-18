@@ -237,6 +237,53 @@ html[data-theme="light"] .rich-text th { color:#29322b; background:#e9ede9; } ht
 .thought-steps li.current { color: #c7cac7; }
 .thought-steps li.current::before { background: var(--accent); box-shadow: 0 0 0 3px #171918, 0 0 10px rgba(168,233,134,.35); }
 
+.candidate-race-card { width:min(720px,96%); overflow:hidden; border:1px solid #343a35; border-radius:13px; background:linear-gradient(145deg,rgba(168,233,134,.035),transparent 48%),#1b1e1c; box-shadow:0 10px 30px rgba(0,0,0,.12); animation:race-card-in .34s var(--ease) both; }
+.candidate-race-card>header { min-height:52px; display:grid; grid-template-columns:28px minmax(0,1fr) auto; align-items:center; gap:9px; padding:10px 12px; border-bottom:1px solid var(--line); }
+.race-mark { width:27px; height:27px; display:grid; place-items:center; border-radius:8px; color:var(--accent); background:rgba(168,233,134,.08); font-size:calc(15px * var(--ui-font-scale)); }
+.candidate-race-card>header>div { min-width:0; display:grid; gap:2px; }
+.candidate-race-card>header b { overflow:hidden; color:var(--ink); font-size:calc(12px * var(--ui-font-scale)); font-weight:680; text-overflow:ellipsis; white-space:nowrap; }
+.candidate-race-card>header small { color:var(--muted); font-size:calc(10px * var(--ui-font-scale)); }
+.race-state { padding:3px 7px; border-radius:999px; color:var(--muted); background:var(--surface-hover); font-size:calc(9px * var(--ui-font-scale)); font-weight:650; white-space:nowrap; }
+.race-state.active { color:#c8efb2; background:rgba(168,233,134,.08); }
+.race-state.active::before { content:""; width:5px; height:5px; display:inline-block; margin-right:5px; border-radius:50%; background:var(--accent); animation:pulse 1.2s ease-in-out infinite; }
+.race-candidates { display:grid; gap:5px; padding:7px; }
+.race-candidate { overflow:hidden; border:1px solid transparent; border-radius:9px; background:rgba(255,255,255,.018); transition:border-color .18s,background .18s; }
+.race-candidate:hover,.race-candidate[open] { border-color:var(--line); background:var(--surface); }
+.race-candidate.winner { border-color:rgba(168,233,134,.23); background:rgba(168,233,134,.035); }
+.race-candidate>summary { min-height:42px; display:grid; grid-template-columns:22px minmax(0,1fr) auto 17px; align-items:center; gap:8px; padding:6px 9px; cursor:pointer; list-style:none; }
+.race-candidate>summary::-webkit-details-marker { display:none; }
+.candidate-index { width:20px; height:20px; display:grid; place-items:center; border:1px solid var(--line); border-radius:6px; color:var(--accent); font-size:calc(10px * var(--ui-font-scale)); }
+.race-candidate.winner .candidate-index { border-color:rgba(168,233,134,.32); background:rgba(168,233,134,.09); }
+.race-candidate>summary>span:nth-child(2) { min-width:0; display:grid; gap:1px; }
+.race-candidate>summary b { font-size:calc(11px * var(--ui-font-scale)); font-weight:630; }
+.race-candidate>summary small { color:var(--muted); font-size:calc(9px * var(--ui-font-scale)); }
+.candidate-metrics { color:var(--muted); font:calc(9px * var(--ui-font-scale)) "Cascadia Code",Consolas,monospace; white-space:nowrap; }
+.candidate-metrics i { margin-left:5px; color:var(--muted-2); font-style:normal; }
+.candidate-chevron { color:var(--muted-2); text-align:center; transition:transform .2s var(--ease); }
+.race-candidate[open] .candidate-chevron { transform:rotate(180deg); }
+.candidate-details { padding:8px 10px 10px 40px; border-top:1px solid color-mix(in srgb,var(--line) 68%,transparent); animation:race-details-in .22s var(--ease) both; }
+.candidate-fact-summary { display:flex; flex-wrap:wrap; gap:5px; margin-bottom:7px; }
+.candidate-fact-summary span { padding:2px 6px; border-radius:5px; color:var(--muted); background:var(--surface-hover); font-size:calc(9px * var(--ui-font-scale)); }
+.candidate-fact-summary .fact-pass { color:#a9d995; background:rgba(168,233,134,.07); }
+.candidate-fact-summary .fact-fail { color:#eba09a; background:rgba(231,134,127,.08); }
+.candidate-details>ul { margin:0; padding:0; display:grid; gap:4px; list-style:none; }
+.candidate-details>p { margin:4px 0; color:var(--muted); font-size:calc(10px * var(--ui-font-scale)); }
+.candidate-details li { display:grid; grid-template-columns:14px minmax(0,1fr); gap:6px; color:var(--muted); font-size:calc(10px * var(--ui-font-scale)); line-height:1.4; }
+.candidate-details li>span { color:var(--muted-2); font-weight:800; }
+.candidate-details li.fact-passed>span { color:#91ce78; }
+.candidate-details li.fact-failed>span { color:var(--danger); }
+.candidate-details li b { display:block; color:var(--ink); font-weight:500; }
+.candidate-details li code { display:block; margin-top:2px; color:var(--muted); font-size:calc(9px * var(--code-font-scale)); overflow-wrap:anywhere; }
+.candidate-diff { margin-top:8px; }
+.candidate-diff>summary { color:var(--muted); cursor:pointer; font-size:calc(10px * var(--ui-font-scale)); }
+.candidate-diff pre { max-height:260px; margin:7px 0 0; padding:9px; overflow:auto; border:1px solid #343936; border-radius:7px; color:#cbd0cc; background:#121413; font:calc(10px * var(--code-font-scale))/1.55 "Cascadia Code",Consolas,monospace; white-space:pre; }
+.race-explanation { margin:0 11px 8px; padding:8px 9px; border-radius:7px; color:var(--muted); background:rgba(231,134,127,.045); font-size:calc(10px * var(--ui-font-scale)); line-height:1.5; }
+.candidate-race-card>footer { min-height:38px; display:flex; align-items:center; justify-content:space-between; gap:10px; padding:7px 11px; border-top:1px solid var(--line); color:var(--muted); font-size:calc(9px * var(--ui-font-scale)); }
+.candidate-race-card>footer>span { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.candidate-race-card>footer .quiet { flex:none; padding:5px 8px; font-size:calc(9px * var(--ui-font-scale)); }
+@keyframes race-card-in { from { opacity:0; transform:translateY(8px) scale(.992); } to { opacity:1; transform:none; } }
+@keyframes race-details-in { from { opacity:0; transform:translateY(-4px); } to { opacity:1; transform:none; } }
+
 .approval-card { max-width: 94%; padding: 14px; border: 1px solid #3a3d3a; border-radius: 12px; background: #1c1e1d; display: grid; grid-template-columns: 32px 1fr; gap: 11px; }
 .approval-icon { width: 30px; height: 30px; display: grid; place-items: center; border-radius: 8px; color: var(--warning); background: rgba(228,184,106,.1); font-weight: 700; }
 .approval-content p { margin: 8px 0 12px; color: var(--muted); font-size: calc(12px * var(--ui-font-scale)); }
@@ -972,7 +1019,14 @@ html[data-theme="light"] .setting-field,html[data-theme="light"] .sound-settings
 html[data-theme="light"] .settings-surface footer { border-color:var(--line); background:#f2f5f1; }
 html[data-theme="light"] .quiet { border-color:var(--line-strong); color:#4b554d; background:#fff; }
 html[data-theme="light"] .quiet:hover { color:var(--ink); background:var(--surface-hover); }
-html[data-theme="light"] .approval-card,html[data-theme="light"] .task-rescue,html[data-theme="light"] .receipt-banner,html[data-theme="light"] .evidence-receipt,html[data-theme="light"] .error-card,html[data-theme="light"] .recovery-required-card { border-color:var(--line); color:var(--ink); background:#fff; box-shadow:0 8px 22px rgba(38,52,42,.06); }
+html[data-theme="light"] .approval-card,html[data-theme="light"] .task-rescue,html[data-theme="light"] .receipt-banner,html[data-theme="light"] .evidence-receipt,html[data-theme="light"] .error-card,html[data-theme="light"] .recovery-required-card,html[data-theme="light"] .candidate-race-card { border-color:var(--line); color:var(--ink); background:#fff; box-shadow:0 8px 22px rgba(38,52,42,.06); }
+html[data-theme="light"] .race-mark { color:#4e7b45; background:#e9f4e5; }
+html[data-theme="light"] .race-state.active { color:#47703f; background:#e8f2e5; }
+html[data-theme="light"] .race-candidate { background:#fafcf9; }
+html[data-theme="light"] .race-candidate:hover,html[data-theme="light"] .race-candidate[open] { background:var(--surface); }
+html[data-theme="light"] .race-candidate.winner { border-color:#c9ddc3; background:#f3f8f1; }
+html[data-theme="light"] .candidate-index { background:#fff; }
+html[data-theme="light"] .candidate-diff pre { border-color:#303632; color:#d4d9d5; background:#171a18; }
 html[data-theme="light"] .task-rescue-copy code { color:#4c5d50; }
 html[data-theme="light"] .recovery-required-paths code { border-color:#e1c7c3; color:#754f4b; background:#fff5f3; }
 html[data-theme="light"] .recovery-required-card summary { color:#7d5652; }

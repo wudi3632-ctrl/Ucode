@@ -29,6 +29,7 @@ test("candidate mode requires bounded strategy scope acceptance and write author
     candidateId: "candidate-a",
     strategy: "minimal_change",
     allowedPaths: ["README.md"],
+    targets: [{ path: "README.md", operation: "modify" }],
     acceptance: ["README heading is UCode"],
     generationAttempt: 1,
     feedback: null,

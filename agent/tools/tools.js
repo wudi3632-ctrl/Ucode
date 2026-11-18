@@ -233,7 +233,7 @@ export class ProjectTools {
         input: after,
         encoding: "utf8",
         windowsHide: true,
-        timeout: Math.min(this.timeoutMs, 10_000),
+        timeout: Math.min(Math.max(this.timeoutMs, 5_000), 10_000),
         env: { PATH: process.env.PATH || "", SYSTEMROOT: process.env.SYSTEMROOT || "", PYTHONIOENCODING: "utf-8" },
       });
       if (check.status !== 0) throw new AppError("candidate_syntax_error", "代码模型生成的 Python 文件未通过语法检查");

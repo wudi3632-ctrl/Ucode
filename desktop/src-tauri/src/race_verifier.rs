@@ -1,4 +1,6 @@
-use crate::race::{ChangeMetrics, HardFailure, ValidationFact, ValidationOutcome};
+use crate::race::{
+    ChangeMetrics, HardFailure, RaceTarget, RaceTargetOperation, ValidationFact, ValidationOutcome,
+};
 use crate::race_workspace::{digest_tree, CandidateWorkspace};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -75,6 +77,7 @@ pub fn verify_candidate(
     workspace: &CandidateWorkspace,
     proposal: &CandidateProposal,
     allowed_paths: &[String],
+    targets: &[RaceTarget],
     acceptance: &[String],
 ) -> Result<VerificationResult, VerificationError> {
     if proposal.version != "ucode.candidate.v1"
@@ -94,6 +97,10 @@ pub fn verify_candidate(
         .iter()
         .map(|value| value.replace('\\', "/"))
         .collect();
+    let expected_operations = targets
+        .iter()
+        .map(|target| (target.path.replace('\\', "/"), target.operation))
+        .collect::<std::collections::HashMap<_, _>>();
     let mut seen = HashSet::new();
     let mut facts = Vec::new();
     let mut prepared = Vec::new();
@@ -115,6 +122,24 @@ pub fn verify_candidate(
                 HardFailure::WorkspaceEscape,
             ));
             return finish_failed(workspace, facts);
+        }
+        if let Some(expected) = expected_operations.get(&normalized) {
+            let matches = matches!(
+                (expected, &change.operation),
+                (RaceTargetOperation::Create, ChangeOperation::Create)
+                    | (RaceTargetOperation::Modify, ChangeOperation::Modify)
+                    | (RaceTargetOperation::Delete, ChangeOperation::Delete)
+            );
+            if !matches {
+                facts.push(hard_fact(
+                    "mandate-operation",
+                    format!(
+                        "candidate operation for {normalized} does not match the requested operation"
+                    ),
+                    HardFailure::OperationMismatch,
+                ));
+                return finish_failed(workspace, facts);
+            }
         }
         let absolute = root.join(&normalized);
         if path_crosses_link(&root, &absolute)? {
@@ -199,6 +224,31 @@ pub fn verify_candidate(
             before,
             after,
         });
+    }
+    let missing = allowed.difference(&seen).cloned().collect::<BTreeSet<_>>();
+    if !missing.is_empty() {
+        facts.push(hard_fact(
+            "mandate-coverage",
+            format!(
+                "candidate omitted required target paths: {}",
+                missing.into_iter().collect::<Vec<_>>().join(", ")
+            ),
+            HardFailure::MandateIncomplete,
+        ));
+        return finish_failed(workspace, facts);
+    }
+    facts.push(pass_fact(
+        "mandate-coverage",
+        format!(
+            "candidate covered all {} required target paths",
+            allowed.len()
+        ),
+    ));
+    if !expected_operations.is_empty() {
+        facts.push(pass_fact(
+            "mandate-operation",
+            "every candidate operation matches the explicit create/modify/delete request".into(),
+        ));
     }
     facts.push(pass_fact(
         "path-boundary",
@@ -690,6 +740,7 @@ mod tests {
             ),
             &["app.json".into()],
             &[],
+            &[],
         )
         .unwrap();
         assert!(result.diff.contains("-{\"value\":1}"));
@@ -732,6 +783,7 @@ mod tests {
             ),
             &["api.py".into()],
             &[],
+            &[],
         )
         .unwrap();
         assert_eq!(
@@ -754,6 +806,7 @@ mod tests {
             ),
             &["api.py".into()],
             &[],
+            &[],
         )
         .unwrap();
         assert_eq!(lost.facts[0].hard_failure, Some(HardFailure::InterfaceLost));
@@ -773,6 +826,7 @@ mod tests {
             ),
             &["tests/test_api.py".into()],
             &[],
+            &[],
         )
         .unwrap();
         assert_eq!(
@@ -780,6 +834,120 @@ mod tests {
             Some(HardFailure::TestDeleted)
         );
         remove_candidate_workspace(&workspace).unwrap();
+    }
+
+    #[test]
+    fn mandate_requires_every_target_and_the_requested_operation() {
+        let directory = tempdir().unwrap();
+        let project = directory.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("modify.txt"), "before\n").unwrap();
+        fs::write(project.join("delete.txt"), "remove\n").unwrap();
+        let managed = directory.path().join("managed");
+        let allowed = vec![
+            "create.txt".into(),
+            "modify.txt".into(),
+            "delete.txt".into(),
+        ];
+        let targets = vec![
+            RaceTarget {
+                path: "create.txt".into(),
+                operation: RaceTargetOperation::Create,
+            },
+            RaceTarget {
+                path: "modify.txt".into(),
+                operation: RaceTargetOperation::Modify,
+            },
+            RaceTarget {
+                path: "delete.txt".into(),
+                operation: RaceTargetOperation::Delete,
+            },
+        ];
+
+        let incomplete_workspace =
+            create_candidate_workspace(&project, &managed, "race-mandate", "incomplete").unwrap();
+        let incomplete = verify_candidate(
+            &incomplete_workspace,
+            &proposal(
+                &incomplete_workspace,
+                vec![ProposedChange {
+                    path: "create.txt".into(),
+                    operation: ChangeOperation::Create,
+                    content: Some("created\n".into()),
+                }],
+            ),
+            &allowed,
+            &targets,
+            &[],
+        )
+        .unwrap();
+        assert!(incomplete
+            .facts
+            .iter()
+            .any(|fact| fact.hard_failure == Some(HardFailure::MandateIncomplete)));
+        remove_candidate_workspace(&incomplete_workspace).unwrap();
+
+        let wrong_operation_workspace =
+            create_candidate_workspace(&project, &managed, "race-mandate", "wrong-op").unwrap();
+        let wrong_operation = verify_candidate(
+            &wrong_operation_workspace,
+            &proposal(
+                &wrong_operation_workspace,
+                vec![ProposedChange {
+                    path: "modify.txt".into(),
+                    operation: ChangeOperation::Delete,
+                    content: None,
+                }],
+            ),
+            &["modify.txt".into()],
+            &[RaceTarget {
+                path: "modify.txt".into(),
+                operation: RaceTargetOperation::Modify,
+            }],
+            &[],
+        )
+        .unwrap();
+        assert!(wrong_operation
+            .facts
+            .iter()
+            .any(|fact| fact.hard_failure == Some(HardFailure::OperationMismatch)));
+        remove_candidate_workspace(&wrong_operation_workspace).unwrap();
+
+        let complete_workspace =
+            create_candidate_workspace(&project, &managed, "race-mandate", "complete").unwrap();
+        let complete = verify_candidate(
+            &complete_workspace,
+            &proposal(
+                &complete_workspace,
+                vec![
+                    ProposedChange {
+                        path: "create.txt".into(),
+                        operation: ChangeOperation::Create,
+                        content: Some("created\n".into()),
+                    },
+                    ProposedChange {
+                        path: "modify.txt".into(),
+                        operation: ChangeOperation::Modify,
+                        content: Some("after\n".into()),
+                    },
+                    ProposedChange {
+                        path: "delete.txt".into(),
+                        operation: ChangeOperation::Delete,
+                        content: None,
+                    },
+                ],
+            ),
+            &allowed,
+            &targets,
+            &[],
+        )
+        .unwrap();
+        assert!(complete
+            .facts
+            .iter()
+            .all(|fact| fact.hard_failure.is_none()));
+        assert_eq!(complete.metrics.modified_files, 3);
+        remove_candidate_workspace(&complete_workspace).unwrap();
     }
 
     #[test]
@@ -833,6 +1001,7 @@ mod tests {
                 }],
             ),
             &["app.json".into()],
+            &[],
             &[],
         )
         .unwrap();

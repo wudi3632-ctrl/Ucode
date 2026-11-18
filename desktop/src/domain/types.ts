@@ -128,6 +128,78 @@ export interface RuntimeEvent {
   createdAt: string;
 }
 
+export type RaceState = "prepared" | "generating" | "validating" | "decided" | "awaiting_review" | "no_winner" | "applied" | "rolled_back" | "rejected" | "stale" | "cancelled";
+export type CandidateState = "queued" | "generating" | "proposed" | "validating" | "passed" | "failed" | "rejected" | "cancelled";
+export type CandidateStrategy = "minimal_change" | "compatibility_first";
+export type ValidationOutcome = "passed" | "failed" | "skipped";
+export type HardFailure = "workspace_escape" | "syntax_error" | "interface_lost" | "required_test_failed" | "test_deleted" | "non_replayable" | "empty_change" | "mandate_incomplete" | "operation_mismatch";
+
+export interface ValidationFact {
+  checkId: string;
+  outcome: ValidationOutcome;
+  summary: string;
+  required: boolean;
+  hardFailure: HardFailure | null;
+  command: string | null;
+  exitCode: number | null;
+  evidenceDigests: string[];
+}
+
+export interface ChangeMetrics {
+  modifiedFiles: number;
+  unrelatedFiles: number;
+  deletedFiles: number;
+  changedLines: number;
+}
+
+export interface CandidateDecision {
+  candidateId: string;
+  eligible: boolean;
+  reasons: string[];
+}
+
+export interface RaceVerdict {
+  schemaVersion: number;
+  kind: "winner" | "no_winner";
+  winnerId: string | null;
+  rankedCandidateIds: string[];
+  decisions: CandidateDecision[];
+  summary: string;
+  decidedAt: string;
+}
+
+export interface CandidateRace {
+  schemaVersion: number;
+  id: string;
+  ticketId: string;
+  projectFingerprint: string;
+  objective: string;
+  state: RaceState;
+  targets: Array<{ path: string; operation: "create" | "modify" | "delete" }>;
+  allowedPaths: string[];
+  acceptance: string[];
+  verdict: RaceVerdict | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface RaceCandidate {
+  id: string;
+  strategy: CandidateStrategy;
+  state: CandidateState;
+  provider: string;
+  model: string;
+  diff: string | null;
+  resultDigest: string | null;
+  facts: ValidationFact[];
+  metrics: ChangeMetrics;
+}
+
+export interface RaceBundle {
+  race: CandidateRace;
+  candidates: RaceCandidate[];
+}
+
 export interface EvidenceReceipt {
   ticketId: string;
   request: string;
@@ -191,6 +263,7 @@ export interface ProposedEffect {
   id: string;
   changes: EffectChange[];
   risk: "write" | "command" | "network";
+  atomic?: boolean;
 }
 
 export interface EffectChange {

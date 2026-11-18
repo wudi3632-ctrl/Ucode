@@ -1,6 +1,6 @@
 import { FormEvent, KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
 import { chooseContextAttachments, removeContextAttachment } from "../bridge/desktop";
-import type { AppliedEffect, AppSettings, ContextAttachmentSelection, ContextAttachmentSummary, EvidenceReceipt, OnboardingState, ProposedEffect, RuntimeEvent, TicketSummary } from "../domain/types";
+import type { AppliedEffect, AppSettings, ContextAttachmentSelection, ContextAttachmentSummary, EvidenceReceipt, OnboardingState, ProposedEffect, RaceBundle, RaceCandidate, RuntimeEvent, TicketSummary } from "../domain/types";
 import type { ObservedModelPerformance } from "../domain/modelPerformance";
 import { changedLineCounts } from "../domain/diff";
 import { buildComposerHistory, canStartComposerHistory, exitComposerHistory, moveComposerHistory, type ComposerHistoryState } from "../domain/composerHistory";
@@ -15,6 +15,8 @@ interface ConversationProps {
   receipt: EvidenceReceipt | null;
   appliedEffect: AppliedEffect | null;
   busy: boolean;
+  races?: RaceBundle[];
+  onCancelRace?: (raceId: string) => Promise<void>;
   onSubmit: (request: string, selection?: ContextAttachmentSelection | null, clientRequestId?: string) => Promise<boolean>;
   onCancel: () => Promise<void>;
   onRetry: () => Promise<void>;
@@ -71,7 +73,7 @@ const activityCopy: Record<string, string> = {
   "provider.reconnected": "连接已恢复，缺失内容已补齐",
 };
 
-export function Conversation({ projectId, ticket, events, effect, receipt, appliedEffect, busy, onSubmit, onCancel, onRetry, onExport, onBranch, onApprove, onReject, onRollback, onExportReceipt, hasProject, onOpenProject, onboarding = completedOnboardingState, onboardingBusy = false, onCreateDemo = async () => undefined, onDismissOnboarding = async () => undefined, onDismissOnboardingTip = async () => undefined, onOpenSettings = () => undefined, error, sidebarOpen, inspectorOpen, onToggleSidebar, onToggleInspector, providerStatus, modelProvider, providerModel, modelPerformance, providerRecovering = false, onRecoverProvider = async () => undefined }: ConversationProps) {
+export function Conversation({ projectId, ticket, events, effect, receipt, appliedEffect, busy, races = [], onCancelRace = async () => undefined, onSubmit, onCancel, onRetry, onExport, onBranch, onApprove, onReject, onRollback, onExportReceipt, hasProject, onOpenProject, onboarding = completedOnboardingState, onboardingBusy = false, onCreateDemo = async () => undefined, onDismissOnboarding = async () => undefined, onDismissOnboardingTip = async () => undefined, onOpenSettings = () => undefined, error, sidebarOpen, inspectorOpen, onToggleSidebar, onToggleInspector, providerStatus, modelProvider, providerModel, modelPerformance, providerRecovering = false, onRecoverProvider = async () => undefined }: ConversationProps) {
   const [request, setRequest] = useState("");
   const [selection, setSelection] = useState<ContextAttachmentSelection | null>(null);
   const [attachmentLoading, setAttachmentLoading] = useState(false);
@@ -240,6 +242,7 @@ export function Conversation({ projectId, ticket, events, effect, receipt, appli
               if (item.kind === "rescue") return <TaskRescueRow key={item.key} recovery={item.recovery} onAttachContext={() => void addAttachments()} onConfigureModel={onOpenSettings} />;
               return <AssistantMessage key={item.key} content={item.content} streaming={item.streaming} copied={copied === item.key} onCopy={() => copyText(item.key, item.content)} onRetry={() => void onSubmit(latestUserRequest)} onBranch={() => onBranch(item.sequence)} />;
             })}
+            {races.map((race) => <CandidateRaceCard key={race.race.id} bundle={race} onCancel={() => onCancelRace(race.race.id)} />)}
             {effect && (
               <article className="approval-card">
                 <div className="approval-icon">±</div>
@@ -249,10 +252,10 @@ export function Conversation({ projectId, ticket, events, effect, receipt, appli
                     {effect.changes.map((change) => {
                       const checked = selectedEffectPaths.includes(change.path);
                       const counts = changedLineCounts(change.before, change.after);
-                      return <label key={change.path}><input type="checkbox" checked={checked} onChange={() => setEffectSelection({ effectId: effect.id, paths: checked ? selectedEffectPaths.filter((path) => path !== change.path) : [...selectedEffectPaths, change.path] })} /><span><b>{change.path}</b><small>{change.operation === "create" ? "新建" : change.operation === "delete" ? "删除" : "修改"}</small></span><div className="change-summary"><span className="addition">+{counts.additions}</span><span className="deletion">−{counts.deletions}</span></div></label>;
+                      return <label key={change.path}><input type="checkbox" checked={checked} disabled={effect.atomic} onChange={() => setEffectSelection({ effectId: effect.id, paths: checked ? selectedEffectPaths.filter((path) => path !== change.path) : [...selectedEffectPaths, change.path] })} /><span><b>{change.path}</b><small>{change.operation === "create" ? "新建" : change.operation === "delete" ? "删除" : "修改"}</small></span><div className="change-summary"><span className="addition">+{counts.additions}</span><span className="deletion">−{counts.deletions}</span></div></label>;
                     })}
                   </div>
-                  <p>批准前会重新校验所有选中文件；任一文件发生变化，整批都不会写入。</p>
+                  <p>{effect.atomic ? "该候选方案已经整体验证，必须整批批准；写入前仍会重新校验全部文件。" : "批准前会重新校验所有选中文件；任一文件发生变化，整批都不会写入。"}</p>
                   <div className="approval-actions">
                     <button className="quiet" onClick={onReject}>拒绝</button>
                     <button className="approve" disabled={!selectedEffectPaths.length} onClick={() => onApprove(selectedEffectPaths)}>批准选中的 {selectedEffectPaths.length} 个文件</button>
@@ -334,6 +337,54 @@ export function Conversation({ projectId, ticket, events, effect, receipt, appli
   );
 }
 
+function CandidateRaceCard({ bundle, onCancel }: { bundle: RaceBundle; onCancel: () => Promise<void> }) {
+  const { race, candidates } = bundle;
+  const winnerId = race.verdict?.winnerId ?? null;
+  const running = ["prepared", "generating", "validating", "decided"].includes(race.state);
+  const state = ({
+    prepared: "正在准备隔离区", generating: "正在生成两个方案", validating: "正在本地验证", decided: "正在整理结论",
+    awaiting_review: "验证完成，等待审查", no_winner: "没有安全赢家", applied: "推荐方案已应用", rolled_back: "已安全回滚", rejected: "已拒绝",
+    stale: "项目已变化，需要重新生成", cancelled: "已停止",
+  } as const)[race.state];
+  const passed = candidates.filter((candidate) => candidate.state === "passed").length;
+  const title = race.state === "no_winner" ? "两个方案均未通过" : winnerId ? "本地验证已选出推荐方案" : "正在比较两个隔离方案";
+  return <article className={`candidate-race-card state-${race.state}`} aria-label="候选验证">
+    <header>
+      <span className="race-mark" aria-hidden="true">◇</span>
+      <div><b>{title}</b><small>{state}</small></div>
+      <span className={`race-state ${running ? "active" : ""}`}>{running ? "验证中" : `${passed}/${candidates.length} 通过`}</span>
+    </header>
+    <div className="race-candidates">
+      {candidates.map((candidate, index) => <CandidateSummary key={candidate.id} candidate={candidate} label={index === 0 ? "最小改动" : "兼容优先"} winner={candidate.id === winnerId} />)}
+    </div>
+    {race.state === "no_winner" && <p className="race-explanation">UCode 没有把失败方案包装成成功。原项目保持不变，可展开查看未通过的检查。</p>}
+    {race.state === "stale" && <p className="race-explanation">生成后项目内容发生了变化，为避免覆盖新修改，旧结果已失效。</p>}
+    <footer>
+      <span>{race.allowedPaths.length} 个目标文件 · {race.acceptance.join(" · ")}</span>
+      {running && <button type="button" className="quiet" onClick={() => void onCancel()}>停止比较</button>}
+    </footer>
+  </article>;
+}
+
+function CandidateSummary({ candidate, label, winner }: { candidate: RaceCandidate; label: string; winner: boolean }) {
+  const failed = candidate.facts.filter((fact) => fact.outcome === "failed").length;
+  const passed = candidate.facts.filter((fact) => fact.outcome === "passed").length;
+  const state = ({ queued: "等待", generating: "生成中", proposed: "已生成", validating: "验证中", passed: "通过", failed: "未通过", rejected: "未采用", cancelled: "已停止" } as const)[candidate.state];
+  return <details className={`race-candidate ${winner ? "winner" : ""}`}>
+    <summary>
+      <span className="candidate-index" aria-hidden="true">{winner ? "✓" : ""}</span>
+      <span><b>{label}</b><small>{winner ? "推荐 · " : ""}{state}</small></span>
+      <span className="candidate-metrics">{candidate.metrics.modifiedFiles || 0} 文件 <i>+−{candidate.metrics.changedLines || 0}</i></span>
+      <span className="candidate-chevron">⌄</span>
+    </summary>
+    <div className="candidate-details">
+      <div className="candidate-fact-summary"><span className="fact-pass">{passed} 通过</span><span className={failed ? "fact-fail" : "fact-muted"}>{failed} 失败</span><span>{candidate.metrics.deletedFiles} 删除</span></div>
+      {candidate.facts.length > 0 ? <ul>{candidate.facts.map((fact) => <li key={fact.checkId} className={`fact-${fact.outcome}`}><span>{fact.outcome === "passed" ? "✓" : fact.outcome === "failed" ? "×" : "–"}</span><div><b>{fact.summary}</b>{fact.command && <code>{fact.command}{fact.exitCode === null ? "" : ` · exit ${fact.exitCode}`}</code>}</div></li>)}</ul> : <p>验证事实将在本地检查完成后出现。</p>}
+      {candidate.diff && <details className="candidate-diff"><summary>查看候选 Diff</summary><pre>{candidate.diff}</pre></details>}
+    </div>
+  </details>;
+}
+
 function RuntimeRecoveryStrip({ status, recovering, onRecover }: { status: "offline" | "unavailable"; recovering: boolean; onRecover: () => Promise<void> }) {
   const starting = status === "offline";
   return <div className={`runtime-recovery-strip ${starting ? "starting" : "failed"}`} role="status">
@@ -391,7 +442,7 @@ function EvidenceReceiptCard({ receipt, onExport }: { receipt: EvidenceReceipt; 
       : visibleSources.length
         ? "回答范围仅限于本轮实际读取的项目内容"
         : receipt.route === "chat" || receipt.route === "code_generate"
-          ? "回答由本地模型生成，未读取项目文件"
+          ? "未读取项目文件；本回答不构成项目证据"
           : "本轮未修改项目文件"
     : receipt.outcome === "failed"
       ? "任务失败，不能视为完成"

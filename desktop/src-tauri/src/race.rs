@@ -15,6 +15,7 @@ pub enum RaceState {
     AwaitingReview,
     NoWinner,
     Applied,
+    RolledBack,
     Rejected,
     Stale,
     Cancelled,
@@ -37,6 +38,7 @@ impl RaceState {
                 | (AwaitingReview, Applied)
                 | (AwaitingReview, Rejected)
                 | (AwaitingReview, Stale)
+                | (Applied, RolledBack)
         )
     }
 
@@ -122,6 +124,23 @@ pub enum HardFailure {
     TestDeleted,
     NonReplayable,
     EmptyChange,
+    MandateIncomplete,
+    OperationMismatch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RaceTargetOperation {
+    Create,
+    Modify,
+    Delete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RaceTarget {
+    pub path: String,
+    pub operation: RaceTargetOperation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -157,6 +176,8 @@ pub struct Race {
     pub project_fingerprint: String,
     pub objective: String,
     pub state: RaceState,
+    #[serde(default)]
+    pub targets: Vec<RaceTarget>,
     #[serde(default)]
     pub allowed_paths: Vec<String>,
     #[serde(default)]
@@ -361,6 +382,7 @@ pub struct TaskCapsule {
     pub ticket_id: String,
     pub project_fingerprint: String,
     pub objective: String,
+    pub targets: Vec<RaceTarget>,
     pub allowed_paths: Vec<String>,
     pub acceptance: Vec<String>,
     pub candidates: Vec<CapsuleCandidate>,
@@ -376,6 +398,7 @@ pub fn project_capsule(race: &Race, candidates: &[Candidate]) -> TaskCapsule {
         ticket_id: race.ticket_id.clone(),
         project_fingerprint: race.project_fingerprint.clone(),
         objective: race.objective.clone(),
+        targets: race.targets.clone(),
         allowed_paths: race.allowed_paths.clone(),
         acceptance: race.acceptance.clone(),
         candidates: candidates
@@ -442,6 +465,7 @@ mod tests {
             project_fingerprint: "project".into(),
             objective: "fix".into(),
             state: RaceState::Prepared,
+            targets: vec![],
             allowed_paths: vec![],
             acceptance: vec![],
             verdict: None,
@@ -572,6 +596,7 @@ mod tests {
             project_fingerprint: "project".into(),
             objective: "fix".into(),
             state: RaceState::AwaitingReview,
+            targets: vec![],
             allowed_paths: vec!["src/**".into()],
             acceptance: vec!["cargo test".into()],
             verdict: None,

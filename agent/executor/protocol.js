@@ -78,8 +78,16 @@ function validateCandidateRequest(candidate, mandate) {
   boundedString(candidate.candidateId, "candidate.candidateId", 200);
   if (!CANDIDATE_STRATEGIES.has(candidate.strategy)) fail("executor_candidate_strategy", "Candidate strategy is invalid");
   boundedArray(candidate.allowedPaths, "candidate.allowedPaths", 1, 20);
+  boundedArray(candidate.targets, "candidate.targets", 1, 20);
   boundedArray(candidate.acceptance, "candidate.acceptance", 1, 16);
   for (const value of candidate.allowedPaths) validateRelativePath(value, "candidate allowed path");
+  if (candidate.targets.length !== candidate.allowedPaths.length) fail("executor_candidate_targets", "Candidate targets must cover every allowed path");
+  for (const target of candidate.targets) {
+    object(target, "candidate target");
+    validateRelativePath(target.path, "candidate target path");
+    if (!candidate.allowedPaths.includes(target.path)) fail("executor_candidate_targets", "Candidate target is outside allowed paths");
+    if (!["create", "modify", "delete"].includes(target.operation)) fail("executor_candidate_targets", "Candidate target operation is invalid");
+  }
   for (const value of candidate.acceptance) boundedString(value, "candidate acceptance", 2_000);
   if (!Number.isSafeInteger(candidate.generationAttempt) || candidate.generationAttempt < 1 || candidate.generationAttempt > 2) {
     fail("executor_candidate_budget", "Candidate generation attempt must be 1 or 2");

@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { AppSettings, AssignmentSummary, BootstrapSnapshot, ContextAttachmentSelection, FilePreview, GitDetails, GitSnapshot, ModelPackInfo, NotificationDiagnostics, NotificationIdentityStatus, OnboardingStepId, ProjectFileEntry, ProposedEffect, ProviderSecretStatus, ProviderTestResult, RuntimeDiagnosticSnapshot, RuntimeEvent, SkillPreview, SkillSummary, SubagentRequest, TerminalCommandAccepted, TerminalInterruptResult, TerminalOutputEvent, TerminalReadResult, TerminalResult, TerminalSession, TerminalStatusEvent, TicketSummary, WorktreeEntry } from "../domain/types";
+import type { AppSettings, AssignmentSummary, BootstrapSnapshot, ContextAttachmentSelection, FilePreview, GitDetails, GitSnapshot, ModelPackInfo, NotificationDiagnostics, NotificationIdentityStatus, OnboardingStepId, ProjectFileEntry, ProposedEffect, ProviderSecretStatus, ProviderTestResult, RaceBundle, RuntimeDiagnosticSnapshot, RuntimeEvent, SkillPreview, SkillSummary, SubagentRequest, TerminalCommandAccepted, TerminalInterruptResult, TerminalOutputEvent, TerminalReadResult, TerminalResult, TerminalSession, TerminalStatusEvent, TicketSummary, WorktreeEntry } from "../domain/types";
+import type { CandidateRaceTarget } from "../domain/candidateRace";
 
 const demoSnapshot: BootstrapSnapshot = {
   portableRoot: "E:\\UCode",
@@ -45,6 +46,7 @@ const demoSnapshot: BootstrapSnapshot = {
 };
 const demoSubagents = new Map<string, AssignmentSummary[]>();
 const demoTerminals = new Map<string, { chunks: TerminalReadResult["chunks"]; state: TerminalReadResult["state"] }>();
+const demoRaces = new Map<string, RaceBundle[]>();
 
 function inTauri(): boolean {
   return typeof window !== "undefined" && Boolean(window.__TAURI_INTERNALS__);
@@ -456,6 +458,45 @@ export async function cancelTicket(ticketId: string): Promise<BootstrapSnapshot>
 export async function runTicket(ticketId: string, selectionId?: string, clientRequestId: string = crypto.randomUUID()): Promise<BootstrapSnapshot> {
   if (inTauri()) return invoke<BootstrapSnapshot>("run_ticket", { ticketId, selectionId: selectionId || null, clientRequestId });
   return demoSnapshot;
+}
+
+export async function listTicketRaces(ticketId: string): Promise<RaceBundle[]> {
+  return inTauri() ? invoke<RaceBundle[]>("list_ticket_races", { ticketId }) : demoRaces.get(ticketId) ?? [];
+}
+
+export async function startCandidateRace(ticketId: string, targets: CandidateRaceTarget[], acceptance: string[]): Promise<RaceBundle> {
+  const allowedPaths = targets.map((target) => target.path);
+  if (inTauri()) return invoke<RaceBundle>("start_candidate_race", { ticketId, targets, acceptance });
+  const now = new Date().toISOString();
+  const raceId = crypto.randomUUID();
+  const bundle: RaceBundle = {
+    race: { schemaVersion: 1, id: raceId, ticketId, projectFingerprint: "demo", objective: "候选验证", state: "generating", targets, allowedPaths, acceptance, verdict: null, createdAt: now, updatedAt: now },
+    candidates: ["minimal_change", "compatibility_first"].map((strategy, index) => ({
+      id: `${raceId}-${index + 1}`,
+      strategy: strategy as "minimal_change" | "compatibility_first",
+      state: "generating",
+      provider: "bundled",
+      model: "qwen2-5-coder-1-5b-q4-k-m",
+      diff: null,
+      resultDigest: null,
+      facts: [],
+      metrics: { modifiedFiles: 0, unrelatedFiles: 0, deletedFiles: 0, changedLines: 0 },
+    })),
+  };
+  demoRaces.set(ticketId, [bundle]);
+  return bundle;
+}
+
+export async function cancelCandidateRace(raceId: string): Promise<RaceBundle> {
+  if (inTauri()) return invoke<RaceBundle>("cancel_candidate_race", { raceId });
+  for (const [ticketId, races] of demoRaces) {
+    const found = races.find((bundle) => bundle.race.id === raceId);
+    if (!found) continue;
+    const cancelled: RaceBundle = { ...found, race: { ...found.race, state: "cancelled" }, candidates: found.candidates.map((candidate) => ({ ...candidate, state: candidate.state === "passed" || candidate.state === "failed" ? candidate.state : "cancelled" })) };
+    demoRaces.set(ticketId, races.map((bundle) => bundle.race.id === raceId ? cancelled : bundle));
+    return cancelled;
+  }
+  throw new Error("候选竞赛不存在");
 }
 
 export async function continueTicket(ticketId: string, request: string, selectionId?: string, clientRequestId: string = crypto.randomUUID()): Promise<BootstrapSnapshot> {
