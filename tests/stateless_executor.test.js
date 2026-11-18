@@ -94,6 +94,37 @@ test("candidate mode returns a structured isolated batch without writing or prop
   assert.match(value.calls[0].messages[0].content, /不能运行验证、选择赢家、声称完成或写入原项目/);
 });
 
+test("rescue mode explains only host evidence and never receives action authority", async (t) => {
+  const value = fixture("rescue", "Windows 网络无法访问网站，请诊断");
+  t.after(() => fs.rmSync(value.root, { recursive: true, force: true }));
+  value.request.metadata.taskContext = {
+    rescueEvidence: {
+      version: "ucode.rescue.diagnosis.v1",
+      outcome: "safe_stop",
+      mutationPerformed: false,
+      evidence: [{ id: "evidence-1", toolId: "network.adapter.inspect", state: "observed", summary: "存在 IPv4 地址" }],
+      hypotheses: [{ id: "network.external", state: "unresolved", evidenceIds: ["evidence-1"] }],
+      nextProbe: "network.dns.resolve（R1，需要用户允许网络探测）",
+    },
+  };
+
+  const output = await value.executor.execute(value.request, { onEvent: (event) => value.events.push(event) });
+
+  assert.match(output, /当前结论：证据尚不足/);
+  assert.match(output, /evidence-1/);
+  assert.match(output, /只进行了只读诊断，没有修改系统/);
+  assert.equal(value.calls.length, 0);
+  assert.equal(value.request.assignment, null);
+  assert.equal(value.request.mandate, null);
+});
+
+test("rescue mode refuses to generate a report without host-verified evidence", async (t) => {
+  const value = fixture("rescue", "系统异常，帮我诊断");
+  t.after(() => fs.rmSync(value.root, { recursive: true, force: true }));
+  await assert.rejects(() => value.executor.execute(value.request), (error) => error.code === "rescue_evidence_missing");
+  assert.equal(value.calls.length, 0);
+});
+
 test("compatibility candidate may read a related caller but cannot modify it outside scope", async (t) => {
   const value = fixture("candidate", "修改 src/api.js 并保持调用兼容");
   fs.mkdirSync(path.join(value.root, "src"));

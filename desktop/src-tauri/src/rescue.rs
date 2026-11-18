@@ -1,0 +1,472 @@
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+
+const MAX_PROBE_OUTPUT: usize = 64 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RiskClass {
+    R0,
+    R1,
+    R2,
+    R3,
+    R4,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RescueToolDefinition {
+    pub id: &'static str,
+    pub version: u16,
+    pub domain: &'static str,
+    pub risk: RiskClass,
+    pub authority: &'static str,
+    pub description: &'static str,
+}
+
+pub fn tool_registry() -> &'static [RescueToolDefinition] {
+    static TOOLS: [RescueToolDefinition; 8] = [
+        RescueToolDefinition { id: "system.inventory", version: 1, domain: "system", risk: RiskClass::R0, authority: "read", description: "Read bounded operating-system and hardware identity" },
+        RescueToolDefinition { id: "system.environment.inspect", version: 1, domain: "system", risk: RiskClass::R0, authority: "read", description: "Inspect PATH and selected process environment metadata" },
+        RescueToolDefinition { id: "system.process.list", version: 1, domain: "system", risk: RiskClass::R0, authority: "read", description: "List a bounded summary of high-resource processes" },
+        RescueToolDefinition { id: "system.service.inspect", version: 1, domain: "system", risk: RiskClass::R0, authority: "read", description: "Inspect stopped automatic Windows services" },
+        RescueToolDefinition { id: "network.adapter.inspect", version: 1, domain: "network", risk: RiskClass::R0, authority: "read", description: "Inspect active adapter, address, gateway and configured DNS evidence" },
+        RescueToolDefinition { id: "network.route.inspect", version: 1, domain: "network", risk: RiskClass::R0, authority: "read", description: "Inspect bounded default route evidence" },
+        RescueToolDefinition { id: "network.proxy.inspect", version: 1, domain: "network", risk: RiskClass::R0, authority: "read", description: "Inspect WinHTTP and process proxy configuration" },
+        RescueToolDefinition { id: "network.dns.resolve", version: 1, domain: "network", risk: RiskClass::R1, authority: "network_read", description: "Resolve an approved hostname; never runs without network consent" },
+    ];
+    &TOOLS
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProbeOutput {
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+pub trait ProbeRunner {
+    fn run(&self, tool_id: &str) -> Result<ProbeOutput, String>;
+}
+
+pub struct WindowsProbeRunner;
+
+impl ProbeRunner for WindowsProbeRunner {
+    fn run(&self, tool_id: &str) -> Result<ProbeOutput, String> {
+        let script = probe_script(tool_id).ok_or_else(|| format!("unsupported Rescue probe: {tool_id}"))?;
+        let script = format!(
+            "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); $OutputEncoding=[Console]::OutputEncoding; {script}"
+        );
+        let mut command = Command::new("powershell.exe");
+        command
+            .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", &script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
+        let mut child = command
+            .spawn()
+            .map_err(|error| format!("failed to start PowerShell probe: {error}"))?;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            match child.try_wait().map_err(|error| format!("failed to poll PowerShell probe: {error}"))? {
+                Some(_) => break,
+                None if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
+                None => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("Rescue probe timed out after 15 seconds: {tool_id}"));
+                }
+            }
+        }
+        let output = child.wait_with_output().map_err(|error| format!("failed to collect PowerShell probe output: {error}"))?;
+        Ok(ProbeOutput {
+            exit_code: output.status.code().unwrap_or(-1),
+            stdout: bounded_utf8(&output.stdout),
+            stderr: bounded_utf8(&output.stderr),
+        })
+    }
+}
+
+fn bounded_utf8(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_PROBE_OUTPUT)]).to_string()
+}
+
+fn probe_script(tool_id: &str) -> Option<&'static str> {
+    match tool_id {
+        "system.inventory" => Some("$os=Get-CimInstance Win32_OperatingSystem; $cs=Get-CimInstance Win32_ComputerSystem; [pscustomobject]@{caption=$os.Caption;version=$os.Version;build=$os.BuildNumber;architecture=$os.OSArchitecture;computer=$env:COMPUTERNAME;manufacturer=$cs.Manufacturer;model=$cs.Model;memoryBytes=[int64]$cs.TotalPhysicalMemory;uptimeSeconds=[int64]((Get-Date)-$os.LastBootUpTime).TotalSeconds}|ConvertTo-Json -Compress"),
+        "system.environment.inspect" => Some("$parts=@($env:Path -split ';'|Where-Object{$_}|Select-Object -First 80); [pscustomobject]@{pathEntries=$parts;pathEntryCount=$parts.Count;temp=$env:TEMP;userProfilePresent=[bool]$env:USERPROFILE;processorArchitecture=$env:PROCESSOR_ARCHITECTURE}|ConvertTo-Json -Compress -Depth 3"),
+        "system.process.list" => Some("@(Get-Process|Sort-Object CPU -Descending|Select-Object -First 25 Name,Id,CPU,WorkingSet64)|ConvertTo-Json -Compress"),
+        "system.service.inspect" => Some("@(Get-CimInstance Win32_Service|Where-Object{$_.StartMode -eq 'Auto' -and $_.State -ne 'Running'}|Select-Object -First 40 Name,DisplayName,State,StartMode,ExitCode)|ConvertTo-Json -Compress"),
+        "network.adapter.inspect" => Some("@(Get-NetIPConfiguration|Where-Object{$_.NetAdapter.Status -eq 'Up'}|ForEach-Object{[pscustomobject]@{alias=$_.InterfaceAlias;description=$_.InterfaceDescription;ipv4=@($_.IPv4Address|ForEach-Object{$_.IPAddress});ipv6=@($_.IPv6Address|ForEach-Object{$_.IPAddress}|Select-Object -First 4);gateway=@($_.IPv4DefaultGateway|ForEach-Object{$_.NextHop});dnsServers=@($_.DNSServer.ServerAddresses)}})|ConvertTo-Json -Compress -Depth 5"),
+        "network.route.inspect" => Some("@(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue|Sort-Object RouteMetric|Select-Object -First 12 InterfaceAlias,NextHop,RouteMetric,State)|ConvertTo-Json -Compress"),
+        "network.proxy.inspect" => Some("$winHttp=(netsh winhttp show proxy|Out-String).Trim(); [pscustomobject]@{winHttp=$winHttp;httpProxy=$env:HTTP_PROXY;httpsProxy=$env:HTTPS_PROXY;noProxy=$env:NO_PROXY}|ConvertTo-Json -Compress"),
+        // R1 probes are deliberately absent from the automatic runner. A future
+        // consent envelope supplies a validated hostname to a dedicated adapter.
+        "network.dns.resolve" => None,
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceState {
+    Observed,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EvidenceNode {
+    pub id: String,
+    pub tool_id: String,
+    pub tool_version: u16,
+    pub state: EvidenceState,
+    pub summary: String,
+    pub structured: Value,
+    pub exit_code: Option<i32>,
+    pub content_digest: String,
+    pub elapsed_ms: u128,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HypothesisState {
+    Supported,
+    Contradicted,
+    Unresolved,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Hypothesis {
+    pub id: String,
+    pub title: String,
+    pub state: HypothesisState,
+    pub confidence: f32,
+    pub evidence_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EvidenceEdge {
+    pub from: String,
+    pub to: String,
+    pub relation: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosisOutcome {
+    Diagnosed,
+    SafeStop,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosisReport {
+    pub version: &'static str,
+    pub symptom: String,
+    pub domain: String,
+    pub outcome: DiagnosisOutcome,
+    pub evidence: Vec<EvidenceNode>,
+    pub hypotheses: Vec<Hypothesis>,
+    pub edges: Vec<EvidenceEdge>,
+    pub next_probe: Option<String>,
+    pub mutation_performed: bool,
+}
+
+pub fn is_rescue_request(request: &str) -> bool {
+    let value = request.to_lowercase();
+    let machine_scope = ["电脑", "windows", "系统", "网络", "上网", "wifi", "wi-fi", "dns", "代理", "proxy", "服务", "进程", "端口", "path", "环境变量", "powershell", "cmd"];
+    let symptom = ["不能", "无法", "失败", "异常", "报错", "坏了", "冲突", "很慢", "断开", "诊断", "检查", "修复", "排查", "not working", "failed", "broken", "diagnose", "troubleshoot"];
+    machine_scope.iter().any(|item| value.contains(item)) && symptom.iter().any(|item| value.contains(item))
+}
+
+pub fn diagnose(request: &str) -> DiagnosisReport {
+    diagnose_with_runner(request, &WindowsProbeRunner)
+}
+
+pub fn diagnose_with_runner(request: &str, runner: &dyn ProbeRunner) -> DiagnosisReport {
+    let domain = if is_network_request(request) { "network" } else { "system" };
+    let mut probe_ids = vec!["system.inventory", "system.environment.inspect"];
+    if domain == "network" {
+        probe_ids.extend(["network.adapter.inspect", "network.route.inspect", "network.proxy.inspect"]);
+    } else {
+        probe_ids.extend(["system.process.list", "system.service.inspect"]);
+    }
+    let evidence = probe_ids.into_iter().map(|id| collect(runner, id)).collect::<Vec<_>>();
+    let (hypotheses, edges, next_probe) = if domain == "network" {
+        analyze_network(&evidence)
+    } else {
+        analyze_system(&evidence)
+    };
+    let outcome = if hypotheses.iter().any(|item| matches!(item.state, HypothesisState::Supported) && item.confidence >= 0.75) {
+        DiagnosisOutcome::Diagnosed
+    } else {
+        DiagnosisOutcome::SafeStop
+    };
+    DiagnosisReport {
+        version: "ucode.rescue.diagnosis.v1",
+        symptom: request.trim().chars().take(2_000).collect(),
+        domain: domain.into(),
+        outcome,
+        evidence,
+        hypotheses,
+        edges,
+        next_probe,
+        mutation_performed: false,
+    }
+}
+
+fn is_network_request(request: &str) -> bool {
+    let value = request.to_lowercase();
+    ["网络", "上网", "wifi", "wi-fi", "dns", "代理", "proxy", "网关", "路由", "network", "internet"].iter().any(|item| value.contains(item))
+}
+
+fn collect(runner: &dyn ProbeRunner, tool_id: &str) -> EvidenceNode {
+    let started = Instant::now();
+    let definition = tool_registry().iter().find(|tool| tool.id == tool_id).expect("registered probe");
+    match runner.run(tool_id) {
+        Ok(output) => {
+            let parsed = serde_json::from_str::<Value>(output.stdout.trim()).unwrap_or_else(|_| json!({ "text": output.stdout.trim() }));
+            let state = if output.exit_code == 0 { EvidenceState::Observed } else { EvidenceState::Unavailable };
+            let summary = summarize(tool_id, &parsed, output.exit_code, &output.stderr);
+            evidence_node(definition, state, summary, parsed, Some(output.exit_code), started.elapsed().as_millis())
+        }
+        Err(error) => evidence_node(definition, EvidenceState::Unavailable, error.clone(), json!({ "error": error }), None, started.elapsed().as_millis()),
+    }
+}
+
+fn evidence_node(definition: &RescueToolDefinition, state: EvidenceState, summary: String, structured: Value, exit_code: Option<i32>, elapsed_ms: u128) -> EvidenceNode {
+    let canonical = serde_json::to_vec(&structured).unwrap_or_default();
+    let digest = format!("{:x}", Sha256::digest(&canonical));
+    EvidenceNode {
+        id: format!("evidence-{}", &digest[..16]),
+        tool_id: definition.id.into(),
+        tool_version: definition.version,
+        state,
+        summary,
+        structured,
+        exit_code,
+        content_digest: digest,
+        elapsed_ms,
+    }
+}
+
+fn summarize(tool_id: &str, value: &Value, exit_code: i32, stderr: &str) -> String {
+    if exit_code != 0 {
+        return format!("探针失败（退出码 {exit_code}）：{}", stderr.trim().chars().take(300).collect::<String>());
+    }
+    match tool_id {
+        "network.adapter.inspect" => format!("发现 {} 个启用的 IP 配置", array_items(value).len()),
+        "network.route.inspect" => format!("发现 {} 条 IPv4 默认路由", array_items(value).len()),
+        "network.proxy.inspect" => if proxy_configured(value) { "检测到代理配置".into() } else { "未检测到显式代理配置".into() },
+        "system.service.inspect" => format!("发现 {} 个未运行的自动服务", array_items(value).len()),
+        "system.process.list" => format!("已采集 {} 个高资源进程摘要", array_items(value).len()),
+        "system.environment.inspect" => format!("PATH 包含 {} 个条目", value.get("pathEntryCount").and_then(Value::as_u64).unwrap_or(0)),
+        "system.inventory" => format!("{} build {}", value.get("caption").and_then(Value::as_str).unwrap_or("Windows"), value.get("build").and_then(Value::as_str).unwrap_or("未知")),
+        _ => "已采集证据".into(),
+    }
+}
+
+fn array_items(value: &Value) -> Vec<&Value> {
+    match value {
+        Value::Array(items) => items.iter().collect(),
+        Value::Null => Vec::new(),
+        other => vec![other],
+    }
+}
+
+fn find_evidence<'a>(evidence: &'a [EvidenceNode], tool_id: &str) -> Option<&'a EvidenceNode> {
+    evidence.iter().find(|item| item.tool_id == tool_id)
+}
+
+fn observed(item: Option<&EvidenceNode>) -> bool {
+    item.is_some_and(|value| matches!(value.state, EvidenceState::Observed))
+}
+
+fn proxy_configured(value: &Value) -> bool {
+    let env_proxy = ["httpProxy", "httpsProxy"].iter().any(|key| value.get(key).and_then(Value::as_str).is_some_and(|item| !item.trim().is_empty()));
+    let win_http = value.get("winHttp").and_then(Value::as_str).unwrap_or_default().to_lowercase();
+    env_proxy || !(win_http.is_empty() || win_http.contains("direct access") || win_http.contains("直接访问"))
+}
+
+fn analyze_network(evidence: &[EvidenceNode]) -> (Vec<Hypothesis>, Vec<EvidenceEdge>, Option<String>) {
+    let adapter = find_evidence(evidence, "network.adapter.inspect");
+    let route = find_evidence(evidence, "network.route.inspect");
+    let proxy = find_evidence(evidence, "network.proxy.inspect");
+    let adapters = adapter.map(|item| array_items(&item.structured)).unwrap_or_default();
+    let routes = route.map(|item| array_items(&item.structured)).unwrap_or_default();
+    let has_ipv4 = adapters.iter().any(|item| item.get("ipv4").is_some_and(|value| !array_items(value).is_empty()));
+    let has_gateway = adapters.iter().any(|item| item.get("gateway").is_some_and(|value| !array_items(value).is_empty())) || !routes.is_empty();
+    let has_dns = adapters.iter().any(|item| item.get("dnsServers").is_some_and(|value| !array_items(value).is_empty()));
+    let has_proxy = proxy.is_some_and(|item| observed(Some(item)) && proxy_configured(&item.structured));
+    let mut hypotheses = Vec::new();
+    let mut edges = Vec::new();
+    let mut add = |id: &str, title: &str, state: HypothesisState, confidence: f32, sources: Vec<&EvidenceNode>| {
+        let evidence_ids = sources.iter().map(|item| item.id.clone()).collect::<Vec<_>>();
+        for source in &sources {
+            edges.push(EvidenceEdge { from: source.id.clone(), to: id.into(), relation: if matches!(state, HypothesisState::Contradicted) { "contradicts".into() } else { "supports".into() } });
+        }
+        hypotheses.push(Hypothesis { id: id.into(), title: title.into(), state, confidence, evidence_ids });
+    };
+    if observed(adapter) {
+        add("network.no_ipv4", "启用的网络适配器没有 IPv4 地址", if has_ipv4 { HypothesisState::Contradicted } else { HypothesisState::Supported }, if has_ipv4 { 0.08 } else { 0.95 }, adapter.into_iter().collect());
+        add("network.no_dns", "启用的适配器没有 DNS 服务器配置", if has_dns { HypothesisState::Contradicted } else { HypothesisState::Supported }, if has_dns { 0.08 } else { 0.88 }, adapter.into_iter().collect());
+    } else {
+        add("network.adapter_unknown", "适配器状态未知", HypothesisState::Unresolved, 0.35, adapter.into_iter().collect());
+    }
+    if observed(route) && observed(adapter) {
+        let sources = [adapter, route].into_iter().flatten().collect();
+        add("network.no_gateway", "缺少可用的 IPv4 默认网关或默认路由", if has_gateway { HypothesisState::Contradicted } else { HypothesisState::Supported }, if has_gateway { 0.1 } else { 0.92 }, sources);
+    }
+    if observed(proxy) {
+        add("network.proxy_configured", "显式代理可能影响连接", if has_proxy { HypothesisState::Supported } else { HypothesisState::Contradicted }, if has_proxy { 0.65 } else { 0.08 }, proxy.into_iter().collect());
+    }
+    let local_configuration_looks_complete = has_ipv4 && has_gateway && has_dns && !has_proxy;
+    add("network.external_or_application", "本机基础配置完整，问题可能位于外部连通性、DNS 解析结果或具体应用", if local_configuration_looks_complete { HypothesisState::Unresolved } else { HypothesisState::Contradicted }, if local_configuration_looks_complete { 0.55 } else { 0.15 }, Vec::new());
+    let next_probe = local_configuration_looks_complete.then(|| "network.dns.resolve（R1，需要用户允许网络探测）".into());
+    (hypotheses, edges, next_probe)
+}
+
+fn analyze_system(evidence: &[EvidenceNode]) -> (Vec<Hypothesis>, Vec<EvidenceEdge>, Option<String>) {
+    let services = find_evidence(evidence, "system.service.inspect");
+    let environment = find_evidence(evidence, "system.environment.inspect");
+    let stopped = services.map(|item| array_items(&item.structured).len()).unwrap_or(0);
+    let path_entries = environment.and_then(|item| item.structured.get("pathEntryCount")).and_then(Value::as_u64).unwrap_or(0);
+    let mut hypotheses = Vec::new();
+    let mut edges = Vec::new();
+    let mut add = |id: &str, title: &str, state: HypothesisState, confidence: f32, source: Option<&EvidenceNode>| {
+        let evidence_ids = source.into_iter().map(|item| item.id.clone()).collect::<Vec<_>>();
+        if let Some(source) = source { edges.push(EvidenceEdge { from: source.id.clone(), to: id.into(), relation: "supports".into() }); }
+        hypotheses.push(Hypothesis { id: id.into(), title: title.into(), state, confidence, evidence_ids });
+    };
+    if observed(services) && stopped > 0 {
+        add("system.stopped_automatic_service", "存在未运行的自动服务，需要结合具体症状核对", HypothesisState::Supported, 0.72, services);
+    } else {
+        add("system.service_failure", "自动服务异常", if observed(services) { HypothesisState::Contradicted } else { HypothesisState::Unresolved }, 0.2, services);
+    }
+    if observed(environment) && path_entries == 0 {
+        add("system.empty_path", "当前进程 PATH 为空", HypothesisState::Supported, 0.9, environment);
+    } else {
+        add("system.environment_specific", "需要针对具体命令或应用继续检查环境", HypothesisState::Unresolved, 0.4, environment);
+    }
+    (hypotheses, edges, Some("提供具体错误文本、应用或服务名后执行定向只读探针".into()))
+}
+
+pub fn compact_report(report: &DiagnosisReport) -> Value {
+    json!({
+        "version": report.version,
+        "symptom": report.symptom,
+        "domain": report.domain,
+        "outcome": report.outcome,
+        "evidence": report.evidence.iter().map(|item| json!({
+            "id": item.id,
+            "toolId": item.tool_id,
+            "state": item.state,
+            "summary": item.summary,
+            "structured": item.structured,
+            "contentDigest": item.content_digest,
+        })).collect::<Vec<_>>(),
+        "hypotheses": report.hypotheses,
+        "edges": report.edges,
+        "nextProbe": report.next_probe,
+        "mutationPerformed": false,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct FixtureRunner(std::collections::BTreeMap<&'static str, ProbeOutput>);
+    impl ProbeRunner for FixtureRunner {
+        fn run(&self, tool_id: &str) -> Result<ProbeOutput, String> {
+            self.0.get(tool_id).cloned().ok_or_else(|| "fixture missing".into())
+        }
+    }
+
+    fn fixture(adapter: Value, route: Value, proxy: Value) -> FixtureRunner {
+        let mut values = std::collections::BTreeMap::new();
+        for (id, value) in [
+            ("system.inventory", json!({"caption":"Windows 11","build":"26100"})),
+            ("system.environment.inspect", json!({"pathEntryCount":12,"pathEntries":["C:/Windows"]})),
+            ("network.adapter.inspect", adapter),
+            ("network.route.inspect", route),
+            ("network.proxy.inspect", proxy),
+        ] {
+            values.insert(id, ProbeOutput { exit_code: 0, stdout: value.to_string(), stderr: String::new() });
+        }
+        FixtureRunner(values)
+    }
+
+    fn hypothesis<'a>(report: &'a DiagnosisReport, id: &str) -> &'a Hypothesis {
+        report.hypotheses.iter().find(|item| item.id == id).unwrap()
+    }
+
+    #[test]
+    fn registry_has_unique_versioned_tools_and_never_marks_dns_as_r0() {
+        let mut seen = std::collections::BTreeSet::new();
+        for tool in tool_registry() {
+            assert!(seen.insert(tool.id));
+            assert!(tool.version > 0);
+            assert!(!tool.description.is_empty());
+        }
+        let dns = tool_registry().iter().find(|tool| tool.id == "network.dns.resolve").unwrap();
+        assert_eq!(dns.risk, RiskClass::R1);
+        assert!(probe_script(dns.id).is_none());
+    }
+
+    #[test]
+    fn identical_network_symptom_distinguishes_missing_gateway_from_proxy() {
+        let healthy_adapter = json!([{"alias":"Ethernet","ipv4":["192.168.1.20"],"gateway":["192.168.1.1"],"dnsServers":["1.1.1.1"]}]);
+        let missing_gateway = diagnose_with_runner("电脑无法上网，请诊断", &fixture(
+            json!([{"alias":"Ethernet","ipv4":["169.254.2.4"],"gateway":[],"dnsServers":["1.1.1.1"]}]),
+            json!([]),
+            json!({"winHttp":"Direct access (no proxy server).","httpProxy":null,"httpsProxy":null}),
+        ));
+        let stale_proxy = diagnose_with_runner("电脑无法上网，请诊断", &fixture(
+            healthy_adapter,
+            json!([{"InterfaceAlias":"Ethernet","NextHop":"192.168.1.1"}]),
+            json!({"winHttp":"Proxy Server(s) : 127.0.0.1:7890","httpProxy":"http://127.0.0.1:7890","httpsProxy":null}),
+        ));
+        assert!(matches!(hypothesis(&missing_gateway, "network.no_gateway").state, HypothesisState::Supported));
+        assert!(matches!(hypothesis(&stale_proxy, "network.no_gateway").state, HypothesisState::Contradicted));
+        assert!(matches!(hypothesis(&stale_proxy, "network.proxy_configured").state, HypothesisState::Supported));
+        assert_ne!(serde_json::to_string(&missing_gateway.hypotheses).unwrap(), serde_json::to_string(&stale_proxy.hypotheses).unwrap());
+        assert!(!missing_gateway.mutation_performed && !stale_proxy.mutation_performed);
+    }
+
+    #[test]
+    fn complete_local_network_stops_before_r1_network_probe() {
+        let report = diagnose_with_runner("Windows 网络无法访问网站", &fixture(
+            json!([{"alias":"Wi-Fi","ipv4":["10.0.0.20"],"gateway":["10.0.0.1"],"dnsServers":["10.0.0.1"]}]),
+            json!([{"InterfaceAlias":"Wi-Fi","NextHop":"10.0.0.1"}]),
+            json!({"winHttp":"Direct access (no proxy server).","httpProxy":null,"httpsProxy":null}),
+        ));
+        assert!(matches!(report.outcome, DiagnosisOutcome::SafeStop));
+        assert!(report.next_probe.as_deref().unwrap().contains("R1"));
+        assert!(report.evidence.iter().all(|item| item.tool_id != "network.dns.resolve"));
+    }
+
+    #[test]
+    fn failed_probe_is_explicitly_unavailable_not_a_fact() {
+        struct Failing;
+        impl ProbeRunner for Failing { fn run(&self, _: &str) -> Result<ProbeOutput, String> { Err("access denied".into()) } }
+        let report = diagnose_with_runner("系统服务异常，帮我诊断", &Failing);
+        assert!(report.evidence.iter().all(|item| matches!(item.state, EvidenceState::Unavailable)));
+        assert!(matches!(report.outcome, DiagnosisOutcome::SafeStop));
+        assert!(!report.mutation_performed);
+    }
+}

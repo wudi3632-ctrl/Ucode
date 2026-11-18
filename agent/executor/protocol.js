@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { AppError } from "../shared/errors.js";
 
 export const EXECUTOR_PROTOCOL_V1 = "ucode.executor.v1";
-export const EXECUTOR_MODES = new Set(["chat", "project_read", "action", "candidate"]);
+export const EXECUTOR_MODES = new Set(["chat", "project_read", "rescue", "action", "candidate"]);
 export const CANDIDATE_STRATEGIES = new Set(["minimal_change", "compatibility_first"]);
 export const EXECUTOR_EVENT_TYPES = new Set([
   "start",
@@ -47,9 +47,9 @@ export function validateExecutorRequest(input) {
     if (input.mode === "candidate") validateCandidateRequest(input.candidate, input.mandate);
     else if (input.candidate != null) fail("executor_candidate_unexpected", "Action requests cannot carry candidate configuration");
   } else if (input.assignment != null || input.mandate != null) {
-    fail("executor_authority_unexpected", "Chat and project-read requests cannot carry action authority");
+    fail("executor_authority_unexpected", "Chat, project-read, and Rescue requests cannot carry action authority");
   } else if (input.candidate != null) {
-    fail("executor_candidate_unexpected", "Chat and project-read requests cannot carry candidate configuration");
+    fail("executor_candidate_unexpected", "Chat, project-read, and Rescue requests cannot carry candidate configuration");
   }
 
   for (const item of input.inputs) {

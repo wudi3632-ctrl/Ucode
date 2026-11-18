@@ -11,6 +11,7 @@ pub const EXECUTOR_PROTOCOL_V1: &str = "ucode.executor.v1";
 pub enum ExecutorMode {
     Chat,
     ProjectRead,
+    Rescue,
     Action,
     Candidate,
 }

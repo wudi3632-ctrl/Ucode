@@ -33,6 +33,45 @@ function event(sequence: number, eventType: string, payload: Record<string, unkn
 }
 
 describe("conversation timeline projection", () => {
+  it("groups Rescue probe evidence as factual activity before the report", () => {
+    const items = buildTimeline(ticket, [
+      event(1, "rescue.probe.completed", { toolId: "network.adapter.inspect", summary: "发现 1 个启用的 IP 配置", evidenceId: "evidence-1" }),
+      event(2, "rescue.diagnosis.ready", { outcome: "safe_stop", mutationPerformed: false }),
+      event(3, "delivery.ready", { content: "仍需经过授权的 DNS 探测；本轮没有更改系统。", route: "rescue" }),
+    ], false);
+    expect(items.map((item) => item.kind)).toEqual(["user", "activity", "assistant"]);
+    const activity = items[1];
+    expect(activity.kind === "activity" ? activity.events.map((item) => item.eventType) : []).toEqual([
+      "rescue.probe.completed",
+      "rescue.diagnosis.ready",
+    ]);
+  });
+
+  it("describes a Rescue receipt as system evidence with no system mutation", () => {
+    const receipt: EvidenceReceipt = {
+      ticketId: ticket.id,
+      request: "Windows 无法上网，请诊断",
+      route: "rescue",
+      outcome: "waiting_input",
+      sources: [{ toolName: "network.adapter.inspect", evidenceId: "evidence-1", status: "observed", preview: "发现 1 个启用的 IP 配置" }],
+      commands: [], tests: [], effects: [],
+      decisions: [{ event: "rescue.diagnosis.ready", detail: { outcome: "safe_stop", mutationPerformed: false } }],
+      finalState: {}, contentDigest: "digest", updatedAt: "2026-11-10T00:00:01Z",
+    };
+    render(<Conversation
+      projectId="project-1" ticket={ticket} events={[]} effect={null} receipt={receipt} appliedEffect={null} busy={false}
+      onSubmit={vi.fn()} onCancel={vi.fn()} onRetry={vi.fn()} onExport={vi.fn()} onBranch={vi.fn()}
+      onApprove={vi.fn()} onReject={vi.fn()} onRollback={vi.fn()} onExportReceipt={vi.fn()} hasProject onOpenProject={vi.fn()} error={null}
+      sidebarOpen inspectorOpen={false} onToggleSidebar={vi.fn()} onToggleInspector={vi.fn()}
+      providerStatus="ready" modelProvider="bundled" providerModel="" modelPerformance={null}
+    />);
+    const card = screen.getByRole("article", { name: "结果证据" });
+    expect(card).toHaveTextContent("没有修改系统");
+    expect(card).toHaveTextContent("1 项系统只读证据已核验");
+    expect(card).toHaveTextContent("未执行修复");
+    expect(card).toHaveTextContent("无需回滚");
+  });
+
   it("describes read-only evidence without implying that tests or Diff review were required", () => {
     const receipt: EvidenceReceipt = {
       ticketId: ticket.id,

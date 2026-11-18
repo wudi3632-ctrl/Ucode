@@ -29,6 +29,7 @@ export class StatelessExecutor {
     const request = validateExecutorRequest(rawRequest);
     if (request.mode === "action") return this.action(request, { signal, onEvent });
     if (request.mode === "candidate") return this.candidate(request, { signal, onEvent });
+    if (request.mode === "rescue") return this.rescue(request, { signal, onEvent });
     if (request.mode === "chat") return this.chat(request, { signal, onEvent });
     return this.projectRead(request, { signal, onEvent });
   }
@@ -117,6 +118,19 @@ export class StatelessExecutor {
     }
     const result = await generate(coder, payload, options);
     return safeIdentityAnswer(request, usableContent(result, "本地对话模型没有生成可用的文本回答。"));
+  }
+
+  async rescue(request, options) {
+    const evidence = request.metadata?.taskContext?.rescueEvidence;
+    if (!evidence || typeof evidence !== "object" || !Array.isArray(evidence.evidence)) {
+      throw new AppError("rescue_evidence_missing", "Rescue diagnosis has no host-verified evidence", 422);
+    }
+    // Rescue facts are projected by the trusted host rather than rewritten by
+    // the small language model. This prevents project-history contamination and
+    // guarantees that every displayed claim carries an evidence identifier.
+    const content = groundedRescueContent(evidence);
+    options.onEvent?.({ type: "text_delta", delta: content });
+    return content;
   }
 
   async projectRead(request, options) {
@@ -461,7 +475,56 @@ function formatTaskContext(value) {
   if (typeof value.scoutFindings === "string" && value.scoutFindings.trim()) {
     lines.push(`并行只读分析：\n${value.scoutFindings.trim().slice(0, 2500)}`);
   }
-  return lines.join("\n").slice(0, 4_000);
+  if (value.rescueEvidence && typeof value.rescueEvidence === "object") {
+    lines.push(`rescueEvidence（宿主只读探针，事实必须引用 evidence id）：\n${JSON.stringify(value.rescueEvidence).slice(0, 12_000)}`);
+  }
+  return lines.join("\n").slice(0, 16_000);
+}
+
+function groundedRescueContent(report) {
+  const evidence = Array.isArray(report.evidence) ? report.evidence : [];
+  const hypotheses = Array.isArray(report.hypotheses) ? report.hypotheses : [];
+  const supported = hypotheses.filter((item) => item?.state === "supported");
+  const contradicted = hypotheses.filter((item) => item?.state === "contradicted");
+  const unavailable = evidence.filter((item) => item?.state === "unavailable");
+  const lines = [report.outcome === "diagnosed" ? "## 当前结论：已由本机证据定位可能原因" : "## 当前结论：证据尚不足，已安全停止"];
+  if (supported.length) {
+    lines.push("", "### 已支持的原因");
+    for (const item of supported.slice(0, 6)) {
+      const ids = Array.isArray(item.evidenceIds) ? item.evidenceIds.map(safeEvidenceId).filter(Boolean) : [];
+      lines.push(`- ${safeRescueText(item.title, "检测到异常状态")}${ids.length ? `（证据 ${ids.map((id) => `\`${id}\``).join("、")}）` : ""}`);
+    }
+  }
+  if (contradicted.length) {
+    lines.push("", "### 已排除的方向");
+    for (const item of contradicted.slice(0, 4)) {
+      const ids = Array.isArray(item.evidenceIds) ? item.evidenceIds.map(safeEvidenceId).filter(Boolean) : [];
+      lines.push(`- ${safeRescueText(item.title, "该方向与现有证据不符")}${ids.length ? `（证据 ${ids.map((id) => `\`${id}\``).join("、")}）` : ""}`);
+    }
+  }
+  lines.push("", "### 采集到的事实");
+  for (const item of evidence.slice(0, 12)) {
+    lines.push(`- ${safeRescueText(item.summary, "已采集只读证据")}（\`${safeEvidenceId(item.id) || "evidence-unknown"}\` · \`${safeToolId(item.toolId)}\`）`);
+  }
+  if (unavailable.length) lines.push("", `有 ${unavailable.length} 项探针不可用；它们被保留为未知，不代表系统正常。`);
+  if (typeof report.nextProbe === "string" && report.nextProbe.trim()) lines.push("", `**下一步：** ${safeRescueText(report.nextProbe, "需要更多定向证据")}`);
+  lines.push("", "本轮只进行了只读诊断，没有修改系统、执行修复或提升权限。");
+  return lines.join("\n");
+}
+
+function safeEvidenceId(value) {
+  const text = String(value || "");
+  return /^evidence-[a-z0-9]{1,64}$/i.test(text) ? text : "";
+}
+
+function safeToolId(value) {
+  const text = String(value || "");
+  return /^[a-z][a-z0-9_.-]{1,80}$/i.test(text) ? text : "unknown.probe";
+}
+
+function safeRescueText(value, fallback) {
+  const text = String(value || "").replace(/[\r\n`<>]/g, " ").replace(/\s+/g, " ").trim();
+  return text.slice(0, 500) || fallback;
 }
 
 function boundedStop(options, content) {

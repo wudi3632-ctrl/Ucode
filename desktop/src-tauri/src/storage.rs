@@ -1619,6 +1619,25 @@ fn refresh_evidence_receipt(connection: &Connection, ticket_id: &str) -> Result<
                     );
                 }
             }
+            "rescue.probe.completed" => {
+                route = Some("rescue".into());
+                push_unique(
+                    &mut sources,
+                    json!({
+                        "toolName": payload.get("toolId"),
+                        "evidenceId": payload.get("evidenceId"),
+                        "status": payload.get("state"),
+                        "preview": payload.get("summary"),
+                        "contentDigest": payload.get("contentDigest"),
+                        "elapsedMs": payload.get("elapsedMs"),
+                        "at": created_at,
+                    }),
+                );
+            }
+            "rescue.diagnosis.ready" => {
+                route = Some("rescue".into());
+                decisions.push(json!({ "event": event_type, "detail": payload, "at": created_at }));
+            }
             "delivery.ready" => {
                 route = payload
                     .get("route")
@@ -2721,6 +2740,47 @@ mod tests {
         assert_eq!(receipt.outcome, "completed");
         assert_eq!(receipt.sources.len(), 1);
         assert_eq!(receipt.content_digest.len(), 64);
+    }
+
+    #[test]
+    fn rescue_receipt_preserves_probe_provenance_and_safe_stop() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("ucode.db");
+        let mut storage = Storage::open(&database).unwrap();
+        let locator = ProjectLocator {
+            absolute_path: directory.path().display().to_string(),
+            relative_path: None,
+            fingerprint: "rescue-receipt".into(),
+        };
+        let project = storage.upsert_project(&locator, true).unwrap();
+        let ticket = storage.create_ticket(&project.id, "Windows 无法上网，请诊断").unwrap();
+        storage.append_event(Some(&ticket.id), "user.message", json!({
+            "content": "重新诊断当前 Windows 网络配置", "clientRequestId": "rescue-followup-1",
+        })).unwrap();
+        storage.append_event(Some(&ticket.id), "rescue.probe.completed", json!({
+            "toolId": "network.adapter.inspect",
+            "evidenceId": "evidence-abc",
+            "state": "observed",
+            "summary": "发现 1 个启用的 IP 配置",
+            "contentDigest": "a".repeat(64),
+            "elapsedMs": 12,
+        })).unwrap();
+        storage.append_event(Some(&ticket.id), "rescue.diagnosis.ready", json!({
+            "outcome": "safe_stop", "mutationPerformed": false,
+        })).unwrap();
+        storage.set_ticket_state(&ticket.id, TicketState::Waiting).unwrap();
+        storage.append_event(Some(&ticket.id), "delivery.ready", json!({
+            "content": "需要授权下一探针", "route": "rescue",
+        })).unwrap();
+
+        let receipt = storage.evidence_receipts().unwrap().pop().unwrap();
+        assert_eq!(receipt.request, "重新诊断当前 Windows 网络配置");
+        assert_eq!(receipt.route.as_deref(), Some("rescue"));
+        assert_eq!(receipt.outcome, "waiting_input");
+        assert_eq!(receipt.sources.len(), 1);
+        assert_eq!(receipt.sources[0].get("evidenceId").and_then(Value::as_str), Some("evidence-abc"));
+        assert!(receipt.decisions.iter().any(|item| item.get("event").and_then(Value::as_str) == Some("rescue.diagnosis.ready")));
+        assert!(receipt.effects.is_empty());
     }
 
     #[test]

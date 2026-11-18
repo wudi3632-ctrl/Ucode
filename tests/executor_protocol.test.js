@@ -21,6 +21,17 @@ test("chat cannot smuggle action authority and action must carry it", () => {
   assert.throws(() => validateExecutorRequest(action), /must be an object/);
 });
 
+test("rescue mode is read-only and cannot carry action authority", () => {
+  const request = structuredClone(fixture);
+  request.mode = "rescue";
+  request.assignment = null;
+  request.mandate = null;
+  assert.equal(validateExecutorRequest(request).mode, "rescue");
+  request.assignment = { ticketId: "ticket", assignmentId: "assignment" };
+  request.mandate = structuredClone(fixture.mandate);
+  assert.throws(() => validateExecutorRequest(request), /cannot carry action authority/);
+});
+
 test("candidate mode requires bounded strategy scope acceptance and write authority", () => {
   const request = structuredClone(fixture);
   request.mode = "candidate";

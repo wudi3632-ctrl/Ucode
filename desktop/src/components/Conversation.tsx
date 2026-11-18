@@ -63,6 +63,8 @@ interface TaskRescue {
 
 const activityCopy: Record<string, string> = {
   "tool.completed": "已完成项目读取",
+  "rescue.probe.completed": "已完成一项系统只读探针",
+  "rescue.diagnosis.ready": "只读诊断证据已汇总",
   "subagents.started": "正在并行分析项目",
   "subagent.started": "已启动只读分析",
   "subagent.completed": "只读分析已完成",
@@ -425,7 +427,7 @@ function EvidenceReceiptCard({ receipt, onExport }: { receipt: EvidenceReceipt; 
   const legacyRaceStopped = receipt.decisions.find((decision) => decision.event === "race.legacy_stopped");
   const staleRaceReconciled = receipt.decisions.find((decision) => decision.event === "race.terminal_reconciled" && nestedValue(decision, ["detail", "raceState"]) === "stale");
   const outcome = rejected ? "已取消" : ({ completed: "已完成", failed: "失败", cancelled: "已停止", rolled_back: "已回滚", waiting_input: "等待输入", waiting_approval: "等待审批", in_progress: "进行中" } as Record<string, string>)[receipt.outcome] ?? receipt.outcome;
-  const changed = appliedEffects.length ? `${appliedEffects.length} 个已应用批次` : "没有写入文件";
+  const changed = appliedEffects.length ? `${appliedEffects.length} 个已应用批次` : receipt.route === "rescue" ? "没有修改系统" : "没有写入文件";
   const verified = rejected
     ? "未执行测试（修改已拒绝）"
     : visibleTests.length
@@ -439,7 +441,7 @@ function EvidenceReceiptCard({ receipt, onExport }: { receipt: EvidenceReceipt; 
       : legacyRaceStopped
         ? "机械验收未执行：旧任务缺少安全操作约束，已在写入前终止"
     : visibleSources.length
-      ? `${visibleSources.length} 项项目来源已核验`
+      ? receipt.route === "rescue" ? `${visibleSources.length} 项系统只读证据已核验` : `${visibleSources.length} 项项目来源已核验`
       : appliedEffects.length
         ? "尚未记录测试结果"
         : receipt.route === "chat" || receipt.route === "code_generate"
@@ -457,8 +459,8 @@ function EvidenceReceiptCard({ receipt, onExport }: { receipt: EvidenceReceipt; 
           : "本轮未修改项目文件"
     : receipt.outcome === "failed"
       ? "任务失败，不能视为完成"
-      : "任务尚未完成或仍需人工确认";
-  const undo = appliedEffects.length ? "可使用本任务下方的回滚入口撤销已应用批次" : "没有需要撤销的文件批次";
+      : receipt.route === "rescue" ? "只读诊断已结束；未执行修复，下一步仍需确认或授权" : "任务尚未完成或仍需人工确认";
+  const undo = appliedEffects.length ? "可使用本任务下方的回滚入口撤销已应用批次" : receipt.route === "rescue" ? "本轮没有系统变更，无需回滚" : "没有需要撤销的文件批次";
   return <article className="evidence-receipt" aria-label="结果证据">
     <header><span className="receipt-seal">{rejected ? "×" : receipt.outcome === "completed" ? "✓" : "·"}</span><span><b>任务收据</b><small>{outcome}</small></span></header>
     <dl className="receipt-summary">
@@ -681,6 +683,14 @@ function ActivityBlock({ events, active }: { events: RuntimeEvent[]; active: boo
 }
 
 function activityLabel(event: RuntimeEvent) {
+  if (event.eventType === "rescue.probe.completed") {
+    const summary = String(event.payload.summary ?? "已采集系统证据");
+    const tool = String(event.payload.toolId ?? "系统探针");
+    return `${tool} · ${summary}`;
+  }
+  if (event.eventType === "rescue.diagnosis.ready") {
+    return event.payload.outcome === "diagnosed" ? "已由证据定位可能原因" : "证据不足，已安全停止并给出下一探针";
+  }
   if (event.eventType === "tool.completed") {
     const tool = String(event.payload.tool ?? "");
     const title = typeof event.payload.title === "string" ? event.payload.title : "";

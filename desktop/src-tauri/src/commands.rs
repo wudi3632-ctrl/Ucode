@@ -17,6 +17,7 @@ use crate::race_workspace::{
     create_candidate_workspace, digest_tree, load_candidate_workspace, remove_candidate_workspace,
     workspace_inventory,
 };
+use crate::rescue::{compact_report as compact_rescue_report, diagnose as diagnose_rescue, is_rescue_request};
 use crate::skills::{SkillPreview, SkillRuntime};
 use crate::storage::{
     AppSettings, AssignmentSummary, EvidenceReceipt, OnboardingState, ProjectSummary, RuntimeEvent,
@@ -4701,6 +4702,7 @@ enum DesktopRoute {
     Chat,
     CodeGenerate,
     ProjectRead,
+    Rescue,
     Action,
 }
 
@@ -4709,6 +4711,7 @@ impl DesktopRoute {
         match self {
             Self::Chat | Self::CodeGenerate => ExecutorMode::Chat,
             Self::ProjectRead => ExecutorMode::ProjectRead,
+            Self::Rescue => ExecutorMode::Rescue,
             Self::Action => ExecutorMode::Action,
         }
     }
@@ -4718,6 +4721,7 @@ impl DesktopRoute {
             Self::Chat => "chat",
             Self::CodeGenerate => "code_generate",
             Self::ProjectRead => "project_read",
+            Self::Rescue => "rescue",
             Self::Action => "action",
         }
     }
@@ -4745,8 +4749,12 @@ fn classify_desktop_route(request: &str, previous: Option<&str>) -> DesktopRoute
             "project_read" | "project_question" | "read_file" | "list_files"
             | "summarize_project" => return DesktopRoute::ProjectRead,
             "action" | "tool_task" => return DesktopRoute::Action,
+            "rescue" => return DesktopRoute::Rescue,
             _ => {}
         }
+    }
+    if is_rescue_request(&normalized) && !mentions_project_file(&actionable) {
+        return DesktopRoute::Rescue;
     }
     let conversational_code_request = contains_any(
         &actionable,
@@ -5040,11 +5048,25 @@ fn run_executor_ticket(
             .map_err(|error| error.to_string())?;
         (ticket, project, settings, history, task_context)
     };
-    provider::configure(&settings, legacy, None)?;
+    if route != DesktopRoute::Rescue {
+        provider::configure(&settings, legacy, None)?;
+    }
     let attachment_payloads = attachments
         .lock()
         .map_err(|_| "attachment store lock was poisoned".to_string())?
         .resolve(selection_id, &ticket.project_id)?;
+    if followup && route == DesktopRoute::Rescue {
+        let guard = storage
+            .lock()
+            .map_err(|_| "storage lock was poisoned".to_string())?;
+        guard
+            .append_event(
+                Some(ticket_id),
+                "user.message",
+                json!({ "content": request_text, "clientRequestId": client_request_id }),
+            )
+            .map_err(|error| error.to_string())?;
+    }
     let mut entries = Vec::new();
     collect_project_files(
         Path::new(&project.path),
@@ -5061,18 +5083,54 @@ fn run_executor_ticket(
             content_digest: None,
         })
         .collect::<Vec<_>>();
-    let scout_context = run_automatic_scouts(
-        storage,
-        skills,
-        legacy,
-        executor,
-        ticket_id,
-        &project.path,
-        request_text,
-        route,
-        files.len(),
-        app,
-    );
+    let rescue_report = (route == DesktopRoute::Rescue).then(|| diagnose_rescue(request_text));
+    if let Some(report) = &rescue_report {
+        for evidence in &report.evidence {
+            append_runtime_event(
+                storage,
+                ticket_id,
+                "rescue.probe.completed",
+                json!({
+                    "evidenceId": evidence.id,
+                    "toolId": evidence.tool_id,
+                    "state": evidence.state,
+                    "summary": evidence.summary,
+                    "contentDigest": evidence.content_digest,
+                    "elapsedMs": evidence.elapsed_ms,
+                }),
+                app,
+            );
+        }
+        append_runtime_event(
+            storage,
+            ticket_id,
+            "rescue.diagnosis.ready",
+            json!({
+                "outcome": report.outcome,
+                "domain": report.domain,
+                "hypotheses": report.hypotheses,
+                "nextProbe": report.next_probe,
+                "mutationPerformed": false,
+            }),
+            app,
+        );
+    }
+    let scout_context = if route == DesktopRoute::Rescue {
+        None
+    } else {
+        run_automatic_scouts(
+            storage,
+            skills,
+            legacy,
+            executor,
+            ticket_id,
+            &project.path,
+            request_text,
+            route,
+            files.len(),
+            app,
+        )
+    };
     let mut history = history;
     if followup
         && !history
@@ -5123,6 +5181,9 @@ fn run_executor_ticket(
     if let (Some(findings), Some(object)) = (scout_context, task_context.as_object_mut()) {
         object.insert("scoutFindings".into(), json!(findings));
     }
+    if let (Some(report), Some(object)) = (rescue_report.as_ref(), task_context.as_object_mut()) {
+        object.insert("rescueEvidence".into(), compact_rescue_report(report));
+    }
     let request = ExecutorRequest {
         version: EXECUTOR_PROTOCOL_V1.into(),
         request_id: request_id.clone(),
@@ -5168,7 +5229,7 @@ fn run_executor_ticket(
         guard
             .set_ticket_state(ticket_id, TicketState::Running)
             .map_err(|error| error.to_string())?;
-        if followup {
+        if followup && route != DesktopRoute::Rescue {
             guard
                 .append_event(
                     Some(ticket_id),
@@ -5187,13 +5248,15 @@ fn run_executor_ticket(
                 .map_err(|error| error.to_string())?;
         }
     }
-    append_runtime_event(
-        storage,
-        ticket_id,
-        "provider.started",
-        json!({ "provider": settings.model_provider }),
-        app,
-    );
+    if route != DesktopRoute::Rescue {
+        append_runtime_event(
+            storage,
+            ticket_id,
+            "provider.started",
+            json!({ "provider": settings.model_provider }),
+            app,
+        );
+    }
     append_runtime_event(
         storage,
         ticket_id,
@@ -6078,7 +6141,9 @@ fn persist_executor_event(
                 let preserve_waiting = guard
                     .ticket(ticket_id)
                     .is_ok_and(|ticket| preserve_waiting_after_executor_complete(ticket.state));
-                if !preserve_waiting {
+                if route == DesktopRoute::Rescue {
+                    let _ = guard.set_ticket_state(ticket_id, TicketState::Waiting);
+                } else if !preserve_waiting {
                     let _ = guard.set_ticket_state(ticket_id, TicketState::Completed);
                 }
             }
@@ -6591,6 +6656,18 @@ mod tests {
         assert_eq!(
             classify_desktop_route("帮我做一个背包问题的 Python 代码", None),
             DesktopRoute::CodeGenerate
+        );
+        assert_eq!(
+            classify_desktop_route("Windows 电脑无法上网，请帮我诊断", None),
+            DesktopRoute::Rescue
+        );
+        assert_eq!(
+            classify_desktop_route("检查系统服务为什么异常", None),
+            DesktopRoute::Rescue
+        );
+        assert_eq!(
+            classify_desktop_route("解释 network_service.py 为什么报错", None),
+            DesktopRoute::ProjectRead
         );
         assert_eq!(
             classify_desktop_route("给我一段 Python 示例代码", None),

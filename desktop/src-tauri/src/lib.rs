@@ -9,6 +9,7 @@ pub mod provider;
 pub mod race;
 pub mod race_verifier;
 pub mod race_workspace;
+pub mod rescue;
 pub mod skills;
 pub mod storage;
 pub mod superagent;
