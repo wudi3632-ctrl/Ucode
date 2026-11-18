@@ -30,6 +30,31 @@ async function waitReady(port, child, stderr) {
   throw new Error(`Agent did not become ready: ${stderr.value}`);
 }
 
+async function postJsonSplitInsideUtf8(port, value, needle) {
+  const body = Buffer.from(JSON.stringify(value), "utf8");
+  const marker = Buffer.from(needle, "utf8");
+  const markerStart = body.indexOf(marker);
+  assert.notEqual(markerStart, -1);
+  const split = markerStart + 1;
+  return new Promise((resolve, reject) => {
+    const request = http.request({
+      host: "127.0.0.1",
+      port,
+      path: "/v3/executor/runs",
+      method: "POST",
+      headers: { "content-type": "application/json", "content-length": body.length },
+    }, (response) => {
+      response.setEncoding("utf8");
+      let output = "";
+      response.on("data", (chunk) => { output += chunk; });
+      response.on("end", () => resolve({ status: response.statusCode, output }));
+    });
+    request.on("error", reject);
+    request.write(body.subarray(0, split));
+    setTimeout(() => request.end(body.subarray(split)), 5);
+  });
+}
+
 test("v3 Executor endpoint streams typed chat events without creating a Node ticket", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "ucode-executor-server-"));
   const project = path.join(root, "project");
@@ -101,4 +126,39 @@ test("v3 Executor endpoint streams typed chat events without creating a Node tic
     const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
     assert.deepEqual(state.tickets || [], []);
   }
+
+
+  const rescueTitle = "存在未运行的自动服务，需要结合具体症状核对";
+  const rescueRequest = {
+    version: "ucode.executor.v1",
+    requestId: `rescue-${Date.now()}`,
+    turnId: "turn-rescue-utf8",
+    threadKey: "desktop:conversation-rescue",
+    mode: "rescue",
+    assignment: null,
+    mandate: null,
+    inputs: [{ id: "input-rescue", kind: "trigger", triggerId: "trigger-rescue", text: "只读诊断", human: true }],
+    history: [],
+    workspace: { canonicalRoot: project, fingerprint: "fixture", files: [] },
+    attachmentToken: null,
+    attachments: [],
+    metadata: {
+      taskContext: {
+        rescueEvidence: {
+          version: "ucode.rescue.diagnosis.v1",
+          outcome: "diagnosed",
+          mutationPerformed: false,
+          evidence: [{ id: "evidence-1", toolId: "system.service.inspect", state: "observed", summary: "自动服务状态已读取" }],
+          hypotheses: [{ id: "service.auto", state: "supported", title: rescueTitle, evidenceIds: ["evidence-1"] }],
+        },
+      },
+    },
+  };
+  const rescueResponse = await postJsonSplitInsideUtf8(agentPort, rescueRequest, "核");
+  assert.equal(rescueResponse.status, 200);
+  const rescueEvents = rescueResponse.output.trim().split("\n").map((line) => JSON.parse(line));
+  assert.equal(rescueEvents.map((event) => event.type).join(","), "start,text_delta,complete");
+  assert.match(rescueEvents[1].delta, new RegExp(rescueTitle));
+  assert.match(rescueEvents[2].content, new RegExp(rescueTitle));
+  assert.equal(rescueResponse.output.includes("�"), false);
 });

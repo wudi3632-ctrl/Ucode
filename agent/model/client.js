@@ -9,6 +9,7 @@ export class ModelClient {
       const body = payload === undefined ? null : JSON.stringify(payload);
       const req = http.request({ hostname: this.host, port: this.port, path, method: body ? "POST" : "GET", headers: body ? { "content-type": "application/json", "content-length": Buffer.byteLength(body) } : {} }, (res) => {
         let output = "";
+        res.setEncoding("utf8");
         res.on("data", (chunk) => { output += chunk; });
         res.on("end", () => {
           try {

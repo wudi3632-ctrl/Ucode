@@ -1,6 +1,6 @@
 import { FormEvent, KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
 import { chooseContextAttachments, removeContextAttachment } from "../bridge/desktop";
-import type { AppliedEffect, AppSettings, ContextAttachmentSelection, ContextAttachmentSummary, EvidenceReceipt, OnboardingState, ProposedEffect, RaceBundle, RaceCandidate, RuntimeEvent, TicketSummary } from "../domain/types";
+import type { AppliedEffect, AppSettings, ContextAttachmentSelection, ContextAttachmentSummary, EvidenceReceipt, OnboardingState, ProposedEffect, RaceBundle, RaceCandidate, RescueRepairProposal, RescueRepairRecord, RuntimeEvent, TicketSummary } from "../domain/types";
 import type { ObservedModelPerformance } from "../domain/modelPerformance";
 import { changedLineCounts } from "../domain/diff";
 import { buildComposerHistory, canStartComposerHistory, exitComposerHistory, moveComposerHistory, type ComposerHistoryState } from "../domain/composerHistory";
@@ -25,6 +25,8 @@ interface ConversationProps {
   onApprove: (selectedPaths: string[]) => void;
   onReject: () => void;
   onRollback: () => Promise<void>;
+  onResolveRescueRepair?: (proposalId: string, approved: boolean) => Promise<void>;
+  onRollbackRescueRepair?: (proposalId: string) => Promise<void>;
   onExportReceipt: (receipt: EvidenceReceipt, format: "json" | "md") => Promise<void>;
   hasProject: boolean;
   onOpenProject: () => void | Promise<void>;
@@ -75,7 +77,7 @@ const activityCopy: Record<string, string> = {
   "provider.reconnected": "连接已恢复，缺失内容已补齐",
 };
 
-export function Conversation({ projectId, ticket, events, effect, receipt, appliedEffect, busy, races = [], onCancelRace = async () => undefined, onSubmit, onCancel, onRetry, onExport, onBranch, onApprove, onReject, onRollback, onExportReceipt, hasProject, onOpenProject, onboarding = completedOnboardingState, onboardingBusy = false, onCreateDemo = async () => undefined, onDismissOnboarding = async () => undefined, onDismissOnboardingTip = async () => undefined, onOpenSettings = () => undefined, error, sidebarOpen, inspectorOpen, onToggleSidebar, onToggleInspector, providerStatus, modelProvider, providerModel, modelPerformance, providerRecovering = false, onRecoverProvider = async () => undefined }: ConversationProps) {
+export function Conversation({ projectId, ticket, events, effect, receipt, appliedEffect, busy, races = [], onCancelRace = async () => undefined, onSubmit, onCancel, onRetry, onExport, onBranch, onApprove, onReject, onRollback, onResolveRescueRepair = async () => undefined, onRollbackRescueRepair = async () => undefined, onExportReceipt, hasProject, onOpenProject, onboarding = completedOnboardingState, onboardingBusy = false, onCreateDemo = async () => undefined, onDismissOnboarding = async () => undefined, onDismissOnboardingTip = async () => undefined, onOpenSettings = () => undefined, error, sidebarOpen, inspectorOpen, onToggleSidebar, onToggleInspector, providerStatus, modelProvider, providerModel, modelPerformance, providerRecovering = false, onRecoverProvider = async () => undefined }: ConversationProps) {
   const [request, setRequest] = useState("");
   const [selection, setSelection] = useState<ContextAttachmentSelection | null>(null);
   const [attachmentLoading, setAttachmentLoading] = useState(false);
@@ -91,6 +93,7 @@ export function Conversation({ projectId, ticket, events, effect, receipt, appli
   const items = useMemo(() => buildTimeline(ticket, ticketEvents, busy), [ticket, ticketEvents, busy]);
   const requestHistory = useMemo(() => buildComposerHistory(items.flatMap((item) => item.kind === "user" ? [item.content] : [])), [items]);
   const taskContext = useMemo(() => latestTaskContext(ticketEvents), [ticketEvents]);
+  const rescueRepair = useMemo(() => rescueRepairFrom(ticketEvents), [ticketEvents]);
   const recoveryRequired = items.some((item) => item.kind === "recovery");
   const latestUserRequest = useMemo(() => [...items].reverse().find((item) => item.kind === "user")?.content ?? ticket?.request ?? "", [items, ticket?.request]);
 
@@ -245,6 +248,7 @@ export function Conversation({ projectId, ticket, events, effect, receipt, appli
               return <AssistantMessage key={item.key} content={item.content} streaming={item.streaming} copied={copied === item.key} onCopy={() => copyText(item.key, item.content)} onRetry={() => void onSubmit(latestUserRequest)} onBranch={() => onBranch(item.sequence)} />;
             })}
             {races.map((race) => <CandidateRaceCard key={race.race.id} bundle={race} onCancel={() => onCancelRace(race.race.id)} />)}
+            {rescueRepair && <RescueRepairCard value={rescueRepair} busy={busy} onResolve={onResolveRescueRepair} onRollback={onRollbackRescueRepair} />}
             {effect && (
               <article className="approval-card">
                 <div className="approval-icon">±</div>
@@ -422,14 +426,44 @@ function EvidenceReceiptCard({ receipt, onExport }: { receipt: EvidenceReceipt; 
   const visibleTests = [...receipt.tests, ...legacyTests];
   const total = visibleSources.length + receipt.commands.length + visibleTests.length + receipt.effects.length + receipt.decisions.length;
   const appliedEffects = receipt.effects.filter((effect) => effect.event === "effect.applied");
+  const rescueRepair = [...receipt.effects].reverse().find((effect) => typeof effect.event === "string" && effect.event.startsWith("rescue.repair.") && effect.event !== "rescue.repair.proposed");
+  const rescueRepairEvent = String(rescueRepair?.event ?? "");
+  const rescueVerified = rescueRepairEvent === "rescue.repair.verified";
+  const rescueRolledBack = rescueRepairEvent === "rescue.repair.rolled_back";
+  const rescueUnverified = rescueRepairEvent === "rescue.repair.unverified";
+  const rescueRollbackFailed = rescueRepairEvent === "rescue.repair.rollback_failed";
   const rejected = appliedEffects.length === 0 && receipt.decisions.some((decision) => decision.event === "effect.rejected");
   const noWinnerDecision = receipt.decisions.find((decision) => decision.event === "race.decided" && nestedValue(decision, ["detail", "race", "verdict", "kind"]) === "no_winner");
   const legacyRaceStopped = receipt.decisions.find((decision) => decision.event === "race.legacy_stopped");
   const staleRaceReconciled = receipt.decisions.find((decision) => decision.event === "race.terminal_reconciled" && nestedValue(decision, ["detail", "raceState"]) === "stale");
-  const outcome = rejected ? "已取消" : ({ completed: "已完成", failed: "失败", cancelled: "已停止", rolled_back: "已回滚", waiting_input: "等待输入", waiting_approval: "等待审批", in_progress: "进行中" } as Record<string, string>)[receipt.outcome] ?? receipt.outcome;
-  const changed = appliedEffects.length ? `${appliedEffects.length} 个已应用批次` : receipt.route === "rescue" ? "没有修改系统" : "没有写入文件";
+  const outcome = rejected
+    ? "已取消"
+    : rescueRolledBack
+      ? "已回滚"
+      : rescueVerified
+        ? "写入已验证"
+        : rescueUnverified || rescueRollbackFailed
+          ? "需要检查"
+          : ({ completed: "已完成", failed: "失败", cancelled: "已停止", rolled_back: "已回滚", waiting_input: "等待输入", waiting_approval: "等待审批", in_progress: "进行中" } as Record<string, string>)[receipt.outcome] ?? receipt.outcome;
+  const changed = appliedEffects.length
+    ? `${appliedEffects.length} 个已应用批次`
+    : rescueRolledBack
+      ? "用户级系统修改已精确回滚"
+      : rescueVerified
+        ? "已应用 1 个用户级系统修复"
+        : rescueUnverified
+          ? "系统写入已发生，但尚未验证"
+          : receipt.route === "rescue"
+            ? "没有修改系统"
+            : "没有写入文件";
   const verified = rejected
     ? "未执行测试（修改已拒绝）"
+    : rescueRolledBack
+      ? "回滚后已重读目标并确认恢复审批前原值"
+    : rescueVerified
+      ? "修复后已重读目标并核对精确摘要"
+    : rescueUnverified
+      ? "写入后的目标重读验证未通过"
     : visibleTests.length
     ? legacyRaceStopped
       ? `仅旧候选验证：${summarizeTestEvidence(visibleTests)}；任务已在写入前安全失效`
@@ -449,6 +483,14 @@ function EvidenceReceiptCard({ receipt, onExport }: { receipt: EvidenceReceipt; 
           : "本轮不需要运行测试";
   const risk = rejected
     ? "修改已拒绝，项目文件未改变"
+    : rescueRolledBack
+      ? "系统已恢复到审批前状态"
+    : rescueVerified
+      ? "系统已修改；仅当目标仍保持应用后状态时允许回滚"
+    : rescueUnverified
+      ? "系统可能已修改但验证未通过，需要人工核对当前状态"
+    : rescueRollbackFailed
+      ? "回滚失败或被安全拒绝，需要人工核对当前系统状态"
     : receipt.outcome === "completed"
     ? appliedEffects.length
       ? "文件已变更，仍应审查 Diff 和测试结果"
@@ -460,7 +502,17 @@ function EvidenceReceiptCard({ receipt, onExport }: { receipt: EvidenceReceipt; 
     : receipt.outcome === "failed"
       ? "任务失败，不能视为完成"
       : receipt.route === "rescue" ? "只读诊断已结束；未执行修复，下一步仍需确认或授权" : "任务尚未完成或仍需人工确认";
-  const undo = appliedEffects.length ? "可使用本任务下方的回滚入口撤销已应用批次" : receipt.route === "rescue" ? "本轮没有系统变更，无需回滚" : "没有需要撤销的文件批次";
+  const undo = appliedEffects.length
+    ? "可使用本任务下方的回滚入口撤销已应用批次"
+    : rescueRolledBack
+      ? "已完成回滚，无需再次撤销"
+      : rescueVerified
+        ? String(nestedValue(rescueRepair, ["detail", "record", "proposal", "rollbackContract"]) ?? "可使用本任务下方的回滚入口恢复审批前状态")
+        : rescueUnverified || rescueRollbackFailed
+          ? "先核对当前系统状态，再决定是否执行恢复"
+          : receipt.route === "rescue"
+            ? "本轮没有系统变更，无需回滚"
+            : "没有需要撤销的文件批次";
   return <article className="evidence-receipt" aria-label="结果证据">
     <header><span className="receipt-seal">{rejected ? "×" : receipt.outcome === "completed" ? "✓" : "·"}</span><span><b>任务收据</b><small>{outcome}</small></span></header>
     <dl className="receipt-summary">
@@ -506,6 +558,7 @@ function summarizeTestEvidence(tests: Record<string, unknown>[]) {
 }
 
 interface VisibleTaskContext {
+  scope: "project" | "system" | "conversation";
   objective: string;
   targetFiles: string[];
   constraints: string[];
@@ -518,12 +571,21 @@ function latestTaskContext(events: RuntimeEvent[]): VisibleTaskContext | null {
   const payload = [...events].reverse().find((event) => event.eventType === "context.updated")?.payload;
   if (!payload || typeof payload.objective !== "string") return null;
   const strings = (key: string) => Array.isArray(payload[key]) ? (payload[key] as unknown[]).filter((value): value is string => typeof value === "string" && Boolean(value.trim())).slice(0, 10) : [];
-  return { objective: payload.objective, targetFiles: strings("targetFiles"), constraints: strings("constraints"), verification: strings("verification"), unresolvedQuestions: strings("unresolvedQuestions"), revision: Number(payload.revision ?? 1) };
+  const scope = payload.scope === "system" || payload.scope === "conversation" ? payload.scope : "project";
+  return { scope, objective: payload.objective, targetFiles: strings("targetFiles"), constraints: strings("constraints"), verification: strings("verification"), unresolvedQuestions: strings("unresolvedQuestions"), revision: Number(payload.revision ?? 1) };
 }
 
 function TaskContextSummary({ context }: { context: VisibleTaskContext }) {
+  const heading = context.scope === "project" ? "任务范围" : "任务上下文";
+  const scope = context.targetFiles.length
+    ? `${context.targetFiles.length} 个目标文件`
+    : context.scope === "system"
+      ? "系统诊断"
+      : context.scope === "conversation"
+        ? "普通对话"
+        : "尚未限定文件";
   return <details className={`task-context-summary ${context.unresolvedQuestions.length ? "needs-input" : ""}`}>
-    <summary><span>任务范围</span><b>{context.targetFiles.length ? `${context.targetFiles.length} 个目标文件` : "尚未限定文件"}</b><small>v{context.revision}</small></summary>
+    <summary><span>{heading}</span><b>{scope}</b><small>v{context.revision}</small></summary>
     <div><p><b>目标</b>{context.objective}</p>{context.targetFiles.length > 0 && <p><b>文件</b>{context.targetFiles.join("、")}</p>}{context.constraints.length > 0 && <p><b>限制</b>{context.constraints.join("；")}</p>}{context.verification.length > 0 && <p><b>验证</b>{context.verification.join("；")}</p>}{context.unresolvedQuestions.length > 0 && <p className="task-context-questions"><b>待确认</b>{context.unresolvedQuestions.join("；")}</p>}</div>
   </details>;
 }
@@ -633,6 +695,37 @@ function TaskRescueRow({ recovery, onAttachContext, onConfigureModel }: { recove
       {recovery.actions.includes("configure_model") && <button type="button" className="quiet" onClick={onConfigureModel}>调整模型</button>}
     </div>
   </section>;
+}
+
+interface VisibleRescueRepair { proposal: RescueRepairProposal; record: RescueRepairRecord | null }
+
+function rescueRepairFrom(events: RuntimeEvent[]): VisibleRescueRepair | null {
+  const proposed = [...events].reverse().find((event) => event.eventType === "rescue.repair.proposed");
+  const value = proposed?.payload.proposal;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const proposal = value as unknown as RescueRepairProposal;
+  if (proposal.schemaVersion !== 1 || proposal.risk !== "r2" || proposal.operationId !== "system.user_path.normalize" || typeof proposal.id !== "string") return null;
+  const result = [...events].reverse().find((event) => String(event.payload.proposalId ?? "") === proposal.id && event.eventType.startsWith("rescue.repair.") && event.eventType !== "rescue.repair.proposed");
+  const recordValue = result?.payload.record;
+  const record = recordValue && typeof recordValue === "object" && !Array.isArray(recordValue) ? recordValue as unknown as RescueRepairRecord : null;
+  return { proposal: record?.proposal ?? proposal, record };
+}
+
+function RescueRepairCard({ value, busy, onResolve, onRollback }: { value: VisibleRescueRepair; busy: boolean; onResolve: (proposalId: string, approved: boolean) => Promise<void>; onRollback: (proposalId: string) => Promise<void> }) {
+  const [confirmRollback, setConfirmRollback] = useState(false);
+  const proposal = value.proposal;
+  const status = proposal.status;
+  const removed = Array.isArray(proposal.normalizedArguments.removedEntries) ? proposal.normalizedArguments.removedEntries : [];
+  const statusCopy = status === "awaiting_approval" ? "等待批准" : status === "verified" ? "写入已验证" : status === "rolled_back" ? "已精确回滚" : status === "repaired_unverified" ? "验证未通过" : status === "rollback_failed" ? "回滚失败" : "已安全停止";
+  return <article className={`rescue-repair-card ${status}`} aria-label="Rescue 可逆修复">
+    <header><span>R2</span><div><b>规范化当前用户 PATH</b><small>{statusCopy} · 不需要管理员权限</small></div></header>
+    <p>{value.record?.detail ?? "检测到可以确定清理的空项、重复项或不存在目录。模型无权执行；只有本地审批执行器能写入。"}</p>
+    <dl><div><dt>目标</dt><dd><code>{proposal.target}</code></dd></div><div><dt>验证</dt><dd>{proposal.verificationProbe}</dd></div><div><dt>回滚</dt><dd>{proposal.rollbackContract}</dd></div></dl>
+    {removed.length > 0 && <details><summary>查看 {removed.length} 个拟清理项</summary><ul>{removed.slice(0, 12).map((item, index) => <li key={`${item}-${index}`}><code>{item}</code></li>)}</ul></details>}
+    <div className="rescue-repair-digests"><span>before <code>{proposal.beforeDigest.slice(0, 10)}</code></span><span>after <code>{proposal.expectedAfterDigest.slice(0, 10)}</code></span></div>
+    {status === "awaiting_approval" && <div className="approval-actions"><button className="quiet" disabled={busy} onClick={() => void onResolve(proposal.id, false)}>暂不修复</button><button className="approve" disabled={busy} onClick={() => void onResolve(proposal.id, true)}>{busy ? "正在核验…" : "批准、应用并验证"}</button></div>}
+    {status === "verified" && (confirmRollback ? <div className="rollback-confirm"><p>仅当当前 PATH 仍等于应用后摘要时才会恢复；后续用户修改不会被覆盖。</p><button className="quiet" onClick={() => setConfirmRollback(false)}>取消</button><button className="danger" disabled={busy} onClick={() => void onRollback(proposal.id).finally(() => setConfirmRollback(false))}>确认回滚</button></div> : <button className="quiet rescue-rollback" disabled={busy} onClick={() => setConfirmRollback(true)}>回滚本次系统修改</button>)}
+  </article>;
 }
 
 function RecoveryRequiredCard({ event, paths }: { event: RuntimeEvent; paths: string[] }) {

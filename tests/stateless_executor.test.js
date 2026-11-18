@@ -103,7 +103,7 @@ test("rescue mode explains only host evidence and never receives action authorit
       outcome: "safe_stop",
       mutationPerformed: false,
       evidence: [{ id: "evidence-1", toolId: "network.adapter.inspect", state: "observed", summary: "存在 IPv4 地址" }],
-      hypotheses: [{ id: "network.external", state: "unresolved", evidenceIds: ["evidence-1"] }],
+      hypotheses: [{ id: "network.external", state: "supported", title: "存在未运行的自动服务，需要结合具体症状核对", evidenceIds: ["evidence-1"] }],
       nextProbe: "network.dns.resolve（R1，需要用户允许网络探测）",
     },
   };
@@ -112,6 +112,8 @@ test("rescue mode explains only host evidence and never receives action authorit
 
   assert.match(output, /当前结论：证据尚不足/);
   assert.match(output, /evidence-1/);
+  assert.match(output, /存在未运行的自动服务，需要结合具体症状核对/);
+  assert.equal(output.includes("�"), false);
   assert.match(output, /只进行了只读诊断，没有修改系统/);
   assert.equal(value.calls.length, 0);
   assert.equal(value.request.assignment, null);

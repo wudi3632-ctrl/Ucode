@@ -205,6 +205,8 @@ pub struct EvidenceReceipt {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskContext {
+    #[serde(default)]
+    pub scope: TaskContextScope,
     pub objective: String,
     pub target_files: Vec<String>,
     pub constraints: Vec<String>,
@@ -215,9 +217,19 @@ pub struct TaskContext {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskContextScope {
+    #[default]
+    Project,
+    System,
+    Conversation,
+}
+
 impl TaskContext {
     fn from_request(request: &str) -> Self {
         let mut context = Self {
+            scope: TaskContextScope::Project,
             objective: request.trim().to_string(),
             target_files: extract_context_paths(request),
             constraints: extract_context_clauses(request, ContextClause::Constraint),
@@ -270,6 +282,9 @@ impl TaskContext {
 
     fn refresh_questions(&mut self, latest: &str) {
         self.unresolved_questions.clear();
+        if self.scope != TaskContextScope::Project {
+            return;
+        }
         if looks_like_mutation(&self.objective) && self.target_files.is_empty() {
             self.unresolved_questions
                 .push("需要明确目标文件或允许的项目范围".into());
@@ -822,6 +837,32 @@ impl Storage {
     ) -> Result<TaskContext, StorageError> {
         let mut context = self.task_context(ticket_id)?;
         context.merge_message(message);
+        let transaction = self.connection.transaction()?;
+        upsert_task_context_tx(&transaction, ticket_id, &context)?;
+        append_event_tx(
+            &transaction,
+            Some(ticket_id),
+            "context.updated",
+            serde_json::to_value(&context)?,
+        )?;
+        transaction.commit()?;
+        Ok(context)
+    }
+
+    pub fn set_task_context_scope(
+        &mut self,
+        ticket_id: &str,
+        scope: TaskContextScope,
+    ) -> Result<TaskContext, StorageError> {
+        let mut context = self.task_context(ticket_id)?;
+        if context.scope == scope {
+            return Ok(context);
+        }
+        context.scope = scope;
+        let objective = context.objective.clone();
+        context.refresh_questions(&objective);
+        context.revision = context.revision.saturating_add(1);
+        context.updated_at = Utc::now().to_rfc3339();
         let transaction = self.connection.transaction()?;
         upsert_task_context_tx(&transaction, ticket_id, &context)?;
         append_event_tx(
@@ -1637,6 +1678,30 @@ fn refresh_evidence_receipt(connection: &Connection, ticket_id: &str) -> Result<
             "rescue.diagnosis.ready" => {
                 route = Some("rescue".into());
                 decisions.push(json!({ "event": event_type, "detail": payload, "at": created_at }));
+            }
+            "rescue.repair.proposed" => {
+                route = Some("rescue".into());
+                if let Some(id) = payload
+                    .get("proposal")
+                    .and_then(|value| value.get("id"))
+                    .and_then(Value::as_str)
+                {
+                    unresolved_effects.insert(id.to_string());
+                }
+                effects.push(json!({ "event": event_type, "detail": payload, "at": created_at }));
+            }
+            "rescue.repair.verified"
+            | "rescue.repair.unverified"
+            | "rescue.repair.rolled_back"
+            | "rescue.repair.rollback_failed"
+            | "rescue.repair.safe_stop"
+            | "rescue.repair.rejected" => {
+                route = Some("rescue".into());
+                if let Some(id) = payload.get("proposalId").and_then(Value::as_str) {
+                    unresolved_effects.remove(id);
+                }
+                effects.push(json!({ "event": event_type, "detail": payload, "at": created_at }));
+                decisions.push(json!({ "event": event_type, "detail": { "proposalId": payload.get("proposalId"), "status": payload.get("status"), "detail": payload.get("detail") }, "at": created_at }));
             }
             "delivery.ready" => {
                 route = payload
@@ -2753,33 +2818,60 @@ mod tests {
             fingerprint: "rescue-receipt".into(),
         };
         let project = storage.upsert_project(&locator, true).unwrap();
-        let ticket = storage.create_ticket(&project.id, "Windows 无法上网，请诊断").unwrap();
+        let ticket = storage
+            .create_ticket(&project.id, "Windows 无法上网，请诊断")
+            .unwrap();
         storage.append_event(Some(&ticket.id), "user.message", json!({
             "content": "重新诊断当前 Windows 网络配置", "clientRequestId": "rescue-followup-1",
         })).unwrap();
-        storage.append_event(Some(&ticket.id), "rescue.probe.completed", json!({
-            "toolId": "network.adapter.inspect",
-            "evidenceId": "evidence-abc",
-            "state": "observed",
-            "summary": "发现 1 个启用的 IP 配置",
-            "contentDigest": "a".repeat(64),
-            "elapsedMs": 12,
-        })).unwrap();
-        storage.append_event(Some(&ticket.id), "rescue.diagnosis.ready", json!({
-            "outcome": "safe_stop", "mutationPerformed": false,
-        })).unwrap();
-        storage.set_ticket_state(&ticket.id, TicketState::Waiting).unwrap();
-        storage.append_event(Some(&ticket.id), "delivery.ready", json!({
-            "content": "需要授权下一探针", "route": "rescue",
-        })).unwrap();
+        storage
+            .append_event(
+                Some(&ticket.id),
+                "rescue.probe.completed",
+                json!({
+                    "toolId": "network.adapter.inspect",
+                    "evidenceId": "evidence-abc",
+                    "state": "observed",
+                    "summary": "发现 1 个启用的 IP 配置",
+                    "contentDigest": "a".repeat(64),
+                    "elapsedMs": 12,
+                }),
+            )
+            .unwrap();
+        storage
+            .append_event(
+                Some(&ticket.id),
+                "rescue.diagnosis.ready",
+                json!({
+                    "outcome": "safe_stop", "mutationPerformed": false,
+                }),
+            )
+            .unwrap();
+        storage
+            .set_ticket_state(&ticket.id, TicketState::Waiting)
+            .unwrap();
+        storage
+            .append_event(
+                Some(&ticket.id),
+                "delivery.ready",
+                json!({
+                    "content": "需要授权下一探针", "route": "rescue",
+                }),
+            )
+            .unwrap();
 
         let receipt = storage.evidence_receipts().unwrap().pop().unwrap();
         assert_eq!(receipt.request, "重新诊断当前 Windows 网络配置");
         assert_eq!(receipt.route.as_deref(), Some("rescue"));
         assert_eq!(receipt.outcome, "waiting_input");
         assert_eq!(receipt.sources.len(), 1);
-        assert_eq!(receipt.sources[0].get("evidenceId").and_then(Value::as_str), Some("evidence-abc"));
-        assert!(receipt.decisions.iter().any(|item| item.get("event").and_then(Value::as_str) == Some("rescue.diagnosis.ready")));
+        assert_eq!(
+            receipt.sources[0].get("evidenceId").and_then(Value::as_str),
+            Some("evidence-abc")
+        );
+        assert!(receipt.decisions.iter().any(
+            |item| item.get("event").and_then(Value::as_str) == Some("rescue.diagnosis.ready")
+        ));
         assert!(receipt.effects.is_empty());
     }
 
@@ -3379,6 +3471,34 @@ mod tests {
         let context = TaskContext::from_request("帮我修复这个项目");
         assert_eq!(context.unresolved_questions.len(), 2);
         assert!(context.target_files.is_empty());
+    }
+
+    #[test]
+    fn system_task_context_does_not_request_project_files_or_tests() {
+        let directory = tempdir().unwrap();
+        let mut storage = Storage::open(&directory.path().join("ucode.db")).unwrap();
+        let locator = ProjectLocator {
+            absolute_path: directory.path().display().to_string(),
+            relative_path: None,
+            fingerprint: "system-task-context".into(),
+        };
+        let project = storage.upsert_project(&locator, true).unwrap();
+        let ticket = storage
+            .create_ticket(&project.id, "Windows PATH 异常，请诊断并生成安全修复方案")
+            .unwrap();
+
+        let context = storage
+            .set_task_context_scope(&ticket.id, TaskContextScope::System)
+            .unwrap();
+
+        assert_eq!(context.scope, TaskContextScope::System);
+        assert!(context.unresolved_questions.is_empty());
+        assert!(context.target_files.is_empty());
+        assert_eq!(context.revision, 2);
+        assert_eq!(
+            storage.task_context(&ticket.id).unwrap().scope,
+            TaskContextScope::System
+        );
     }
 
     #[test]

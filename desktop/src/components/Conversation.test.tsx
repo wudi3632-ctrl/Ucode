@@ -72,6 +72,65 @@ describe("conversation timeline projection", () => {
     expect(card).toHaveTextContent("无需回滚");
   });
 
+  it("labels Rescue task context as system diagnosis instead of asking for project files", () => {
+    render(<Conversation
+      projectId="project-1" ticket={ticket} events={[event(1, "context.updated", {
+        scope: "system",
+        objective: "Windows PATH 异常，请根据真实系统证据诊断",
+        targetFiles: [], constraints: [], verification: [], unresolvedQuestions: [], revision: 2,
+      })]} effect={null} receipt={null} appliedEffect={null} busy={false}
+      onSubmit={vi.fn()} onCancel={vi.fn()} onRetry={vi.fn()} onExport={vi.fn()} onBranch={vi.fn()}
+      onApprove={vi.fn()} onReject={vi.fn()} onRollback={vi.fn()} onExportReceipt={vi.fn()} hasProject onOpenProject={vi.fn()} error={null}
+      sidebarOpen inspectorOpen={false} onToggleSidebar={vi.fn()} onToggleInspector={vi.fn()}
+      providerStatus="ready" modelProvider="bundled" providerModel="" modelPerformance={null}
+    />);
+
+    expect(screen.getByText("系统诊断")).toBeInTheDocument();
+    expect(screen.queryByText("尚未限定文件")).not.toBeInTheDocument();
+    expect(screen.queryByText(/需要明确目标文件/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/需要明确验证方式/)).not.toBeInTheDocument();
+  });
+
+  it("reports verified Rescue writes and exact rollback instead of claiming no system change", () => {
+    const verifiedReceipt: EvidenceReceipt = {
+      ticketId: ticket.id,
+      request: "规范化当前用户 PATH",
+      route: "rescue",
+      outcome: "waiting_input",
+      sources: [{ toolName: "system.environment.inspect", evidenceId: "evidence-1", status: "observed" }],
+      commands: [], tests: [], decisions: [],
+      effects: [
+        { event: "rescue.repair.proposed", detail: { proposal: { id: "repair-1" } } },
+        { event: "rescue.repair.verified", detail: { record: { proposal: { rollbackContract: "仅当当前摘要未变化时恢复原值" } } } },
+      ],
+      finalState: {}, contentDigest: "digest", updatedAt: "2026-11-10T00:00:01Z",
+    };
+    const common = {
+      projectId: "project-1", ticket, events: [], effect: null, appliedEffect: null, busy: false,
+      onSubmit: vi.fn(), onCancel: vi.fn(), onRetry: vi.fn(), onExport: vi.fn(), onBranch: vi.fn(),
+      onApprove: vi.fn(), onReject: vi.fn(), onRollback: vi.fn(), onExportReceipt: vi.fn(), hasProject: true, onOpenProject: vi.fn(), error: null,
+      sidebarOpen: true, inspectorOpen: false, onToggleSidebar: vi.fn(), onToggleInspector: vi.fn(),
+      providerStatus: "ready" as const, modelProvider: "bundled" as const, providerModel: "", modelPerformance: null,
+    };
+    const view = render(<Conversation {...common} receipt={verifiedReceipt} />);
+
+    let card = screen.getByRole("article", { name: "结果证据" });
+    expect(card).toHaveTextContent("写入已验证");
+    expect(card).toHaveTextContent("已应用 1 个用户级系统修复");
+    expect(card).toHaveTextContent("修复后已重读目标并核对精确摘要");
+    expect(card).toHaveTextContent("仅当当前摘要未变化时恢复原值");
+    expect(card).not.toHaveTextContent("没有修改系统");
+
+    view.rerender(<Conversation {...common} receipt={{
+      ...verifiedReceipt,
+      effects: [...verifiedReceipt.effects, { event: "rescue.repair.rolled_back", detail: { status: "rolled_back" } }],
+    }} />);
+    card = screen.getByRole("article", { name: "结果证据" });
+    expect(card).toHaveTextContent("用户级系统修改已精确回滚");
+    expect(card).toHaveTextContent("回滚后已重读目标并确认恢复审批前原值");
+    expect(card).toHaveTextContent("已完成回滚，无需再次撤销");
+  });
+
   it("describes read-only evidence without implying that tests or Diff review were required", () => {
     const receipt: EvidenceReceipt = {
       ticketId: ticket.id,
@@ -590,6 +649,36 @@ describe("conversation timeline projection", () => {
     expect(row).toHaveTextContent("−1");
     expect(row).not.toHaveTextContent("+4");
     expect(row).not.toHaveTextContent("−4");
+  });
+
+  it("requires an explicit decision for an evidence-bound R2 repair and exposes verified rollback", async () => {
+    const proposal = {
+      schemaVersion: 1, id: "repair-1", ticketId: ticket.id, operationId: "system.user_path.normalize", operationVersion: 1, risk: "r2",
+      target: "HKCU\\Environment\\Path", normalizedArguments: { after: { value: "C:\\Windows" }, removedEntries: ["C:\\Windows（重复）"] }, evidenceIds: ["evidence-1"],
+      prerequisites: ["摘要一致"], snapshotPlan: "保存原值", expectedPostcondition: "PATH 已规范化", verificationProbe: "重新读取用户 PATH", rollbackContract: "当前值未变化时恢复",
+      beforeDigest: "a".repeat(64), expectedAfterDigest: "b".repeat(64), nonce: "nonce", createdAt: "2026-11-10T00:00:00Z", expiresAt: "2026-11-10T00:10:00Z", status: "awaiting_approval", proposalDigest: "c".repeat(64),
+    };
+    const onResolve = vi.fn(async () => undefined);
+    const view = render(<Conversation
+      projectId="project-1" ticket={ticket} events={[event(1, "rescue.repair.proposed", { proposal })]} effect={null} receipt={null} appliedEffect={null} busy={false}
+      onSubmit={vi.fn()} onCancel={vi.fn()} onRetry={vi.fn()} onExport={vi.fn()} onBranch={vi.fn()} onApprove={vi.fn()} onReject={vi.fn()} onRollback={vi.fn()}
+      onResolveRescueRepair={onResolve} onRollbackRescueRepair={vi.fn()} onExportReceipt={vi.fn()} hasProject onOpenProject={vi.fn()} error={null}
+      sidebarOpen inspectorOpen={false} onToggleSidebar={vi.fn()} onToggleInspector={vi.fn()} providerStatus="ready" modelProvider="bundled" providerModel="" modelPerformance={null}
+    />);
+    const card = screen.getByRole("article", { name: "Rescue 可逆修复" });
+    expect(card).toHaveTextContent("模型无权执行");
+    expect(card).toHaveTextContent("aaaaaaaaaa");
+    fireEvent.click(within(card).getByRole("button", { name: "批准、应用并验证" }));
+    await waitFor(() => expect(onResolve).toHaveBeenCalledWith("repair-1", true));
+
+    const verified = { ...proposal, status: "verified" };
+    view.rerender(<Conversation
+      projectId="project-1" ticket={ticket} events={[event(1, "rescue.repair.proposed", { proposal }), event(2, "rescue.repair.verified", { proposalId: "repair-1", record: { proposal: verified, snapshot: {}, detail: "修复已通过目标重读验证", updatedAt: "2026-11-10T00:00:02Z" } })]} effect={null} receipt={null} appliedEffect={null} busy={false}
+      onSubmit={vi.fn()} onCancel={vi.fn()} onRetry={vi.fn()} onExport={vi.fn()} onBranch={vi.fn()} onApprove={vi.fn()} onReject={vi.fn()} onRollback={vi.fn()}
+      onResolveRescueRepair={onResolve} onRollbackRescueRepair={vi.fn()} onExportReceipt={vi.fn()} hasProject onOpenProject={vi.fn()} error={null}
+      sidebarOpen inspectorOpen={false} onToggleSidebar={vi.fn()} onToggleInspector={vi.fn()} providerStatus="ready" modelProvider="bundled" providerModel="" modelPerformance={null}
+    />);
+    expect(screen.getByRole("button", { name: "回滚本次系统修改" })).toBeInTheDocument();
   });
 
   it("shows a compact verified candidate comparison without private workspace data", () => {

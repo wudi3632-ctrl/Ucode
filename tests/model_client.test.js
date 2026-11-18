@@ -29,6 +29,23 @@ test("streaming model client preserves ordered deltas and final result", async (
   });
 });
 
+test("non-streaming model JSON preserves Chinese text across response chunks", async () => {
+  await withServer((_request, response) => {
+    const body = Buffer.from(JSON.stringify({ type: "final", content: "需要结合具体症状核对" }), "utf8");
+    const marker = Buffer.from("核", "utf8");
+    const markerStart = body.indexOf(marker);
+    assert.notEqual(markerStart, -1);
+    const split = markerStart + 1;
+    response.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+    response.write(body.subarray(0, split));
+    setTimeout(() => response.end(body.subarray(split)), 5);
+  }, async (port) => {
+    const result = await new ModelClient("127.0.0.1", port).generate({ messages: [] });
+    assert.equal(result.content, "需要结合具体症状核对");
+    assert.equal(JSON.stringify(result).includes("�"), false);
+  });
+});
+
 test("aborting a streaming model request stops later events", async () => {
   await withServer((_request, response) => {
     response.writeHead(200, { "content-type": "application/x-ndjson" });

@@ -17,11 +17,14 @@ use crate::race_workspace::{
     create_candidate_workspace, digest_tree, load_candidate_workspace, remove_candidate_workspace,
     workspace_inventory,
 };
-use crate::rescue::{compact_report as compact_rescue_report, diagnose as diagnose_rescue, is_rescue_request};
+use crate::rescue::{
+    compact_report as compact_rescue_report, diagnose as diagnose_rescue, is_rescue_request,
+};
+use crate::rescue_repair::{RepairRecord, RepairService, RepairStatus};
 use crate::skills::{SkillPreview, SkillRuntime};
 use crate::storage::{
     AppSettings, AssignmentSummary, EvidenceReceipt, OnboardingState, ProjectSummary, RuntimeEvent,
-    SkillSummary, Storage, TicketSummary, ONBOARDING_STEPS,
+    SkillSummary, Storage, TaskContextScope, TicketSummary, ONBOARDING_STEPS,
 };
 use crate::superagent::{
     Capability, ExecutorAssignment, ExecutorAttachment, ExecutorCandidate, ExecutorCandidateTarget,
@@ -60,6 +63,7 @@ pub struct AppState {
     pub supervisor: Arc<CompatibilitySupervisor>,
     pub attachments: Arc<Mutex<AttachmentStore>>,
     pub capsule_health: Arc<Mutex<CapsuleHealth>>,
+    pub rescue_repairs: Arc<RepairService>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3823,18 +3827,23 @@ pub async fn run_ticket(
     let skills = Arc::clone(&state.skills);
     let legacy = state.legacy.clone();
     let executor = state.executor.clone();
+    let rescue_repairs = Arc::clone(&state.rescue_repairs);
     let attachments = Arc::clone(&state.attachments);
     let task_ticket_id = ticket_id.clone();
     let task_selection_id = selection_id.clone();
     let task_app = app.clone();
     let route = {
-        let guard = storage
+        let mut guard = storage
             .lock()
             .map_err(|_| "storage lock was poisoned".to_string())?;
         let ticket = guard
             .ticket(&task_ticket_id)
             .map_err(|error| error.to_string())?;
-        classify_desktop_route(&ticket.request, None)
+        let route = classify_desktop_route(&ticket.request, None);
+        guard
+            .set_task_context_scope(&task_ticket_id, route.task_context_scope())
+            .map_err(|error| error.to_string())?;
+        route
     };
     let request = {
         let guard = storage
@@ -3874,6 +3883,7 @@ pub async fn run_ticket(
                 &attachments,
                 &legacy,
                 &executor,
+                &rescue_repairs,
                 &task_ticket_id,
                 &request,
                 &client_request_id,
@@ -3932,13 +3942,17 @@ pub async fn continue_ticket(
     }
     let storage = Arc::clone(&state.storage);
     let route = {
-        let guard = storage
+        let mut guard = storage
             .lock()
             .map_err(|_| "storage lock was poisoned".to_string())?;
         let previous = guard
             .last_delivery_route(&ticket_id)
             .map_err(|error| error.to_string())?;
-        classify_desktop_route(&request, previous.as_deref())
+        let route = classify_desktop_route(&request, previous.as_deref());
+        guard
+            .set_task_context_scope(&ticket_id, route.task_context_scope())
+            .map_err(|error| error.to_string())?;
+        route
     };
     if let Some(content) = low_information_clarification(&request) {
         record_deterministic_clarification(&storage, &ticket_id, &request, &content, true, &app)?;
@@ -3953,6 +3967,7 @@ pub async fn continue_ticket(
         let skills = Arc::clone(&state.skills);
         let legacy = state.legacy.clone();
         let executor = state.executor.clone();
+        let rescue_repairs = Arc::clone(&state.rescue_repairs);
         let attachments = Arc::clone(&state.attachments);
         let task_ticket_id = ticket_id.clone();
         let task_request = request.clone();
@@ -3966,6 +3981,7 @@ pub async fn continue_ticket(
                 &attachments,
                 &legacy,
                 &executor,
+                &rescue_repairs,
                 &task_ticket_id,
                 &task_request,
                 &task_client_request_id,
@@ -4697,6 +4713,84 @@ pub async fn rollback_effect(
     snapshot(&state)
 }
 
+#[tauri::command]
+pub fn resolve_rescue_repair(
+    ticket_id: String,
+    proposal_id: String,
+    approved: bool,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<BootstrapSnapshot, String> {
+    if approved {
+        ensure_capsule_writable(&state)?;
+    }
+    let record = if approved {
+        state.rescue_repairs.apply(&proposal_id, &ticket_id)?
+    } else {
+        state.rescue_repairs.reject(&proposal_id, &ticket_id)?
+    };
+    record_rescue_repair_event(&state.storage, &ticket_id, &record, approved, false, &app)?;
+    snapshot(&state)
+}
+
+#[tauri::command]
+pub fn rollback_rescue_repair(
+    ticket_id: String,
+    proposal_id: String,
+    approved: bool,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<BootstrapSnapshot, String> {
+    if !approved {
+        return Err("Rescue 回滚必须经过明确确认".into());
+    }
+    ensure_capsule_writable(&state)?;
+    let record = state.rescue_repairs.rollback(&proposal_id, &ticket_id)?;
+    record_rescue_repair_event(&state.storage, &ticket_id, &record, true, true, &app)?;
+    snapshot(&state)
+}
+
+fn record_rescue_repair_event(
+    storage: &Arc<Mutex<Storage>>,
+    ticket_id: &str,
+    record: &RepairRecord,
+    approved: bool,
+    rollback: bool,
+    app: &AppHandle,
+) -> Result<(), String> {
+    let event_type = if rollback {
+        match record.proposal.status {
+            RepairStatus::RolledBack => "rescue.repair.rolled_back",
+            RepairStatus::RollbackFailed => "rescue.repair.rollback_failed",
+            _ => "rescue.repair.safe_stop",
+        }
+    } else if !approved {
+        "rescue.repair.rejected"
+    } else {
+        match record.proposal.status {
+            RepairStatus::Verified => "rescue.repair.verified",
+            RepairStatus::RepairedUnverified => "rescue.repair.unverified",
+            _ => "rescue.repair.safe_stop",
+        }
+    };
+    {
+        let guard = storage
+            .lock()
+            .map_err(|_| "storage lock was poisoned".to_string())?;
+        guard
+            .set_ticket_state(ticket_id, TicketState::Waiting)
+            .map_err(|error| error.to_string())?;
+    }
+    append_runtime_event(
+        storage,
+        ticket_id,
+        event_type,
+        json!({ "proposalId": record.proposal.id, "operationId": record.proposal.operation_id, "status": record.proposal.status, "detail": record.detail, "record": record }),
+        app,
+    );
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DesktopRoute {
     Chat,
@@ -4723,6 +4817,14 @@ impl DesktopRoute {
             Self::ProjectRead => "project_read",
             Self::Rescue => "rescue",
             Self::Action => "action",
+        }
+    }
+
+    fn task_context_scope(self) -> TaskContextScope {
+        match self {
+            Self::Rescue => TaskContextScope::System,
+            Self::Chat => TaskContextScope::Conversation,
+            Self::ProjectRead | Self::CodeGenerate | Self::Action => TaskContextScope::Project,
         }
     }
 }
@@ -5023,6 +5125,7 @@ fn run_executor_ticket(
     attachments: &Arc<Mutex<AttachmentStore>>,
     legacy: &LegacyAgentClient,
     executor: &ExecutorClient,
+    rescue_repairs: &RepairService,
     ticket_id: &str,
     request_text: &str,
     client_request_id: &str,
@@ -5114,6 +5217,31 @@ fn run_executor_ticket(
             }),
             app,
         );
+        if report.domain == "system" {
+            let evidence_ids = report
+                .evidence
+                .iter()
+                .filter(|item| item.tool_id == "system.environment.inspect")
+                .map(|item| item.id.clone())
+                .collect::<Vec<_>>();
+            match rescue_repairs.propose_user_path_normalization(ticket_id, evidence_ids) {
+                Ok(Some(proposal)) => append_runtime_event(
+                    storage,
+                    ticket_id,
+                    "rescue.repair.proposed",
+                    json!({ "proposal": proposal }),
+                    app,
+                ),
+                Ok(None) => {}
+                Err(error) => append_runtime_event(
+                    storage,
+                    ticket_id,
+                    "rescue.repair.unavailable",
+                    json!({ "operationId": "system.user_path.normalize", "error": error }),
+                    app,
+                ),
+            }
+        }
     }
     let scout_context = if route == DesktopRoute::Rescue {
         None

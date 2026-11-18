@@ -221,6 +221,39 @@ export interface AppliedEffect {
   changes: EffectChange[];
 }
 
+export type RepairStatus = "awaiting_approval" | "applying" | "repaired_unverified" | "verified" | "safe_stop" | "rolled_back" | "rollback_failed";
+
+export interface RescueRepairProposal {
+  schemaVersion: number;
+  id: string;
+  ticketId: string;
+  operationId: string;
+  operationVersion: number;
+  risk: "r2";
+  target: string;
+  normalizedArguments: { after?: { value?: string }; removedEntries?: string[] };
+  evidenceIds: string[];
+  prerequisites: string[];
+  snapshotPlan: string;
+  expectedPostcondition: string;
+  verificationProbe: string;
+  rollbackContract: string;
+  beforeDigest: string;
+  expectedAfterDigest: string;
+  nonce: string;
+  createdAt: string;
+  expiresAt: string;
+  status: RepairStatus;
+  proposalDigest: string;
+}
+
+export interface RescueRepairRecord {
+  proposal: RescueRepairProposal;
+  snapshot: Record<string, unknown> | null;
+  detail: string;
+  updatedAt: string;
+}
+
 export interface CapsuleHealth {
   status: "ready" | "warning" | "blocked";
   integrity: "verified" | "cached" | "development" | "failed" | string;

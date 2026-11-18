@@ -1,5 +1,5 @@
 import { CSSProperties, KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent, useEffect, useMemo, useRef, useState } from "react";
-import { archiveTicket, bootstrap, branchTicket, cancelCandidateRace, cancelTicket, chooseProject, clearNotificationIdentity, completeOnboardingStep, continueTicket, createOnboardingDemo, createTicket, deleteTicket, dismissOnboardingTip, exportEvidenceReceipt, exportMarkdown, getRuntimeDiagnostics, listEvents, listTicketRaces, mainWindowActivity, markFrontendReady, pinTicket, recheckCapsule, recoverLocalRuntime, renameTicket, resetOnboarding, resolveEffect, rollbackEffect, runTicket, saveSettings, selectProject, setOnboardingWelcome, showCompletionNotification, skipOnboardingStep, startCandidateRace, subscribeRuntimeEvents, syncNativeTheme } from "../bridge/desktop";
+import { archiveTicket, bootstrap, branchTicket, cancelCandidateRace, cancelTicket, chooseProject, clearNotificationIdentity, completeOnboardingStep, continueTicket, createOnboardingDemo, createTicket, deleteTicket, dismissOnboardingTip, exportEvidenceReceipt, exportMarkdown, getRuntimeDiagnostics, listEvents, listTicketRaces, mainWindowActivity, markFrontendReady, pinTicket, recheckCapsule, recoverLocalRuntime, renameTicket, resetOnboarding, resolveEffect, resolveRescueRepair, rollbackEffect, rollbackRescueRepair, runTicket, saveSettings, selectProject, setOnboardingWelcome, showCompletionNotification, skipOnboardingStep, startCandidateRace, subscribeRuntimeEvents, syncNativeTheme } from "../bridge/desktop";
 import { Conversation } from "../components/Conversation";
 import { Inspector } from "../components/Inspector";
 import { Sidebar } from "../components/Sidebar";
@@ -546,6 +546,20 @@ export function App() {
         onApprove={(selectedPaths) => decideEffect(true, selectedPaths)}
         onReject={() => decideEffect(false, null)}
         onRollback={rollbackAppliedEffect}
+        onResolveRescueRepair={async (proposalId, approved) => {
+          if (!activeTicket) return;
+          setBusy(true); setError(null);
+          try { setSnapshot(await resolveRescueRepair(activeTicket.id, proposalId, approved)); }
+          catch (cause) { setError(friendlyError(cause)); }
+          finally { setBusy(false); }
+        }}
+        onRollbackRescueRepair={async (proposalId) => {
+          if (!activeTicket) return;
+          setBusy(true); setError(null);
+          try { setSnapshot(await rollbackRescueRepair(activeTicket.id, proposalId, true)); }
+          catch (cause) { setError(friendlyError(cause)); }
+          finally { setBusy(false); }
+        }}
         onExportReceipt={exportReceipt}
         hasProject={snapshot.projects.length > 0}
         onOpenProject={openProject}

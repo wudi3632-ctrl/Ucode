@@ -10,6 +10,7 @@ pub mod race;
 pub mod race_verifier;
 pub mod race_workspace;
 pub mod rescue;
+pub mod rescue_repair;
 pub mod skills;
 pub mod storage;
 pub mod superagent;
@@ -98,6 +99,9 @@ pub fn run() {
                     notifications::register_identity(portable.path(), &notification_diagnostics);
             }
             let skills = Arc::new(SkillRuntime::new(portable.skills_dir())?);
+            let rescue_repairs = Arc::new(rescue_repair::RepairService::new(
+                portable.data_dir().join("evidence").join("repairs"),
+            )?);
             let legacy_url = std::env::var("UCODE_LEGACY_AGENT_URL")
                 .unwrap_or_else(|_| "http://127.0.0.1:3082".into());
             let legacy = LegacyAgentClient::new(legacy_url)?;
@@ -122,6 +126,7 @@ pub fn run() {
                 supervisor,
                 attachments: Arc::new(Mutex::new(AttachmentStore::default())),
                 capsule_health: Arc::new(Mutex::new(capsule_health)),
+                rescue_repairs,
             });
             app.manage(notification_diagnostics);
             let open_item = MenuItem::with_id(app, "open", "打开 UCode", true, None::<&str>)?;
@@ -212,6 +217,8 @@ pub fn run() {
             commands::continue_ticket,
             commands::resolve_effect,
             commands::rollback_effect,
+            commands::resolve_rescue_repair,
+            commands::rollback_rescue_repair,
             commands::list_project_files,
             commands::read_project_file,
             commands::git_status,

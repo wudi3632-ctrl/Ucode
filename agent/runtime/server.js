@@ -13,6 +13,7 @@ import { EXECUTOR_PROTOCOL_V1, validateExecutorEvent, validateExecutorRequest } 
 import { StatelessExecutor } from "../executor/stateless.js";
 import { AppError, errorBody } from "../shared/errors.js";
 import { log } from "../shared/log.js";
+import { readJsonBody } from "./body.js";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const defaults = JSON.parse(fs.readFileSync(path.join(projectRoot, "config/default.json"), "utf8"));
@@ -189,13 +190,7 @@ function json(response, status, body, requestId) {
 }
 
 async function body(request) {
-  let value = "";
-  for await (const chunk of request) {
-    value += chunk;
-    if (Buffer.byteLength(value) > 1024 * 1024) throw new AppError("body_too_large", "Request body exceeds 1 MiB", 413);
-  }
-  try { return value ? JSON.parse(value) : {}; }
-  catch { throw new AppError("invalid_json", "Request body must be valid JSON"); }
+  return readJsonBody(request);
 }
 
 function assertLocalOrigin(request) {

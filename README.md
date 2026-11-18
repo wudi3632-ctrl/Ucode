@@ -52,6 +52,8 @@ UCode 不是把聊天网页套进桌面壳。它把项目读取、变更审批�
 - Files 面板内容与磁盘一致；只读 Agent 报告 3 条覆盖用例且未修改文件；
 - Terminal 成功启动持久 PowerShell 会话；非 Git 项目被如实识别，没有自动初始化仓库。
 
+2026-11-18 又完成了 Rescue R2 的候选桌面验收：UCode 从真实 `HKCU\Environment\Path` 生成可审查方案，审批后写入并重读验证，再从桌面精确回滚；随后用新打包候选执行中文只读诊断，并在 SQLite 事件中复核流式文本无 UTF-8 损坏。完整记录见 [Rescue Phase 2 验收报告](docs/benchmarks/2026-11-18-rescue-phase2-r2-acceptance.md)。
+
 ## 能力矩阵
 
 “真实桌面”与“自动测试”分开列出，避免把入口存在或单元测试写成已经完成的用户验收。
@@ -63,7 +65,9 @@ UCode 不是把聊天网页套进桌面壳。它把项目读取、变更审批�
 | 项目文件列表、读取、引用来源 | 已验收 | Node + React | 大仓库只做有界索引与读取 |
 | 单文件与小型多文件修改 | Fibonacci 双文件通过 | Node + Rust | 写入必须审批 |
 | pytest 定向执行 | `3 passed in 0.02s` | Node | 失败回传已自动测试，尚待桌面失败路径复核 |
-| 事务写入、过期检测、回滚 | 已见真实写入与回滚入口 | Node + Rust | 真实回滚与中途故障恢复仍需更多桌面验收 |
+| 项目事务写入、过期检测、回滚 | 已见真实写入与回滚入口 | Node + Rust | 项目写入的中途故障恢复主要由自动测试证明 |
+| Rescue R0 只读系统诊断 | Windows 11 真实探针、报告与证据收据已验收 | Node + Rust + 桌面 | 只覆盖已注册的有界探针；不等于全能系统诊断 |
+| Rescue R2 用户 PATH 修复与回滚 | 已真实审批、写入验证、独立复核并精确回滚 | Rust + 桌面 | 当前只启用 `system.user_path.normalize@1`；机器级与高风险修复仍禁用 |
 | 持久终端与 Ctrl+C | 已验证 PowerShell 会话启动 | Rust PTY | 持久交互与 Ctrl+C 主要由自动测试证明 |
 | Git 状态、Diff、历史与操作 | 已验证非仓库诚实降级 | Rust | 真实 Git 仓库的完整操作流仍待人工复核 |
 | 只读 Agent | 已验收，无文件写入 | Rust + React | 只做有界项目分析 |
@@ -151,6 +155,8 @@ npm run tauri dev
 - Vite 与 Tauri release 构建；
 - 便携 staging 完整性检查；
 - 真实桌面聊天、审批、文件、测试、终端、Git 降级、Agent、主题与布局验收。
+
+最近一次正式候选验收的构建摘要、测试计数、桌面步骤与已知限制见 [2026-11-18 Rescue Phase 2 验收报告](docs/benchmarks/2026-11-18-rescue-phase2-r2-acceptance.md)。
 
 自动测试不能替代第二台 Windows 电脑与真实 U 盘拔插验证。项目仍处于个人/研究产品阶段，欢迎以可复现任务、日志和截图提交 Issue。
 
