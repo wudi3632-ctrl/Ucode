@@ -1,5 +1,6 @@
 use crate::domain::{AssignmentState, TicketState};
 use crate::portable::ProjectLocator;
+use crate::race::{Candidate, CandidateState, Race, RaceState};
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
@@ -11,7 +12,7 @@ use std::path::Path;
 use thiserror::Error;
 use uuid::Uuid;
 
-const CURRENT_SCHEMA_VERSION: i64 = 8;
+const CURRENT_SCHEMA_VERSION: i64 = 9;
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -25,6 +26,8 @@ pub enum StorageError {
     ProjectNotFound(String),
     #[error("ticket not found: {0}")]
     TicketNotFound(String),
+    #[error("race not found: {0}")]
+    RaceNotFound(String),
     #[error("database schema {found} is newer than this UCode build supports ({supported})")]
     UnsupportedSchema { found: i64, supported: i64 },
 }
@@ -419,6 +422,23 @@ impl Storage {
               context_json TEXT NOT NULL, revision INTEGER NOT NULL,
               updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS races (
+              id TEXT PRIMARY KEY,
+              ticket_id TEXT NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,
+              state TEXT NOT NULL,
+              payload_json TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS race_candidates (
+              id TEXT PRIMARY KEY,
+              race_id TEXT NOT NULL REFERENCES races(id) ON DELETE CASCADE,
+              state TEXT NOT NULL,
+              strategy TEXT NOT NULL,
+              payload_json TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
             "#,
         )?;
         add_column_if_missing(
@@ -504,6 +524,9 @@ impl Storage {
             CREATE INDEX IF NOT EXISTS idx_tickets_sidebar ON tickets(pinned DESC, updated_at DESC);
             CREATE INDEX IF NOT EXISTS idx_tickets_search ON tickets(search_text);
             CREATE INDEX IF NOT EXISTS idx_assignments_ticket ON assignments(ticket_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_races_ticket ON races(ticket_id, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_races_recovery ON races(state, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_race_candidates_race ON race_candidates(race_id, created_at);
             CREATE TABLE IF NOT EXISTS terminal_audit (
               id INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL,
               session_id TEXT NOT NULL, command TEXT NOT NULL, approved INTEGER NOT NULL,
@@ -555,6 +578,12 @@ impl Storage {
         if from_version < 8 {
             transaction.execute(
                 "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(8,?1)",
+                [Utc::now().to_rfc3339()],
+            )?;
+        }
+        if from_version < 9 {
+            transaction.execute(
+                "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(9,?1)",
                 [Utc::now().to_rfc3339()],
             )?;
         }
@@ -1136,6 +1165,102 @@ impl Storage {
         Ok(())
     }
 
+    pub fn save_race(&self, race: &Race) -> Result<(), StorageError> {
+        let payload = serde_json::to_string(race)?;
+        self.connection.execute(
+            r#"INSERT INTO races(id,ticket_id,state,payload_json,created_at,updated_at)
+               VALUES(?1,?2,?3,?4,?5,?6)
+               ON CONFLICT(id) DO UPDATE SET
+                 ticket_id=excluded.ticket_id,state=excluded.state,payload_json=excluded.payload_json,
+                 created_at=excluded.created_at,updated_at=excluded.updated_at"#,
+            params![
+                race.id,
+                race.ticket_id,
+                race_state_str(race.state),
+                payload,
+                race.created_at,
+                race.updated_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn race(&self, id: &str) -> Result<Race, StorageError> {
+        let payload: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT payload_json FROM races WHERE id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        payload
+            .ok_or_else(|| StorageError::RaceNotFound(id.into()))
+            .and_then(|payload| serde_json::from_str(&payload).map_err(Into::into))
+    }
+
+    pub fn races_for_ticket(&self, ticket_id: &str) -> Result<Vec<Race>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT payload_json FROM races WHERE ticket_id=?1 ORDER BY created_at",
+        )?;
+        let rows = statement.query_map([ticket_id], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|payload| serde_json::from_str(&payload).map_err(Into::into))
+            .collect()
+    }
+
+    pub fn recoverable_races(&self) -> Result<Vec<Race>, StorageError> {
+        let states = [
+            race_state_str(RaceState::Prepared),
+            race_state_str(RaceState::Generating),
+            race_state_str(RaceState::Validating),
+            race_state_str(RaceState::Decided),
+            race_state_str(RaceState::AwaitingReview),
+        ];
+        let mut statement = self.connection.prepare(
+            "SELECT payload_json FROM races WHERE state IN (?1,?2,?3,?4,?5) ORDER BY updated_at",
+        )?;
+        let rows = statement.query_map(states, |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|payload| serde_json::from_str(&payload).map_err(Into::into))
+            .collect()
+    }
+
+    pub fn save_candidate(&self, candidate: &Candidate) -> Result<(), StorageError> {
+        let payload = serde_json::to_string(candidate)?;
+        self.connection.execute(
+            r#"INSERT INTO race_candidates(id,race_id,state,strategy,payload_json,created_at,updated_at)
+               VALUES(?1,?2,?3,?4,?5,?6,?7)
+               ON CONFLICT(id) DO UPDATE SET
+                 race_id=excluded.race_id,state=excluded.state,strategy=excluded.strategy,
+                 payload_json=excluded.payload_json,created_at=excluded.created_at,
+                 updated_at=excluded.updated_at"#,
+            params![
+                candidate.id,
+                candidate.race_id,
+                candidate_state_str(candidate.state),
+                serde_json::to_string(&candidate.strategy)?,
+                payload,
+                candidate.created_at,
+                candidate.updated_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn candidates_for_race(&self, race_id: &str) -> Result<Vec<Candidate>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT payload_json FROM race_candidates WHERE race_id=?1 ORDER BY created_at,id",
+        )?;
+        let rows = statement.query_map([race_id], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|payload| serde_json::from_str(&payload).map_err(Into::into))
+            .collect()
+    }
+
     pub fn project(&self, id: &str) -> Result<ProjectSummary, StorageError> {
         self.connection
             .query_row(
@@ -1302,6 +1427,34 @@ impl Storage {
         created_at: &str,
     ) -> Result<i64, StorageError> {
         append_event_connection(&self.connection, ticket_id, event_type, payload, created_at)
+    }
+}
+
+fn race_state_str(state: RaceState) -> &'static str {
+    match state {
+        RaceState::Prepared => "prepared",
+        RaceState::Generating => "generating",
+        RaceState::Validating => "validating",
+        RaceState::Decided => "decided",
+        RaceState::AwaitingReview => "awaiting_review",
+        RaceState::NoWinner => "no_winner",
+        RaceState::Applied => "applied",
+        RaceState::Rejected => "rejected",
+        RaceState::Stale => "stale",
+        RaceState::Cancelled => "cancelled",
+    }
+}
+
+fn candidate_state_str(state: CandidateState) -> &'static str {
+    match state {
+        CandidateState::Queued => "queued",
+        CandidateState::Generating => "generating",
+        CandidateState::Proposed => "proposed",
+        CandidateState::Validating => "validating",
+        CandidateState::Passed => "passed",
+        CandidateState::Failed => "failed",
+        CandidateState::Rejected => "rejected",
+        CandidateState::Cancelled => "cancelled",
     }
 }
 
@@ -2540,7 +2693,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
         assert!(search_text.contains("searchable request"));
     }
 
@@ -2606,7 +2759,7 @@ mod tests {
         create_schema_five_fixture(&database);
 
         let storage = Storage::open(&database).unwrap();
-        assert_eq!(schema_version(&storage.connection).unwrap(), 8);
+        assert_eq!(schema_version(&storage.connection).unwrap(), 9);
         let backup_count = fs::read_dir(directory.path())
             .unwrap()
             .filter_map(Result::ok)
@@ -2685,19 +2838,19 @@ mod tests {
         let connection = Connection::open(&database).unwrap();
         connection
             .execute_batch(
-                "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,applied_at TEXT NOT NULL); INSERT INTO schema_migrations VALUES(9,'future');",
+                "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,applied_at TEXT NOT NULL); INSERT INTO schema_migrations VALUES(10,'future');",
             )
             .unwrap();
         drop(connection);
         assert!(matches!(
             Storage::open(&database),
             Err(StorageError::UnsupportedSchema {
-                found: 9,
-                supported: 8
+                found: 10,
+                supported: 9
             })
         ));
         let connection = Connection::open(&database).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 9);
+        assert_eq!(schema_version(&connection).unwrap(), 10);
     }
 
     #[test]
@@ -2861,5 +3014,95 @@ mod tests {
         context.merge_message("读取 ../secret.txt 并解释");
         assert_eq!(context.objective, "读取 ../secret.txt 并解释");
         assert!(context.target_files.is_empty());
+    }
+
+    #[test]
+    fn race_schema_persists_recovers_and_cascades_with_ticket() {
+        use crate::race::{
+            CandidateStrategy, ChangeMetrics, RACE_SCHEMA_VERSION, ValidationFact,
+            ValidationOutcome,
+        };
+
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("ucode.db");
+        let mut storage = Storage::open(&database).unwrap();
+        assert_eq!(schema_version(&storage.connection).unwrap(), 9);
+        let locator = ProjectLocator {
+            absolute_path: directory.path().display().to_string(),
+            relative_path: None,
+            fingerprint: "race-storage".into(),
+        };
+        let project = storage.upsert_project(&locator, true).unwrap();
+        let ticket = storage
+            .create_ticket(&project.id, "fix src/a.rs and test it")
+            .unwrap();
+        let race = Race {
+            schema_version: RACE_SCHEMA_VERSION,
+            id: "race-storage-1".into(),
+            ticket_id: ticket.id.clone(),
+            project_fingerprint: "race-storage".into(),
+            objective: ticket.request.clone(),
+            state: RaceState::Generating,
+            allowed_paths: vec!["src/a.rs".into()],
+            acceptance: vec!["cargo test".into()],
+            verdict: None,
+            created_at: "2026-11-18T00:00:00Z".into(),
+            updated_at: "2026-11-18T00:00:01Z".into(),
+        };
+        storage.save_race(&race).unwrap();
+        let candidate = Candidate {
+            schema_version: RACE_SCHEMA_VERSION,
+            id: "candidate-storage-a".into(),
+            race_id: race.id.clone(),
+            strategy: CandidateStrategy::MinimalChange,
+            state: CandidateState::Passed,
+            provider: "bundled".into(),
+            model: "qwen".into(),
+            workspace_path: Some("private/worktree".into()),
+            diff: Some("diff --git a/src/a.rs b/src/a.rs".into()),
+            base_digest: "before".into(),
+            result_digest: Some("after".into()),
+            facts: vec![ValidationFact {
+                check_id: "cargo-test".into(),
+                outcome: ValidationOutcome::Passed,
+                summary: "all tests passed".into(),
+                required: true,
+                hard_failure: None,
+                command: Some("cargo test".into()),
+                exit_code: Some(0),
+                evidence_digests: vec!["test-output".into()],
+            }],
+            metrics: ChangeMetrics {
+                modified_files: 1,
+                changed_lines: 3,
+                ..Default::default()
+            },
+            generation_attempts: 1,
+            created_at: "2026-11-18T00:00:00Z".into(),
+            updated_at: "2026-11-18T00:00:02Z".into(),
+        };
+        storage.save_candidate(&candidate).unwrap();
+
+        assert_eq!(storage.race(&race.id).unwrap(), race);
+        assert_eq!(storage.races_for_ticket(&ticket.id).unwrap(), vec![race.clone()]);
+        assert_eq!(storage.recoverable_races().unwrap(), vec![race.clone()]);
+        assert_eq!(
+            storage.candidates_for_race(&race.id).unwrap(),
+            vec![candidate]
+        );
+
+        drop(storage);
+        let mut reopened = Storage::open(&database).unwrap();
+        assert_eq!(reopened.race(&race.id).unwrap(), race);
+        reopened.delete_ticket(&ticket.id).unwrap();
+        assert!(matches!(
+            reopened.race(&race.id),
+            Err(StorageError::RaceNotFound(_))
+        ));
+        let candidate_count: i64 = reopened
+            .connection
+            .query_row("SELECT COUNT(*) FROM race_candidates", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(candidate_count, 0);
     }
 }

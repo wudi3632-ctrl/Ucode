@@ -6,6 +6,7 @@ pub mod model_packs;
 pub mod notifications;
 pub mod portable;
 pub mod provider;
+pub mod race;
 pub mod skills;
 pub mod storage;
 pub mod superagent;
