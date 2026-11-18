@@ -6,6 +6,42 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const MAX_PROBE_OUTPUT: usize = 64 * 1024;
+const ENVIRONMENT_INSPECT_SCRIPT: &str = r#"
+$parts=@($env:Path -split ';'|Where-Object{$_}|Select-Object -First 80)
+function Get-UCodePathStats([string]$pathValue) {
+  $raw=@($pathValue -split ';')
+  $nonEmpty=@($raw|Where-Object{$_.Trim()})
+  $keys=@{}
+  $duplicates=0
+  $missing=0
+  foreach($part in $nonEmpty){
+    $value=$part.Trim().Trim('"')
+    $key=$value.Replace('/','\').TrimEnd('\').ToLowerInvariant()
+    if($keys.ContainsKey($key)){$duplicates++}else{$keys[$key]=$true}
+    if([IO.Path]::IsPathRooted($value)-and -not $value.Contains('%')-and -not (Test-Path -LiteralPath $value -PathType Container)){$missing++}
+  }
+  [pscustomobject]@{entryCount=$nonEmpty.Count;emptyEntries=[math]::Max(0,$raw.Count-$nonEmpty.Count);duplicateEntries=$duplicates;missingAbsoluteDirectories=$missing}
+}
+$userPath=(Get-ItemProperty -LiteralPath 'HKCU:\Environment' -Name Path -ErrorAction SilentlyContinue).Path
+$machinePath=(Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment' -Name Path -ErrorAction SilentlyContinue).Path
+$userStats=Get-UCodePathStats $userPath
+$machineStats=Get-UCodePathStats $machinePath
+[pscustomobject]@{
+  pathEntries=$parts
+  pathEntryCount=$parts.Count
+  userPathEntryCount=$userStats.entryCount
+  userPathEmptyEntries=$userStats.emptyEntries
+  userPathDuplicateEntries=$userStats.duplicateEntries
+  userPathMissingAbsoluteDirectories=$userStats.missingAbsoluteDirectories
+  machinePathEntryCount=$machineStats.entryCount
+  machinePathEmptyEntries=$machineStats.emptyEntries
+  machinePathDuplicateEntries=$machineStats.duplicateEntries
+  machinePathMissingAbsoluteDirectories=$machineStats.missingAbsoluteDirectories
+  temp=$env:TEMP
+  userProfilePresent=[bool]$env:USERPROFILE
+  processorArchitecture=$env:PROCESSOR_ARCHITECTURE
+}|ConvertTo-Json -Compress -Depth 3
+"#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -223,7 +259,7 @@ fn bounded_utf8(bytes: &[u8]) -> String {
 fn probe_script(tool_id: &str) -> Option<&'static str> {
     match tool_id {
         "system.inventory" => Some("$os=Get-CimInstance Win32_OperatingSystem; $cs=Get-CimInstance Win32_ComputerSystem; [pscustomobject]@{caption=$os.Caption;version=$os.Version;build=$os.BuildNumber;architecture=$os.OSArchitecture;computer=$env:COMPUTERNAME;manufacturer=$cs.Manufacturer;model=$cs.Model;memoryBytes=[int64]$cs.TotalPhysicalMemory;uptimeSeconds=[int64]((Get-Date)-$os.LastBootUpTime).TotalSeconds}|ConvertTo-Json -Compress"),
-        "system.environment.inspect" => Some("$parts=@($env:Path -split ';'|Where-Object{$_}|Select-Object -First 80); $userPath=(Get-ItemProperty -LiteralPath 'HKCU:\\Environment' -Name Path -ErrorAction SilentlyContinue).Path; $userParts=@($userPath -split ';'); $nonEmpty=@($userParts|Where-Object{$_.Trim()}); $keys=@{}; $duplicates=0; $missing=0; foreach($part in $nonEmpty){$value=$part.Trim().Trim('\\\"');$key=$value.Replace('/','\\').TrimEnd('\\').ToLowerInvariant();if($keys.ContainsKey($key)){$duplicates++}else{$keys[$key]=$true};if([IO.Path]::IsPathRooted($value)-and -not $value.Contains('%')-and -not (Test-Path -LiteralPath $value -PathType Container)){$missing++}}; [pscustomobject]@{pathEntries=$parts;pathEntryCount=$parts.Count;userPath=$userPath;userPathEntryCount=$nonEmpty.Count;userPathEmptyEntries=[math]::Max(0,$userParts.Count-$nonEmpty.Count);userPathDuplicateEntries=$duplicates;userPathMissingAbsoluteDirectories=$missing;temp=$env:TEMP;userProfilePresent=[bool]$env:USERPROFILE;processorArchitecture=$env:PROCESSOR_ARCHITECTURE}|ConvertTo-Json -Compress -Depth 3"),
+        "system.environment.inspect" => Some(ENVIRONMENT_INSPECT_SCRIPT),
         "system.process.list" => Some("@(Get-Process|Sort-Object CPU -Descending|Select-Object -First 25 Name,Id,CPU,WorkingSet64)|ConvertTo-Json -Compress"),
         "system.service.inspect" => Some("@(Get-CimInstance Win32_Service|Where-Object{$_.StartMode -eq 'Auto' -and $_.State -ne 'Running'}|Select-Object -First 40 Name,DisplayName,State,StartMode,ExitCode)|ConvertTo-Json -Compress"),
         "system.eventlog.query" => Some("$start=(Get-Date).AddHours(-24); $queryErrors=@(); $events=@(Get-WinEvent -FilterHashtable @{LogName=@('System','Application');Level=1,2;StartTime=$start} -MaxEvents 30 -ErrorAction SilentlyContinue -ErrorVariable +queryErrors); $realErrors=@($queryErrors|Where-Object{$_.FullyQualifiedErrorId -notmatch 'NoMatchingEventsFound'}); if($realErrors.Count -gt 0){throw $realErrors[0]}; @($events|ForEach-Object{[pscustomobject]@{timeCreated=$_.TimeCreated.ToUniversalTime().ToString('o');logName=$_.LogName;level=$_.LevelDisplayName;eventId=$_.Id;provider=$_.ProviderName;recordId=$_.RecordId}})|ConvertTo-Json -Compress -Depth 3"),
@@ -811,6 +847,23 @@ fn analyze_system(
             .sum::<u64>()
         })
         .unwrap_or(0);
+    let machine_path_issues = environment
+        .map(|item| {
+            [
+                "machinePathEmptyEntries",
+                "machinePathDuplicateEntries",
+                "machinePathMissingAbsoluteDirectories",
+            ]
+            .iter()
+            .map(|key| {
+                item.structured
+                    .get(key)
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+            })
+            .sum::<u64>()
+        })
+        .unwrap_or(0);
     let mut hypotheses = Vec::new();
     let mut edges = Vec::new();
     let mut add = |id: &str,
@@ -856,6 +909,15 @@ fn analyze_system(
             },
             0.2,
             services,
+        );
+    }
+    if observed(environment) && machine_path_issues > 0 {
+        add(
+            "system.machine_path_invalid",
+            &format!("机器 PATH 有 {machine_path_issues} 个可确定清理的问题；修复需要 R3/UAC"),
+            HypothesisState::Supported,
+            0.94,
+            environment,
         );
     }
     if observed(environment) && user_path_issues > 0 {
@@ -1037,6 +1099,16 @@ mod tests {
             .get("userPathMissingAbsoluteDirectories")
             .and_then(Value::as_u64)
             .is_some());
+        assert!(value
+            .get("machinePathEntryCount")
+            .and_then(Value::as_u64)
+            .is_some());
+        assert!(value
+            .get("machinePathDuplicateEntries")
+            .and_then(Value::as_u64)
+            .is_some());
+        assert!(value.get("userPath").is_none());
+        assert!(value.get("machinePath").is_none());
     }
 
     #[cfg(target_os = "windows")]

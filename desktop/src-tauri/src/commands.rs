@@ -5230,6 +5230,16 @@ fn requests_rescue_repair(value: &str) -> bool {
     .any(|action| actionable.contains(action))
 }
 
+fn requests_machine_path_repair(value: &str) -> bool {
+    if !requests_rescue_repair(value) {
+        return false;
+    }
+    let actionable = without_negated_desktop_actions(&value.to_lowercase());
+    ["机器 path", "系统 path", "machine path", "hklm\\", "hklm/"]
+        .iter()
+        .any(|scope| actionable.contains(scope))
+}
+
 fn mentions_project_file(value: &str) -> bool {
     [
         ".md", ".txt", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".py", ".rs", ".go", ".java",
@@ -5356,7 +5366,13 @@ fn run_executor_ticket(
                 .filter(|item| item.tool_id == "system.environment.inspect")
                 .map(|item| item.id.clone())
                 .collect::<Vec<_>>();
-            match rescue_repairs.propose_user_path_normalization(ticket_id, evidence_ids) {
+            let machine_scope = requests_machine_path_repair(request_text);
+            let proposal = if machine_scope {
+                rescue_repairs.propose_machine_path_normalization(ticket_id, evidence_ids)
+            } else {
+                rescue_repairs.propose_user_path_normalization(ticket_id, evidence_ids)
+            };
+            match proposal {
                 Ok(Some(proposal)) => append_runtime_event(
                     storage,
                     ticket_id,
@@ -5369,7 +5385,7 @@ fn run_executor_ticket(
                     storage,
                     ticket_id,
                     "rescue.repair.unavailable",
-                    json!({ "operationId": "system.user_path.normalize", "error": error }),
+                    json!({ "operationId": if machine_scope { "system.machine_path.normalize" } else { "system.user_path.normalize" }, "error": error }),
                     app,
                 ),
             }
@@ -7004,6 +7020,16 @@ mod tests {
             "检查事件日志，只读取有界元数据，不要修改系统"
         ));
         assert!(!requests_rescue_repair("不要修复 PATH，只检查并解释问题"));
+        assert!(requests_machine_path_repair(
+            "请修复机器 PATH，审批后再请求 UAC"
+        ));
+        assert!(requests_machine_path_repair(
+            "fix machine path after explicit approval"
+        ));
+        assert!(!requests_machine_path_repair("请修复当前用户 PATH"));
+        assert!(!requests_machine_path_repair(
+            "只检查机器 PATH，不要修复系统"
+        ));
     }
 
     #[test]

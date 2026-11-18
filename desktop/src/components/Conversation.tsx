@@ -735,7 +735,9 @@ function rescueRepairFrom(events: RuntimeEvent[]): VisibleRescueRepair | null {
   const value = proposed?.payload.proposal;
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const proposal = value as unknown as RescueRepairProposal;
-  if (proposal.schemaVersion !== 1 || proposal.risk !== "r2" || proposal.operationId !== "system.user_path.normalize" || typeof proposal.id !== "string") return null;
+  const knownOperation = (proposal.risk === "r2" && proposal.operationId === "system.user_path.normalize")
+    || (proposal.risk === "r3" && proposal.operationId === "system.machine_path.normalize");
+  if (proposal.schemaVersion !== 1 || !knownOperation || typeof proposal.id !== "string") return null;
   const result = [...events].reverse().find((event) => String(event.payload.proposalId ?? "") === proposal.id && event.eventType.startsWith("rescue.repair.") && event.eventType !== "rescue.repair.proposed");
   const recordValue = result?.payload.record;
   const record = recordValue && typeof recordValue === "object" && !Array.isArray(recordValue) ? recordValue as unknown as RescueRepairRecord : null;
@@ -745,17 +747,18 @@ function rescueRepairFrom(events: RuntimeEvent[]): VisibleRescueRepair | null {
 function RescueRepairCard({ value, busy, onResolve, onRollback }: { value: VisibleRescueRepair; busy: boolean; onResolve: (proposalId: string, approved: boolean) => Promise<void>; onRollback: (proposalId: string) => Promise<void> }) {
   const [confirmRollback, setConfirmRollback] = useState(false);
   const proposal = value.proposal;
+  const elevated = proposal.risk === "r3";
   const status = proposal.status;
   const removed = Array.isArray(proposal.normalizedArguments.removedEntries) ? proposal.normalizedArguments.removedEntries : [];
-  const statusCopy = status === "awaiting_approval" ? "等待批准" : status === "verified" ? "写入已验证" : status === "rolled_back" ? "已精确回滚" : status === "repaired_unverified" ? "验证未通过" : status === "rollback_failed" ? "回滚失败" : "已安全停止";
+  const statusCopy = status === "awaiting_approval" ? "等待批准" : status === "verified" ? "写入已验证" : status === "rolled_back" ? "已精确回滚" : status === "repaired_unverified" ? "写入状态未完全验证" : status === "rollback_failed" ? "回滚失败" : "已安全停止";
   return <article className={`rescue-repair-card ${status}`} aria-label="Rescue 可逆修复">
-    <header><span>R2</span><div><b>规范化当前用户 PATH</b><small>{statusCopy} · 不需要管理员权限</small></div></header>
-    <p>{value.record?.detail ?? "检测到可以确定清理的空项、重复项或不存在目录。模型无权执行；只有本地审批执行器能写入。"}</p>
+    <header><span>{elevated ? "R3" : "R2"}</span><div><b>{elevated ? "规范化机器 PATH" : "规范化当前用户 PATH"}</b><small>{statusCopy} · {elevated ? "需要 Windows UAC 管理员确认" : "不需要管理员权限"}</small></div></header>
+    <p>{value.record?.detail ?? (elevated ? "检测到机器 PATH 中可以确定清理的问题。模型无权提权；批准后只启动一次短生命周期白名单 helper。" : "检测到可以确定清理的空项、重复项或不存在目录。模型无权执行；只有本地审批执行器能写入。")}</p>
     <dl><div><dt>目标</dt><dd><code>{proposal.target}</code></dd></div><div><dt>验证</dt><dd>{proposal.verificationProbe}</dd></div><div><dt>回滚</dt><dd>{proposal.rollbackContract}</dd></div></dl>
     {removed.length > 0 && <details><summary>查看 {removed.length} 个拟清理项</summary><ul>{removed.slice(0, 12).map((item, index) => <li key={`${item}-${index}`}><code>{item}</code></li>)}</ul></details>}
     <div className="rescue-repair-digests"><span>before <code>{proposal.beforeDigest.slice(0, 10)}</code></span><span>after <code>{proposal.expectedAfterDigest.slice(0, 10)}</code></span></div>
-    {status === "awaiting_approval" && <div className="approval-actions"><button className="quiet" disabled={busy} onClick={() => void onResolve(proposal.id, false)}>暂不修复</button><button className="approve" disabled={busy} onClick={() => void onResolve(proposal.id, true)}>{busy ? "正在核验…" : "批准、应用并验证"}</button></div>}
-    {status === "verified" && (confirmRollback ? <div className="rollback-confirm"><p>仅当当前 PATH 仍等于应用后摘要时才会恢复；后续用户修改不会被覆盖。</p><button className="quiet" onClick={() => setConfirmRollback(false)}>取消</button><button className="danger" disabled={busy} onClick={() => void onRollback(proposal.id).finally(() => setConfirmRollback(false))}>确认回滚</button></div> : <button className="quiet rescue-rollback" disabled={busy} onClick={() => setConfirmRollback(true)}>回滚本次系统修改</button>)}
+    {status === "awaiting_approval" && <div className="approval-actions"><button className="quiet" disabled={busy} onClick={() => void onResolve(proposal.id, false)}>暂不修复</button><button className="approve" disabled={busy} onClick={() => void onResolve(proposal.id, true)}>{busy ? "正在核验…" : elevated ? "批准并打开 UAC" : "批准、应用并验证"}</button></div>}
+    {(status === "verified" || status === "repaired_unverified") && (confirmRollback ? <div className="rollback-confirm"><p>仅当当前 PATH 仍等于应用后摘要时才会恢复；后续用户修改不会被覆盖。{elevated ? "回滚会再次打开 UAC。" : ""}</p><button className="quiet" onClick={() => setConfirmRollback(false)}>取消</button><button className="danger" disabled={busy} onClick={() => void onRollback(proposal.id).finally(() => setConfirmRollback(false))}>{elevated ? "确认并打开 UAC" : "确认回滚"}</button></div> : <button className="quiet rescue-rollback" disabled={busy} onClick={() => setConfirmRollback(true)}>{status === "repaired_unverified" ? "按快照安全回滚" : "回滚本次系统修改"}</button>)}
   </article>;
 }
 

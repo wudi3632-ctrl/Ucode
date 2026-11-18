@@ -1,3 +1,8 @@
+use crate::rescue_elevated::{
+    DisabledElevatedRepairExecutor, ElevatedAction, ElevatedRepairExecutor,
+    WindowsElevatedRepairExecutor, MACHINE_PATH_OPERATION, MACHINE_PATH_OPERATION_VERSION,
+    MACHINE_PATH_TARGET,
+};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -46,11 +51,11 @@ pub fn operation_registry() -> &'static [RepairOperationDefinition] {
             enabled: false,
         },
         RepairOperationDefinition {
-            id: "system.machine_path.normalize",
-            version: 1,
+            id: MACHINE_PATH_OPERATION,
+            version: MACHINE_PATH_OPERATION_VERSION,
             risk: "r3",
             authority: "elevated_helper",
-            enabled: false,
+            enabled: true,
         },
     ];
     &OPERATIONS
@@ -192,21 +197,35 @@ impl RepairHost for WindowsRepairHost {
     }
 }
 
-pub struct RepairService<H: RepairHost = WindowsRepairHost> {
+pub struct RepairService<
+    H: RepairHost = WindowsRepairHost,
+    E: ElevatedRepairExecutor = WindowsElevatedRepairExecutor,
+> {
     root: PathBuf,
     host: H,
+    elevated: E,
 }
 
-impl RepairService<WindowsRepairHost> {
+impl RepairService<WindowsRepairHost, WindowsElevatedRepairExecutor> {
     pub fn new(root: PathBuf) -> Result<Self, String> {
-        Self::with_host(root, WindowsRepairHost)
+        Self::with_hosts(root, WindowsRepairHost, WindowsElevatedRepairExecutor)
     }
 }
 
-impl<H: RepairHost> RepairService<H> {
+impl<H: RepairHost> RepairService<H, DisabledElevatedRepairExecutor> {
     pub fn with_host(root: PathBuf, host: H) -> Result<Self, String> {
+        Self::with_hosts(root, host, DisabledElevatedRepairExecutor)
+    }
+}
+
+impl<H: RepairHost, E: ElevatedRepairExecutor> RepairService<H, E> {
+    pub fn with_hosts(root: PathBuf, host: H, elevated: E) -> Result<Self, String> {
         fs::create_dir_all(&root).map_err(|error| format!("无法创建修复证据目录：{error}"))?;
-        Ok(Self { root, host })
+        Ok(Self {
+            root,
+            host,
+            elevated,
+        })
     }
 
     pub fn propose_user_path_normalization(
@@ -256,6 +275,56 @@ impl<H: RepairHost> RepairService<H> {
         Ok(Some(proposal))
     }
 
+    pub fn propose_machine_path_normalization(
+        &self,
+        ticket_id: &str,
+        evidence_ids: Vec<String>,
+    ) -> Result<Option<RepairProposal>, String> {
+        let before = self.elevated.read_machine_path()?;
+        let (after, removed) = normalize_user_path(&before);
+        if before == after {
+            return Ok(None);
+        }
+        let now = Utc::now();
+        let mut proposal = RepairProposal {
+            schema_version: REPAIR_SCHEMA_VERSION,
+            id: format!("repair-{}", Uuid::new_v4()),
+            ticket_id: ticket_id.into(),
+            operation_id: MACHINE_PATH_OPERATION.into(),
+            operation_version: MACHINE_PATH_OPERATION_VERSION,
+            risk: "r3".into(),
+            target: MACHINE_PATH_TARGET.into(),
+            normalized_arguments: json!({ "after": after, "removedEntries": removed }),
+            evidence_ids,
+            prerequisites: vec![
+                "机器 PATH 与诊断及审批时摘要一致".into(),
+                "用户在 Windows 安全桌面明确批准本次管理员操作".into(),
+            ],
+            snapshot_plan: "在便携证据目录保存原值、注册表值类型和 SHA-256；helper 写入前再次核对"
+                .into(),
+            expected_postcondition: "机器 PATH 不含空项、重复项和明确不存在的绝对目录".into(),
+            verification_probe:
+                "管理员 helper 写入后重读 HKLM PATH，未提权宿主再独立重读并核对摘要".into(),
+            rollback_contract: "回滚需要再次确认 UAC；仅当当前值仍等于本次应用后摘要时恢复原值"
+                .into(),
+            before_digest: digest_json(&before),
+            expected_after_digest: digest_json(&after),
+            nonce: Uuid::new_v4().to_string(),
+            created_at: now,
+            expires_at: now + Duration::minutes(10),
+            status: RepairStatus::AwaitingApproval,
+            proposal_digest: String::new(),
+        };
+        proposal.proposal_digest = proposal_digest(&proposal);
+        self.save_record(&RepairRecord {
+            proposal: proposal.clone(),
+            snapshot: None,
+            detail: "等待用户审批；应用时 Windows 将显示 UAC 管理员确认".into(),
+            updated_at: now,
+        })?;
+        Ok(Some(proposal))
+    }
+
     pub fn reject(&self, proposal_id: &str, ticket_id: &str) -> Result<RepairRecord, String> {
         let mut record = self.load_record(proposal_id)?;
         self.validate_identity(&record.proposal, ticket_id)?;
@@ -272,6 +341,9 @@ impl<H: RepairHost> RepairService<H> {
     pub fn apply(&self, proposal_id: &str, ticket_id: &str) -> Result<RepairRecord, String> {
         let mut record = self.load_record(proposal_id)?;
         self.validate_for_apply(&record.proposal, ticket_id)?;
+        if record.proposal.operation_id == MACHINE_PATH_OPERATION {
+            return self.apply_machine_path(record);
+        }
         let before = self.host.read_user_path()?;
         if digest_json(&before) != record.proposal.before_digest {
             return self.safe_stop(record, "审批前目标状态已经变化，已拒绝应用");
@@ -344,11 +416,146 @@ impl<H: RepairHost> RepairService<H> {
         Ok(record)
     }
 
+    fn apply_machine_path(&self, mut record: RepairRecord) -> Result<RepairRecord, String> {
+        let before = self.elevated.read_machine_path()?;
+        if digest_json(&before) != record.proposal.before_digest {
+            return self.safe_stop(record, "审批前机器 PATH 已经变化，已拒绝提权写入");
+        }
+        let after: UserPathState = serde_json::from_value(
+            record
+                .proposal
+                .normalized_arguments
+                .get("after")
+                .cloned()
+                .ok_or("R3 修复参数缺少 after")?,
+        )
+        .map_err(|_| "R3 修复参数格式无效".to_string())?;
+        if digest_json(&after) != record.proposal.expected_after_digest {
+            return self.safe_stop(record, "R3 修复参数摘要不匹配，已拒绝提权");
+        }
+
+        record.proposal.status = RepairStatus::Applying;
+        record.detail = "等待 Windows UAC；批准后短生命周期 helper 将应用机器 PATH 修复".into();
+        record.updated_at = Utc::now();
+        self.save_record(&record)?;
+        let mut snapshot = RepairSnapshot {
+            schema_version: REPAIR_SCHEMA_VERSION,
+            proposal_id: record.proposal.id.clone(),
+            operation_id: record.proposal.operation_id.clone(),
+            operation_version: record.proposal.operation_version,
+            target: record.proposal.target.clone(),
+            before_state: serde_json::to_value(&before).map_err(|error| error.to_string())?,
+            before_digest: digest_json(&before),
+            after_state: serde_json::to_value(&after).map_err(|error| error.to_string())?,
+            after_digest: digest_json(&after),
+            snapshot_digest: String::new(),
+            applied_at: Utc::now(),
+            verified_at: None,
+        };
+        snapshot.snapshot_digest = snapshot_digest(&snapshot);
+        record.snapshot = Some(snapshot.clone());
+        self.save_record(&record)?;
+
+        let observed = match self.elevated.mutate_machine_path(
+            &self.root,
+            &record.proposal,
+            &before,
+            &after,
+            ElevatedAction::Apply,
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                return self.reconcile_machine_path_failure(record, &before, &after, &error)
+            }
+        };
+        record.proposal.status = RepairStatus::RepairedUnverified;
+        record.detail = "管理员 helper 已返回，未提权宿主正在独立重读验证".into();
+        record.updated_at = Utc::now();
+        self.save_record(&record)?;
+        let independently_observed = match self.elevated.read_machine_path() {
+            Ok(value) => value,
+            Err(error) => {
+                record.detail = format!(
+                    "管理员 helper 已返回目标状态，但未提权宿主无法完成独立重读：{error}；修改保持未验证，可在当前摘要仍匹配时回滚"
+                );
+                record.updated_at = Utc::now();
+                self.save_record(&record)?;
+                return Ok(record);
+            }
+        };
+        if digest_json(&observed) != snapshot.after_digest
+            || digest_json(&independently_observed) != snapshot.after_digest
+        {
+            record.detail = "R3 修复返回后独立验证失败；不能声明完成".into();
+            record.updated_at = Utc::now();
+            self.save_record(&record)?;
+            return Ok(record);
+        }
+        if let Some(value) = record.snapshot.as_mut() {
+            value.verified_at = Some(Utc::now());
+            value.snapshot_digest = snapshot_digest(value);
+        }
+        record.proposal.status = RepairStatus::Verified;
+        record.detail =
+            "机器 PATH 已由管理员 helper 写入，并通过 helper 与未提权宿主双重重读验证".into();
+        record.updated_at = Utc::now();
+        self.save_record(&record)?;
+        Ok(record)
+    }
+
+    fn reconcile_machine_path_failure(
+        &self,
+        mut record: RepairRecord,
+        before: &UserPathState,
+        after: &UserPathState,
+        helper_error: &str,
+    ) -> Result<RepairRecord, String> {
+        match self.elevated.read_machine_path() {
+            Ok(current) if digest_json(&current) == digest_json(before) => self.safe_stop(
+                record,
+                &format!("R3 helper 未完成修复，机器 PATH 仍为原摘要：{helper_error}"),
+            ),
+            Ok(current) if digest_json(&current) == digest_json(after) => {
+                record.proposal.status = RepairStatus::RepairedUnverified;
+                record.detail = format!(
+                    "R3 helper 响应未完成，但未提权复核发现机器 PATH 已等于目标摘要：{helper_error}；未声明双重验证完成，可安全回滚"
+                );
+                record.updated_at = Utc::now();
+                self.save_record(&record)?;
+                Ok(record)
+            }
+            Ok(_) => {
+                record.proposal.status = RepairStatus::RepairedUnverified;
+                record.detail = format!(
+                    "R3 helper 响应未完成，且机器 PATH 与审批前后摘要都不一致：{helper_error}；已停止自动操作，请人工检查"
+                );
+                record.updated_at = Utc::now();
+                self.save_record(&record)?;
+                Ok(record)
+            }
+            Err(read_error) => {
+                record.proposal.status = RepairStatus::RepairedUnverified;
+                record.detail = format!(
+                    "R3 helper 响应未完成，且无法复核机器 PATH：{helper_error}；复核错误：{read_error}；未声明系统未修改"
+                );
+                record.updated_at = Utc::now();
+                self.save_record(&record)?;
+                Ok(record)
+            }
+        }
+    }
+
     pub fn rollback(&self, proposal_id: &str, ticket_id: &str) -> Result<RepairRecord, String> {
         let mut record = self.load_record(proposal_id)?;
         self.validate_identity(&record.proposal, ticket_id)?;
-        if record.proposal.status != RepairStatus::Verified {
-            return Err("只有已验证的修复可以回滚".into());
+        if !matches!(
+            record.proposal.status,
+            RepairStatus::Verified | RepairStatus::RepairedUnverified
+        ) {
+            return Err("只有已写入且保留完整快照的修复可以回滚".into());
+        }
+        if record.proposal.operation_id == MACHINE_PATH_OPERATION {
+            return self.rollback_machine_path(record);
         }
         let snapshot = record.snapshot.clone().ok_or("修复快照不存在")?;
         if snapshot.snapshot_digest != snapshot_digest(&snapshot) {
@@ -379,6 +586,48 @@ impl<H: RepairHost> RepairService<H> {
         Ok(record)
     }
 
+    fn rollback_machine_path(&self, mut record: RepairRecord) -> Result<RepairRecord, String> {
+        let snapshot = record.snapshot.clone().ok_or("R3 修复快照不存在")?;
+        if snapshot.snapshot_digest != snapshot_digest(&snapshot) {
+            return Err("R3 修复快照摘要无效，已拒绝回滚".into());
+        }
+        let current = self.elevated.read_machine_path()?;
+        if digest_json(&current) != snapshot.after_digest {
+            return self.safe_stop(record, "机器 PATH 在修复后又被修改，已拒绝覆盖后续更改");
+        }
+        let before: UserPathState = serde_json::from_value(snapshot.before_state.clone())
+            .map_err(|_| "R3 快照 before state 无效".to_string())?;
+        let observed = match self.elevated.mutate_machine_path(
+            &self.root,
+            &record.proposal,
+            &current,
+            &before,
+            ElevatedAction::Rollback,
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                record.proposal.status = RepairStatus::RollbackFailed;
+                record.detail = format!("R3 helper 回滚失败：{error}");
+                record.updated_at = Utc::now();
+                self.save_record(&record)?;
+                return Ok(record);
+            }
+        };
+        let independently_observed = self.elevated.read_machine_path()?;
+        if digest_json(&observed) != snapshot.before_digest
+            || digest_json(&independently_observed) != snapshot.before_digest
+        {
+            record.proposal.status = RepairStatus::RollbackFailed;
+            record.detail = "R3 回滚后独立重读摘要与原始快照不一致".into();
+        } else {
+            record.proposal.status = RepairStatus::RolledBack;
+            record.detail = "机器 PATH 已通过第二次 UAC 确认恢复到审批前精确状态".into();
+        }
+        record.updated_at = Utc::now();
+        self.save_record(&record)?;
+        Ok(record)
+    }
+
     fn safe_stop(&self, mut record: RepairRecord, detail: &str) -> Result<RepairRecord, String> {
         record.proposal.status = RepairStatus::SafeStop;
         record.detail = detail.into();
@@ -395,16 +644,20 @@ impl<H: RepairHost> RepairService<H> {
             operation.id == proposal.operation_id
                 && operation.version == proposal.operation_version
                 && operation.enabled
-                && operation.risk == "r2"
+                && operation.risk == proposal.risk
         });
-        if proposal.schema_version != REPAIR_SCHEMA_VERSION
-            || registered.is_none()
-            || proposal.operation_id != USER_PATH_OPERATION
-            || proposal.operation_version != USER_PATH_OPERATION_VERSION
-            || proposal.risk != "r2"
-            || proposal.target != USER_ENVIRONMENT_TARGET
+        let known_target = match proposal.operation_id.as_str() {
+            USER_PATH_OPERATION => {
+                proposal.risk == "r2" && proposal.target == USER_ENVIRONMENT_TARGET
+            }
+            MACHINE_PATH_OPERATION => {
+                proposal.risk == "r3" && proposal.target == MACHINE_PATH_TARGET
+            }
+            _ => false,
+        };
+        if proposal.schema_version != REPAIR_SCHEMA_VERSION || registered.is_none() || !known_target
         {
-            return Err("未知、过期或非 R2 修复操作，已拒绝执行".into());
+            return Err("未知、过期或未启用的 Rescue 修复操作，已拒绝执行".into());
         }
         if proposal.proposal_digest != proposal_digest(proposal) {
             return Err("修复方案摘要无效，已拒绝执行".into());
@@ -567,7 +820,60 @@ mod tests {
         }
     }
 
-    fn service(value: &str) -> (TempDir, RepairService<FakeHost>) {
+    struct FakeElevatedExecutor {
+        state: Mutex<UserPathState>,
+        calls: Mutex<Vec<ElevatedAction>>,
+        fail_after_write: Mutex<bool>,
+    }
+
+    impl FakeElevatedExecutor {
+        fn new(value: &str) -> Self {
+            Self {
+                state: Mutex::new(UserPathState {
+                    present: true,
+                    value: value.into(),
+                    expandable: true,
+                }),
+                calls: Mutex::new(Vec::new()),
+                fail_after_write: Mutex::new(false),
+            }
+        }
+    }
+
+    impl ElevatedRepairExecutor for FakeElevatedExecutor {
+        fn read_machine_path(&self) -> Result<UserPathState, String> {
+            Ok(self.state.lock().unwrap().clone())
+        }
+
+        fn mutate_machine_path(
+            &self,
+            _root: &Path,
+            proposal: &RepairProposal,
+            expected_current: &UserPathState,
+            desired: &UserPathState,
+            action: ElevatedAction,
+        ) -> Result<UserPathState, String> {
+            assert_eq!(proposal.operation_id, MACHINE_PATH_OPERATION);
+            let mut state = self.state.lock().unwrap();
+            if *state != *expected_current {
+                return Err("stale".into());
+            }
+            *state = desired.clone();
+            self.calls.lock().unwrap().push(action);
+            if *self.fail_after_write.lock().unwrap() {
+                *self.fail_after_write.lock().unwrap() = false;
+                return Err("injected response loss".into());
+            }
+            Ok(state.clone())
+        }
+    }
+
+    fn service(
+        value: &str,
+    ) -> (
+        TempDir,
+        RepairService<FakeHost, DisabledElevatedRepairExecutor>,
+    ) {
         let dir = TempDir::new().unwrap();
         let service =
             RepairService::with_host(dir.path().to_path_buf(), FakeHost::new(value)).unwrap();
@@ -591,6 +897,73 @@ mod tests {
         assert_eq!(
             service.host.read_user_path().unwrap().value,
             r"C:\Windows;%USERPROFILE%\bin"
+        );
+    }
+
+    #[test]
+    fn machine_path_uses_r3_executor_and_requires_a_second_elevated_rollback() {
+        let dir = TempDir::new().unwrap();
+        let service = RepairService::with_hosts(
+            dir.path().to_path_buf(),
+            FakeHost::new(r"C:\Windows"),
+            FakeElevatedExecutor::new(r"C:\Windows;;C:\Windows"),
+        )
+        .unwrap();
+        let proposal = service
+            .propose_machine_path_normalization("ticket-r3", vec!["evidence-r3".into()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(proposal.risk, "r3");
+        assert_eq!(proposal.operation_id, MACHINE_PATH_OPERATION);
+        assert_eq!(service.elevated.calls.lock().unwrap().len(), 0);
+
+        let applied = service.apply(&proposal.id, "ticket-r3").unwrap();
+        assert_eq!(applied.proposal.status, RepairStatus::Verified);
+        assert_eq!(
+            service.elevated.read_machine_path().unwrap().value,
+            r"C:\Windows"
+        );
+        assert_eq!(
+            service.elevated.calls.lock().unwrap().as_slice(),
+            &[ElevatedAction::Apply]
+        );
+
+        let rolled_back = service.rollback(&proposal.id, "ticket-r3").unwrap();
+        assert_eq!(rolled_back.proposal.status, RepairStatus::RolledBack);
+        assert_eq!(
+            service.elevated.read_machine_path().unwrap().value,
+            r"C:\Windows;;C:\Windows"
+        );
+        assert_eq!(
+            service.elevated.calls.lock().unwrap().as_slice(),
+            &[ElevatedAction::Apply, ElevatedAction::Rollback]
+        );
+    }
+
+    #[test]
+    fn lost_helper_response_preserves_an_unverified_but_rollbackable_r3_state() {
+        let dir = TempDir::new().unwrap();
+        let service = RepairService::with_hosts(
+            dir.path().to_path_buf(),
+            FakeHost::new(r"C:\user"),
+            FakeElevatedExecutor::new(r"C:\Windows;C:\Windows"),
+        )
+        .unwrap();
+        let proposal = service
+            .propose_machine_path_normalization("ticket-r3-loss", vec!["evidence-r3".into()])
+            .unwrap()
+            .unwrap();
+        *service.elevated.fail_after_write.lock().unwrap() = true;
+
+        let applied = service.apply(&proposal.id, "ticket-r3-loss").unwrap();
+        assert_eq!(applied.proposal.status, RepairStatus::RepairedUnverified);
+        assert!(applied.detail.contains("已等于目标摘要"));
+
+        let rolled_back = service.rollback(&proposal.id, "ticket-r3-loss").unwrap();
+        assert_eq!(rolled_back.proposal.status, RepairStatus::RolledBack);
+        assert_eq!(
+            service.elevated.read_machine_path().unwrap().value,
+            r"C:\Windows;C:\Windows"
         );
     }
 
@@ -722,18 +1095,29 @@ mod tests {
     }
 
     #[test]
-    fn r3_and_disabled_operations_never_enter_the_r2_executor() {
+    fn operation_registry_separates_r2_r3_and_disabled_operations() {
         let enabled = operation_registry()
             .iter()
             .filter(|operation| operation.enabled)
             .collect::<Vec<_>>();
-        assert_eq!(enabled.len(), 1);
-        assert!(enabled.iter().all(|operation| operation.risk == "r2"));
+        assert_eq!(enabled.len(), 2);
+        assert_eq!(
+            enabled
+                .iter()
+                .filter(|operation| operation.risk == "r2")
+                .count(),
+            1
+        );
         assert!(operation_registry()
             .iter()
             .any(|operation| operation.id == "network.winhttp.reset"
                 && operation.risk == "r3"
                 && !operation.enabled));
+        assert!(operation_registry()
+            .iter()
+            .any(|operation| operation.id == MACHINE_PATH_OPERATION
+                && operation.risk == "r3"
+                && operation.enabled));
         assert!(operation_registry()
             .iter()
             .any(|operation| operation.id == "file.utf8.restore"

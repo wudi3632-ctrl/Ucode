@@ -229,7 +229,7 @@ export interface RescueRepairProposal {
   ticketId: string;
   operationId: string;
   operationVersion: number;
-  risk: "r2";
+  risk: "r2" | "r3";
   target: string;
   normalizedArguments: { after?: { value?: string }; removedEntries?: string[] };
   evidenceIds: string[];

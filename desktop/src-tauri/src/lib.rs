@@ -10,6 +10,7 @@ pub mod race;
 pub mod race_verifier;
 pub mod race_workspace;
 pub mod rescue;
+pub mod rescue_elevated;
 pub mod rescue_filesystem;
 pub mod rescue_probe;
 pub mod rescue_repair;

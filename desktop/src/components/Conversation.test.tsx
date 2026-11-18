@@ -681,6 +681,41 @@ describe("conversation timeline projection", () => {
     expect(screen.getByRole("button", { name: "回滚本次系统修改" })).toBeInTheDocument();
   });
 
+  it("labels an R3 machine PATH repair as a one-time UAC operation", async () => {
+    const proposal = {
+      schemaVersion: 1, id: "repair-r3", ticketId: ticket.id, operationId: "system.machine_path.normalize", operationVersion: 1, risk: "r3",
+      target: "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment\\Path", normalizedArguments: { after: { value: "C:\\Windows" }, removedEntries: ["C:\\Windows（重复）"] }, evidenceIds: ["evidence-r3"],
+      prerequisites: ["摘要一致", "UAC 明确批准"], snapshotPlan: "保存原值", expectedPostcondition: "机器 PATH 已规范化", verificationProbe: "helper 与宿主双重重读", rollbackContract: "第二次 UAC 后恢复",
+      beforeDigest: "d".repeat(64), expectedAfterDigest: "e".repeat(64), nonce: "nonce-r3", createdAt: "2026-11-10T00:00:00Z", expiresAt: "2026-11-10T00:10:00Z", status: "awaiting_approval", proposalDigest: "f".repeat(64),
+    };
+    const onResolve = vi.fn(async () => undefined);
+    const onRollback = vi.fn(async () => undefined);
+    const view = render(<Conversation
+      projectId="project-1" ticket={ticket} events={[event(1, "rescue.repair.proposed", { proposal })]} effect={null} receipt={null} appliedEffect={null} busy={false}
+      onSubmit={vi.fn()} onCancel={vi.fn()} onRetry={vi.fn()} onExport={vi.fn()} onBranch={vi.fn()} onApprove={vi.fn()} onReject={vi.fn()} onRollback={vi.fn()}
+      onResolveRescueRepair={onResolve} onRollbackRescueRepair={onRollback} onExportReceipt={vi.fn()} hasProject onOpenProject={vi.fn()} error={null}
+      sidebarOpen inspectorOpen={false} onToggleSidebar={vi.fn()} onToggleInspector={vi.fn()} providerStatus="ready" modelProvider="bundled" providerModel="" modelPerformance={null}
+    />);
+    const card = screen.getByRole("article", { name: "Rescue 可逆修复" });
+    expect(card).toHaveTextContent("R3");
+    expect(card).toHaveTextContent("规范化机器 PATH");
+    expect(card).toHaveTextContent("需要 Windows UAC 管理员确认");
+    expect(card).toHaveTextContent("短生命周期白名单 helper");
+    fireEvent.click(within(card).getByRole("button", { name: "批准并打开 UAC" }));
+    await waitFor(() => expect(onResolve).toHaveBeenCalledWith("repair-r3", true));
+
+    const unverified = { ...proposal, status: "repaired_unverified" };
+    view.rerender(<Conversation
+      projectId="project-1" ticket={ticket} events={[event(1, "rescue.repair.proposed", { proposal }), event(2, "rescue.repair.unverified", { proposalId: "repair-r3", record: { proposal: unverified, snapshot: {}, detail: "helper 响应丢失，但目标摘要已观察到", updatedAt: "2026-11-10T00:00:02Z" } })]} effect={null} receipt={null} appliedEffect={null} busy={false}
+      onSubmit={vi.fn()} onCancel={vi.fn()} onRetry={vi.fn()} onExport={vi.fn()} onBranch={vi.fn()} onApprove={vi.fn()} onReject={vi.fn()} onRollback={vi.fn()}
+      onResolveRescueRepair={onResolve} onRollbackRescueRepair={onRollback} onExportReceipt={vi.fn()} hasProject onOpenProject={vi.fn()} error={null}
+      sidebarOpen inspectorOpen={false} onToggleSidebar={vi.fn()} onToggleInspector={vi.fn()} providerStatus="ready" modelProvider="bundled" providerModel="" modelPerformance={null}
+    />);
+    expect(screen.getByText("写入状态未完全验证", { exact: false })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "按快照安全回滚" }));
+    expect(screen.getByText("回滚会再次打开 UAC。", { exact: false })).toBeInTheDocument();
+  });
+
   it("shows an exact one-time R1 network boundary and records the observed result", async () => {
     const proposal = {
       schemaVersion: 1, id: "probe-1", ticketId: ticket.id, toolId: "network.tcp.probe", toolVersion: 1, risk: "r1",
