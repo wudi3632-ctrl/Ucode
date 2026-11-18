@@ -77,7 +77,7 @@ pub struct RescueToolDefinition {
 }
 
 pub fn tool_registry() -> &'static [RescueToolDefinition] {
-    static TOOLS: [RescueToolDefinition; 12] = [
+    static TOOLS: [RescueToolDefinition; 13] = [
         RescueToolDefinition {
             id: "system.inventory",
             version: 1,
@@ -109,6 +109,14 @@ pub fn tool_registry() -> &'static [RescueToolDefinition] {
             risk: RiskClass::R0,
             authority: "read",
             description: "Inspect stopped automatic Windows services",
+        },
+        RescueToolDefinition {
+            id: "system.service.query",
+            version: 1,
+            domain: "system",
+            risk: RiskClass::R0,
+            authority: "read",
+            description: "Inspect one explicitly named Windows service and bounded dependencies",
         },
         RescueToolDefinition {
             id: "system.eventlog.query",
@@ -257,6 +265,8 @@ impl ProbeRunner for WindowsProbeRunner {
 
     fn run_with_arguments(&self, tool_id: &str, arguments: &Value) -> Result<ProbeOutput, String> {
         if let Some(result) = crate::rescue_filesystem::run(tool_id, arguments) {
+            result
+        } else if let Some(result) = crate::rescue_service::run(tool_id, arguments) {
             result
         } else {
             self.run(tool_id)
@@ -428,6 +438,9 @@ pub fn diagnose_with_runner(request: &str, runner: &dyn ProbeRunner) -> Diagnosi
         "system"
     };
     let mut probes = vec![("system.inventory".to_string(), Value::Null)];
+    let targeted_service = (domain == "system")
+        .then(|| crate::rescue_service::requested_probe(request))
+        .flatten();
     match domain {
         "network" => probes.extend(
             [
@@ -441,15 +454,19 @@ pub fn diagnose_with_runner(request: &str, runner: &dyn ProbeRunner) -> Diagnosi
         ),
         "filesystem" => probes.extend(crate::rescue_filesystem::requested_probes(request)),
         _ => {
-            probes.extend(
-                [
-                    "system.environment.inspect",
-                    "system.process.list",
-                    "system.service.inspect",
-                ]
-                .into_iter()
-                .map(|id| (id.to_string(), Value::Null)),
-            );
+            if let Some(probe) = targeted_service {
+                probes.push(probe);
+            } else {
+                probes.extend(
+                    [
+                        "system.environment.inspect",
+                        "system.process.list",
+                        "system.service.inspect",
+                    ]
+                    .into_iter()
+                    .map(|id| (id.to_string(), Value::Null)),
+                );
+            }
             if is_eventlog_request(request) {
                 probes.push(("system.eventlog.query".into(), Value::Null));
             }
@@ -466,7 +483,14 @@ pub fn diagnose_with_runner(request: &str, runner: &dyn ProbeRunner) -> Diagnosi
             let edges = edges_from_hypotheses(&hypotheses);
             (hypotheses, edges, next_probe)
         }
-        _ => analyze_system(&evidence),
+        _ => {
+            if let Some((hypotheses, next_probe)) = crate::rescue_service::analyze(&evidence) {
+                let edges = edges_from_hypotheses(&hypotheses);
+                (hypotheses, edges, next_probe)
+            } else {
+                analyze_system(&evidence)
+            }
+        }
     };
     let outcome = if hypotheses
         .iter()
@@ -496,7 +520,6 @@ fn is_eventlog_request(request: &str) -> bool {
         "系统日志",
         "应用日志",
         "event log",
-        "eventlog",
         "事件 id",
         "事件id",
     ]
@@ -595,6 +618,17 @@ fn summarize(tool_id: &str, value: &Value, exit_code: i32, stderr: &str) -> Stri
             }
         }
         "system.service.inspect" => format!("发现 {} 个未运行的自动服务", array_items(value).len()),
+        "system.service.query" => {
+            let name = value
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("未知服务");
+            let state = value
+                .get("state")
+                .and_then(Value::as_str)
+                .unwrap_or("Unknown");
+            format!("指定服务 {name} 当前状态为 {state}")
+        }
         "system.eventlog.query" => format!(
             "发现 {} 条最近 24 小时的严重或错误事件元数据",
             array_items(value).len()
@@ -1085,6 +1119,7 @@ mod tests {
         assert!(probe_script(tcp.id).is_none());
         for id in [
             "system.eventlog.query",
+            "system.service.query",
             "filesystem.hash",
             "filesystem.permissions.inspect",
         ] {
@@ -1257,6 +1292,80 @@ mod tests {
             .all(|item| matches!(item.state, EvidenceState::Unavailable)));
         assert!(matches!(report.outcome, DiagnosisOutcome::SafeStop));
         assert!(!report.mutation_performed);
+    }
+
+    #[test]
+    fn explicit_service_name_runs_one_bounded_query_and_drives_the_diagnosis() {
+        struct ServiceFixture;
+        impl ProbeRunner for ServiceFixture {
+            fn run(&self, tool_id: &str) -> Result<ProbeOutput, String> {
+                let value = match tool_id {
+                    "system.inventory" => json!({"caption":"Windows 11","build":"26100"}),
+                    "system.environment.inspect" => json!({"pathEntryCount":20}),
+                    "system.process.list" | "system.service.inspect" => json!([]),
+                    _ => return Err(format!("unexpected probe: {tool_id}")),
+                };
+                Ok(ProbeOutput {
+                    exit_code: 0,
+                    stdout: value.to_string(),
+                    stderr: String::new(),
+                })
+            }
+
+            fn run_with_arguments(
+                &self,
+                tool_id: &str,
+                arguments: &Value,
+            ) -> Result<ProbeOutput, String> {
+                if tool_id != "system.service.query" {
+                    return self.run(tool_id);
+                }
+                assert_eq!(arguments, &json!({"name":"Spooler"}));
+                Ok(ProbeOutput {
+                    exit_code: 0,
+                    stdout: json!({
+                        "name":"Spooler",
+                        "displayName":"Print Spooler",
+                        "state":"Stopped",
+                        "startMode":"Auto",
+                        "serviceType":272,
+                        "canStop":false,
+                        "dependencies":["RPCSS"],
+                        "dependents":[]
+                    })
+                    .to_string(),
+                    stderr: String::new(),
+                })
+            }
+        }
+
+        let report = diagnose_with_runner("服务名 Spooler 无法启动，请诊断", &ServiceFixture);
+        assert_eq!(report.evidence.len(), 2);
+        assert!(report.evidence.iter().all(|item| matches!(
+            item.tool_id.as_str(),
+            "system.inventory" | "system.service.query"
+        )));
+        let evidence = find_evidence(&report.evidence, "system.service.query").unwrap();
+        assert_eq!(evidence.structured["name"], "Spooler");
+        assert!(matches!(
+            hypothesis(&report, "system.requested_service_stopped").state,
+            HypothesisState::Supported
+        ));
+        assert!(report
+            .next_probe
+            .as_deref()
+            .unwrap()
+            .contains("不能仅凭状态自动启动"));
+        assert!(!report.mutation_performed);
+    }
+
+    #[test]
+    fn eventlog_service_name_does_not_trigger_a_generic_event_log_scan() {
+        assert!(!is_eventlog_request(
+            "服务名 EventLog 异常，请只诊断这个服务"
+        ));
+        assert!(is_eventlog_request("检查 Windows Event Log 中的错误事件"));
+        assert!(is_eventlog_request("检查 Windows 事件日志中的错误事件"));
     }
 
     #[test]

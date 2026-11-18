@@ -14,6 +14,7 @@ pub mod rescue_elevated;
 pub mod rescue_filesystem;
 pub mod rescue_probe;
 pub mod rescue_repair;
+pub mod rescue_service;
 pub mod skills;
 pub mod storage;
 pub mod superagent;
