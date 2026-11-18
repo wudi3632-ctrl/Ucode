@@ -242,6 +242,92 @@ describe("conversation timeline projection", () => {
     expect(document.body).not.toHaveTextContent("CPU 已用 0.0%");
   });
 
+  it("renders bounded power evidence for a charging battery", () => {
+    const events = [
+      event(1, "rescue.probe.completed", {
+        toolId: "system.power.inspect",
+        summary: "电源 已插电，电池 76%，正在充电",
+        evidenceId: "evidence-power",
+        structured: {
+          acLineStatus: "online",
+          batteryPresent: true,
+          charging: true,
+          critical: false,
+          batterySaver: false,
+          batteryPercent: 76,
+          estimatedRemainingSeconds: null,
+          lifetimeUnknown: true,
+          rawBatteryFlagUnknownBits: false,
+        },
+      }),
+      event(2, "rescue.diagnosis.ready", { outcome: "safe_stop", mutationPerformed: false }),
+      event(3, "delivery.ready", { content: "当前已插电并正在充电；没有修改电源计划。", route: "rescue" }),
+    ];
+    render(<Conversation
+      projectId="project-1" ticket={{ ...ticket, state: "running" }} events={events} effect={null} receipt={null} appliedEffect={null} busy
+      onSubmit={vi.fn()} onCancel={vi.fn()} onRetry={vi.fn()} onExport={vi.fn()} onBranch={vi.fn()}
+      onApprove={vi.fn()} onReject={vi.fn()} onRollback={vi.fn()} onExportReceipt={vi.fn()} hasProject onOpenProject={vi.fn()} error={null}
+      sidebarOpen inspectorOpen={false} onToggleSidebar={vi.fn()} onToggleInspector={vi.fn()}
+      providerStatus="ready" modelProvider="bundled" providerModel="" modelPerformance={null}
+    />);
+    fireEvent.click(screen.getByRole("button", { name: /已完成 2 项操作/ }));
+    expect(screen.getByText("电源 已插电 · 电池 76% · 正在充电")).toBeInTheDocument();
+    expect(document.body).not.toHaveTextContent("serialNumber");
+    expect(document.body).not.toHaveTextContent("powerPlanGuid");
+  });
+
+  it("renders no battery and unavailable power states without a fake zero percent", () => {
+    const noBatteryEvents = [
+      event(1, "rescue.probe.completed", {
+        toolId: "system.power.inspect",
+        summary: "电源 已插电，未检测到电池",
+        evidenceId: "evidence-power-desktop",
+        structured: {
+          acLineStatus: "online",
+          batteryPresent: false,
+          charging: null,
+          critical: null,
+          batterySaver: false,
+          batteryPercent: null,
+        },
+      }),
+      event(2, "rescue.diagnosis.ready", { outcome: "safe_stop", mutationPerformed: false }),
+      event(3, "delivery.ready", { content: "Windows 当前未检测到系统电池。", route: "rescue" }),
+    ];
+    const { unmount } = render(<Conversation
+      projectId="project-1" ticket={{ ...ticket, state: "running" }} events={noBatteryEvents} effect={null} receipt={null} appliedEffect={null} busy
+      onSubmit={vi.fn()} onCancel={vi.fn()} onRetry={vi.fn()} onExport={vi.fn()} onBranch={vi.fn()}
+      onApprove={vi.fn()} onReject={vi.fn()} onRollback={vi.fn()} onExportReceipt={vi.fn()} hasProject onOpenProject={vi.fn()} error={null}
+      sidebarOpen inspectorOpen={false} onToggleSidebar={vi.fn()} onToggleInspector={vi.fn()}
+      providerStatus="ready" modelProvider="bundled" providerModel="" modelPerformance={null}
+    />);
+    fireEvent.click(screen.getByRole("button", { name: /已完成 2 项操作/ }));
+    expect(screen.getByText("电源 已插电 · 未检测到电池")).toBeInTheDocument();
+    expect(document.body).not.toHaveTextContent("电池 0%");
+    unmount();
+
+    const unavailableEvents = [
+      event(1, "rescue.probe.completed", {
+        toolId: "system.power.inspect",
+        summary: "Windows 无法读取电源状态",
+        evidenceId: "evidence-power-missing",
+        structured: { error: "Windows 无法读取电源状态" },
+      }),
+      event(2, "rescue.diagnosis.ready", { outcome: "safe_stop", mutationPerformed: false }),
+      event(3, "delivery.ready", { content: "电源探针不可用；没有修改设置。", route: "rescue" }),
+    ];
+    render(<Conversation
+      projectId="project-1" ticket={{ ...ticket, state: "running" }} events={unavailableEvents} effect={null} receipt={null} appliedEffect={null} busy
+      onSubmit={vi.fn()} onCancel={vi.fn()} onRetry={vi.fn()} onExport={vi.fn()} onBranch={vi.fn()}
+      onApprove={vi.fn()} onReject={vi.fn()} onRollback={vi.fn()} onExportReceipt={vi.fn()} hasProject onOpenProject={vi.fn()} error={null}
+      sidebarOpen inspectorOpen={false} onToggleSidebar={vi.fn()} onToggleInspector={vi.fn()}
+      providerStatus="ready" modelProvider="bundled" providerModel="" modelPerformance={null}
+    />);
+    fireEvent.click(screen.getByRole("button", { name: /已完成 2 项操作/ }));
+    expect(screen.getByText("system.power.inspect · Windows 无法读取电源状态")).toBeInTheDocument();
+    expect(document.body).not.toHaveTextContent("电池 0%");
+  });
+
   it("describes a Rescue receipt as system evidence with no system mutation", () => {
     const receipt: EvidenceReceipt = {
       ticketId: ticket.id,

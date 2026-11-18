@@ -5365,7 +5365,7 @@ fn run_executor_ticket(
                     "toolId": evidence.tool_id,
                     "state": evidence.state,
                     "summary": evidence.summary,
-                    "structured": if matches!(evidence.tool_id.as_str(), "network.local_port.inspect" | "storage.volume.inspect" | "system.memory.inspect" | "system.cpu.inspect") { evidence.structured.clone() } else { json!(null) },
+                    "structured": if matches!(evidence.tool_id.as_str(), "network.local_port.inspect" | "storage.volume.inspect" | "system.memory.inspect" | "system.cpu.inspect" | "system.power.inspect") { evidence.structured.clone() } else { json!(null) },
                     "contentDigest": evidence.content_digest,
                     "elapsedMs": evidence.elapsed_ms,
                 }),
@@ -7122,6 +7122,18 @@ mod tests {
         );
         assert_eq!(
             classify_desktop_route("what is cpu usage", None),
+            DesktopRoute::Chat
+        );
+        assert_eq!(
+            classify_desktop_route("电池不充电，请读取当前真实状态", None),
+            DesktopRoute::Rescue
+        );
+        assert_eq!(
+            classify_desktop_route("battery not charging", None),
+            DesktopRoute::Rescue
+        );
+        assert_eq!(
+            classify_desktop_route("what is battery saver", None),
             DesktopRoute::Chat
         );
         assert_eq!(

@@ -77,7 +77,7 @@ pub struct RescueToolDefinition {
 }
 
 pub fn tool_registry() -> &'static [RescueToolDefinition] {
-    static TOOLS: [RescueToolDefinition; 17] = [
+    static TOOLS: [RescueToolDefinition; 18] = [
         RescueToolDefinition {
             id: "system.inventory",
             version: 1,
@@ -141,6 +141,14 @@ pub fn tool_registry() -> &'static [RescueToolDefinition] {
             risk: RiskClass::R0,
             authority: "read",
             description: "Sample global CPU pressure and bounded high-CPU processes",
+        },
+        RescueToolDefinition {
+            id: "system.power.inspect",
+            version: 1,
+            domain: "system",
+            risk: RiskClass::R0,
+            authority: "read",
+            description: "Inspect current AC, battery, charging and saver status",
         },
         RescueToolDefinition {
             id: "network.adapter.inspect",
@@ -308,6 +316,8 @@ impl ProbeRunner for WindowsProbeRunner {
             result
         } else if let Some(result) = crate::rescue_cpu::run(tool_id, arguments) {
             result
+        } else if let Some(result) = crate::rescue_power::run(tool_id, arguments) {
+            result
         } else {
             self.run(tool_id)
         }
@@ -406,6 +416,7 @@ pub struct DiagnosisReport {
 pub fn is_rescue_request(request: &str) -> bool {
     if crate::rescue_memory::is_memory_request(request)
         || crate::rescue_cpu::is_cpu_request(request)
+        || crate::rescue_power::is_power_request(request)
     {
         return true;
     }
@@ -511,6 +522,9 @@ pub fn diagnose_with_runner(request: &str, runner: &dyn ProbeRunner) -> Diagnosi
     let cpu_probe = (domain == "system")
         .then(|| crate::rescue_cpu::requested_probe(request))
         .flatten();
+    let power_probe = (domain == "system")
+        .then(|| crate::rescue_power::requested_probe(request))
+        .flatten();
     let targeted_service = (domain == "system")
         .then(|| crate::rescue_service::requested_probe(request))
         .flatten();
@@ -541,6 +555,8 @@ pub fn diagnose_with_runner(request: &str, runner: &dyn ProbeRunner) -> Diagnosi
             if let Some(probe) = cpu_probe {
                 probes.push(probe);
             } else if let Some(probe) = memory_probe {
+                probes.push(probe);
+            } else if let Some(probe) = power_probe {
                 probes.push(probe);
             } else if let Some(probe) = targeted_service {
                 probes.push(probe);
@@ -590,6 +606,9 @@ pub fn diagnose_with_runner(request: &str, runner: &dyn ProbeRunner) -> Diagnosi
                 (hypotheses, edges, next_probe)
             } else if let Some((hypotheses, next_probe)) = crate::rescue_memory::analyze(&evidence)
             {
+                let edges = edges_from_hypotheses(&hypotheses);
+                (hypotheses, edges, next_probe)
+            } else if let Some((hypotheses, next_probe)) = crate::rescue_power::analyze(&evidence) {
                 let edges = edges_from_hypotheses(&hypotheses);
                 (hypotheses, edges, next_probe)
             } else if let Some((hypotheses, next_probe)) = crate::rescue_service::analyze(&evidence)
@@ -781,6 +800,35 @@ fn summarize(tool_id: &str, value: &Value, exit_code: i32, stderr: &str) -> Stri
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
             format!("CPU 已用 {load:.1}%，采样 {window} ms")
+        }
+        "system.power.inspect" => {
+            let ac = value
+                .get("acLineStatus")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let present = value.get("batteryPresent").and_then(Value::as_bool);
+            let percent = value.get("batteryPercent").and_then(Value::as_u64);
+            let charging = value.get("charging").and_then(Value::as_bool);
+            let source = match ac {
+                "online" => "已插电",
+                "offline" => "使用电池",
+                _ => "供电来源未知",
+            };
+            match present {
+                Some(false) => format!("电源 {source}，未检测到电池"),
+                Some(true) => format!(
+                    "电源 {source}{}{}",
+                    percent
+                        .map(|value| format!("，电池 {value}%"))
+                        .unwrap_or_default(),
+                    if charging == Some(true) {
+                        "，正在充电"
+                    } else {
+                        ""
+                    }
+                ),
+                None => format!("电源 {source}，电池状态未知"),
+            }
         }
         "system.service.inspect" => format!("发现 {} 个未运行的自动服务", array_items(value).len()),
         "system.service.query" => {
@@ -1287,6 +1335,7 @@ mod tests {
             "system.service.query",
             "system.memory.inspect",
             "system.cpu.inspect",
+            "system.power.inspect",
             "network.local_port.inspect",
             "storage.volume.inspect",
             "filesystem.hash",
@@ -1643,6 +1692,49 @@ mod tests {
             HypothesisState::Supported
         ));
         assert!(report.next_probe.as_deref().unwrap().contains("没有结束"));
+        assert!(!report.mutation_performed);
+    }
+
+    #[test]
+    fn explicit_power_fault_runs_only_inventory_and_power_probe() {
+        struct PowerFixture;
+        impl ProbeRunner for PowerFixture {
+            fn run(&self, tool_id: &str) -> Result<ProbeOutput, String> {
+                let value = match tool_id {
+                    "system.inventory" => json!({"caption":"Windows 11","build":"26100"}),
+                    "system.power.inspect" => json!({
+                        "acLineStatus":"offline",
+                        "batteryPresent":true,
+                        "charging":false,
+                        "critical":true,
+                        "batterySaver":true,
+                        "batteryPercent":8,
+                        "estimatedRemainingSeconds":900,
+                        "lifetimeUnknown":false,
+                        "rawBatteryFlagUnknownBits":false
+                    }),
+                    _ => return Err(format!("unexpected probe: {tool_id}")),
+                };
+                Ok(ProbeOutput {
+                    exit_code: 0,
+                    stdout: value.to_string(),
+                    stderr: String::new(),
+                })
+            }
+        }
+
+        let report = diagnose_with_runner("电池快没电，请诊断但不要修改电源计划", &PowerFixture);
+        assert_eq!(report.domain, "system");
+        assert_eq!(report.evidence.len(), 2);
+        assert!(report.evidence.iter().all(|item| matches!(
+            item.tool_id.as_str(),
+            "system.inventory" | "system.power.inspect"
+        )));
+        assert!(matches!(
+            hypothesis(&report, "system.power_status").state,
+            HypothesisState::Supported
+        ));
+        assert!(report.next_probe.as_deref().unwrap().contains("没有修改"));
         assert!(!report.mutation_performed);
     }
 

@@ -876,6 +876,34 @@ function activityLabel(event: RuntimeEvent) {
         return `CPU 已用 ${load.toFixed(1)}%${process && processCpu !== null ? ` · 最大 ${process} ${processCpu.toFixed(1)}%` : ""} · 采样 ${Math.round(windowMs)} ms`;
       }
     }
+    if (tool === "system.power.inspect") {
+      const structured = event.payload.structured && typeof event.payload.structured === "object" && !Array.isArray(event.payload.structured)
+        ? event.payload.structured as Record<string, unknown>
+        : null;
+      const ac = structured?.acLineStatus === "online"
+        ? "已插电"
+        : structured?.acLineStatus === "offline"
+          ? "使用电池"
+          : structured?.acLineStatus === "unknown"
+            ? "供电来源未知"
+            : null;
+      const present = typeof structured?.batteryPresent === "boolean" ? structured.batteryPresent : null;
+      const percent = typeof structured?.batteryPercent === "number" && structured.batteryPercent >= 0 && structured.batteryPercent <= 100
+        ? Math.round(structured.batteryPercent)
+        : null;
+      const charging = structured?.charging === true;
+      const critical = structured?.critical === true;
+      const saver = structured?.batterySaver === true;
+      if (ac && present === false) {
+        return `电源 ${ac} · 未检测到电池${saver ? " · 节电模式" : ""}`;
+      }
+      if (ac && present === true) {
+        return `电源 ${ac}${percent !== null ? ` · 电池 ${percent}%` : ""}${charging ? " · 正在充电" : ""}${critical ? " · 临界" : ""}${saver ? " · 节电模式" : ""}`;
+      }
+      if (ac && present === null) {
+        return `电源 ${ac} · 电池状态未知${saver ? " · 节电模式" : ""}`;
+      }
+    }
     return `${tool} · ${summary}`;
   }
   if (event.eventType === "rescue.diagnosis.ready") {

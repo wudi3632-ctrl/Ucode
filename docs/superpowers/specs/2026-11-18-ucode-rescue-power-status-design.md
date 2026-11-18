@@ -38,9 +38,9 @@ WMI 可返回更多设备字段，但在许多机器上字段缺失或语义不�
 结构化结果：
 
 - `acLineStatus`：`online`、`offline` 或 `unknown`；
-- `batteryPresent`：是否存在系统可见电池；
-- `charging`：Windows 是否报告正在充电；
-- `critical`：Windows 是否报告临界电量；
+- `batteryPresent`：是否存在系统可见电池；Windows 返回未知标志时为 `null`；
+- `charging`：Windows 是否报告正在充电；无电池或标志未知时为 `null`；
+- `critical`：Windows 是否报告临界电量；无电池或标志未知时为 `null`；
 - `batterySaver`：是否启用节电模式；
 - `batteryPercent`：0–100；未知或无电池时为 `null`；
 - `estimatedRemainingSeconds`：Windows 有可靠估算时返回，否则为 `null`；
@@ -94,7 +94,7 @@ UI 复用对话活动和证据收据，不新增独立 Tab；报告明确本轮�
 - React 测试覆盖有电池、无电池与 unavailable，不渲染伪造 0%；
 - Node、React、Rust 与真实 legacy integration 全量通过；
 - 构建 portable 候选并运行完整性验证；
-- 至少两轮真实桌面自然语言请求，第二轮重新读取并产生新的 evidence ID；
+- 至少两轮真实桌面自然语言请求；第二轮必须产生新的探针事件与采集时间。证据 ID 按内容寻址，状态完全相同时允许相同，但不得复用旧事件冒充重新读取；
 - SQLite 事件链确认无联网许可、审批、Effect、设备控制或系统变更。
 
 ## 非目标
